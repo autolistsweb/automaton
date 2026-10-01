@@ -5,7 +5,7 @@
  * The database IS the automaton's memory.
  */
 
-export const SCHEMA_VERSION = 11;
+export const SCHEMA_VERSION = 12;
 
 export const CREATE_TABLES = `
   -- Schema version tracking
@@ -657,6 +657,58 @@ export const MIGRATION_V11 = `
   -- Add chain_type column to children table for multi-chain support
   ALTER TABLE children ADD COLUMN chain_type TEXT DEFAULT 'evm';
 `;
+
+// === Expiry Timestamp Format Normalisation ===
+
+/**
+ * Schema version: 12.
+ *
+ * Expiry columns are compared against `datetime('now')`, which returns
+ * `YYYY-MM-DD HH:MM:SS`. Several writers stored `Date.toISOString()` values
+ * (`YYYY-MM-DDTHH:MM:SS.mmmZ`) instead. SQLite compares those TEXT values
+ * lexicographically, and 'T' sorts after ' ', so rows already past their
+ * expiry were still treated as live: heartbeat leases could never be
+ * reclaimed, dedup keys never expired, and stale agent-cache entries were
+ * served forever.
+ *
+ * This rewrites the already-persisted rows into the SQLite-native format so
+ * existing databases are repaired, not just new writes. `strftime` parses the
+ * ISO-8601 value and reformats it, preserving the instant (both are UTC).
+ *
+ * The `LIKE '%T%'` guard makes every statement idempotent and keeps this a
+ * no-op once the writers emit native timestamps.
+ *
+ * These are kept as SEPARATE statements and executed individually, not as one
+ * multi-statement script. `db.exec()` aborts a script at the first error, so a
+ * single script would mean that whichever table is missing silently skips
+ * every statement after it — measured: with `heartbeat_schedule` absent, the
+ * other three tables were left un-repaired. Running them one at a time means a
+ * database that is missing one of these tables still gets the rest repaired.
+ *
+ * The `IS NOT NULL` guard matters: `strftime()` returns NULL for a value it
+ * cannot parse, and a NULL expiry compares false against every `<` / `>=` test,
+ * so an unparseable row would become permanently-never-expiring. The guard
+ * leaves such a row untouched and visible for diagnosis instead of silently
+ * converting it into an immortal lease or a nonce that never clears.
+ */
+export const MIGRATION_V12_EXPIRY_TIMESTAMP_STATEMENTS: readonly string[] = [
+  `UPDATE heartbeat_schedule
+      SET lease_expires_at = strftime('%Y-%m-%d %H:%M:%S', lease_expires_at)
+    WHERE lease_expires_at LIKE '%T%'
+      AND strftime('%Y-%m-%d %H:%M:%S', lease_expires_at) IS NOT NULL`,
+  `UPDATE heartbeat_dedup
+      SET expires_at = strftime('%Y-%m-%d %H:%M:%S', expires_at)
+    WHERE expires_at LIKE '%T%'
+      AND strftime('%Y-%m-%d %H:%M:%S', expires_at) IS NOT NULL`,
+  `UPDATE working_memory
+      SET expires_at = strftime('%Y-%m-%d %H:%M:%S', expires_at)
+    WHERE expires_at LIKE '%T%'
+      AND strftime('%Y-%m-%d %H:%M:%S', expires_at) IS NOT NULL`,
+  `UPDATE discovered_agents_cache
+      SET valid_until = strftime('%Y-%m-%d %H:%M:%S', valid_until)
+    WHERE valid_until LIKE '%T%'
+      AND strftime('%Y-%m-%d %H:%M:%S', valid_until) IS NOT NULL`,
+] as const;
 
 export const MIGRATION_V10 = `
   -- Schema version: 10

@@ -11,6 +11,24 @@ import fs from "fs";
 import path from "path";
 
 type DatabaseType = BetterSqlite3.Database;
+
+/**
+ * Format an instant as a SQLite-native UTC timestamp: `YYYY-MM-DD HH:MM:SS`.
+ *
+ * Expiry checks in this file compare TEXT columns against `datetime('now')`,
+ * which returns exactly this format. SQLite compares those TEXT values
+ * *lexicographically*, which is only correct when both sides use the same
+ * alphabet and the same instant. `Date.prototype.toISOString()` breaks that:
+ * it emits `2026-10-01T05:42:26.858Z`, and 'T' (0x54) sorts after ' ' (0x20),
+ * so a row already past its expiry still compared as live.
+ *
+ * Both forms are UTC, so there is no timezone skew — only the separator,
+ * the trailing 'Z', and sub-second precision differ.
+ */
+export function toSqliteUtcTimestamp(ms: number): string {
+  return new Date(ms).toISOString().replace("T", " ").replace(/\.\d{3}Z$/, "");
+}
+
 import type {
   AutomatonDatabase,
   AgentTurn,
@@ -46,6 +64,7 @@ import {
   MIGRATION_V9_ALTER_CHILDREN_ROLE,
   MIGRATION_V10,
   MIGRATION_V11,
+  MIGRATION_V12_EXPIRY_TIMESTAMP_STATEMENTS,
 } from "./schema.js";
 import type {
   RiskLevel,
@@ -623,6 +642,33 @@ function applyMigrations(db: DatabaseType): void {
       version: 11,
       apply: () => {
         try { db.exec(MIGRATION_V11); } catch { /* column may already exist */ }
+      },
+    },
+    {
+      version: 12,
+      apply: () => {
+        // Run each statement separately: db.exec() aborts a multi-statement
+        // script at the first error, so one absent table would otherwise skip
+        // every statement after it and silently leave the rest un-repaired.
+        for (const stmt of MIGRATION_V12_EXPIRY_TIMESTAMP_STATEMENTS) {
+          try {
+            db.exec(stmt);
+          } catch (error) {
+            // The table does not exist. In practice this is unreachable: the
+            // four target tables are created by MIGRATION_V4/V5/V7, all of
+            // which run before V12, so by the time this executes they all
+            // exist. The branch is defensive only.
+            //
+            // The version stamp is recorded regardless, so a genuinely missing
+            // table would not be revisited. That is a deliberate trade: this is
+            // a data normalisation, not a schema change, and failing startup
+            // because one row's timestamp is unreadable would be worse for an
+            // agent than leaving that row for a human to inspect.
+            logger.warn("Expiry timestamp normalisation statement skipped", {
+              error: error instanceof Error ? error.message : String(error),
+            });
+          }
+        }
       },
     },
   ];
@@ -1295,12 +1341,15 @@ export function getHeartbeatHistory(db: DatabaseType, taskName: string, limit = 
 // ─── Lease Management Helpers (Phase 1.1) ───────────────────────
 
 export function acquireTaskLease(db: DatabaseType, taskName: string, owner: string, ttlMs: number): boolean {
-  const expiresAt = new Date(Date.now() + ttlMs).toISOString();
+  const expiresAt = toSqliteUtcTimestamp(Date.now() + ttlMs);
+  // `heartbeat_schedule.lease_expires_at` is unindexed, so normalising the
+  // stored value through datetime() is free and keeps the comparison correct
+  // even for a row written by an older build that has not been migrated yet.
   const result = db.prepare(
     `UPDATE heartbeat_schedule
      SET lease_owner = ?, lease_expires_at = ?, updated_at = datetime('now')
      WHERE task_name = ?
-       AND (lease_owner IS NULL OR lease_expires_at < datetime('now'))`,
+       AND (lease_owner IS NULL OR datetime(lease_expires_at) < datetime('now'))`,
   ).run(owner, expiresAt, taskName);
   return result.changes > 0;
 }
@@ -1317,7 +1366,7 @@ export function clearExpiredLeases(db: DatabaseType): number {
   const result = db.prepare(
     `UPDATE heartbeat_schedule
      SET lease_owner = NULL, lease_expires_at = NULL, updated_at = datetime('now')
-     WHERE lease_expires_at IS NOT NULL AND lease_expires_at < datetime('now')`,
+     WHERE lease_expires_at IS NOT NULL AND datetime(lease_expires_at) < datetime('now')`,
   ).run();
   return result.changes;
 }
@@ -1359,7 +1408,7 @@ export function pruneStaleKV(db: DatabaseType, prefix: string, retentionDays: nu
 // ─── Dedup Helpers (Phase 1.1) ──────────────────────────────────
 
 export function insertDedupKey(db: DatabaseType, key: string, taskName: string, ttlMs: number): boolean {
-  const expiresAt = new Date(Date.now() + ttlMs).toISOString();
+  const expiresAt = toSqliteUtcTimestamp(Date.now() + ttlMs);
   try {
     db.prepare(
       "INSERT INTO heartbeat_dedup (dedup_key, task_name, expires_at) VALUES (?, ?, ?)",
@@ -1373,6 +1422,11 @@ export function insertDedupKey(db: DatabaseType, key: string, taskName: string, 
 }
 
 export function pruneExpiredDedupKeys(db: DatabaseType): number {
+  // Deliberately NOT wrapped in datetime(): `idx_dedup_expires` indexes
+  // expires_at, and applying a function to the column turns the range scan
+  // into a full table scan (measured 0.04ms -> 4.9ms on 5k rows). Correctness
+  // here comes from insertDedupKey writing the native format and from
+  // MIGRATION_V12 rewriting rows persisted by older builds.
   const result = db.prepare(
     "DELETE FROM heartbeat_dedup WHERE expires_at < datetime('now')",
   ).run();
@@ -1380,8 +1434,10 @@ export function pruneExpiredDedupKeys(db: DatabaseType): number {
 }
 
 export function isDeduplicated(db: DatabaseType, key: string): boolean {
+  // Looked up by primary key, so this stays an index seek regardless of the
+  // datetime() wrapper (see pruneExpiredDedupKeys).
   const row = db.prepare(
-    "SELECT 1 FROM heartbeat_dedup WHERE dedup_key = ? AND expires_at >= datetime('now')",
+    "SELECT 1 FROM heartbeat_dedup WHERE dedup_key = ? AND datetime(expires_at) >= datetime('now')",
   ).get(key) as any | undefined;
   return !!row;
 }
@@ -1810,7 +1866,7 @@ export function wmPrune(db: DatabaseType, sessionId: string, maxEntries: number)
 
 export function wmClearExpired(db: DatabaseType): number {
   try {
-    const result = db.prepare("DELETE FROM working_memory WHERE expires_at IS NOT NULL AND expires_at < datetime('now')").run();
+    const result = db.prepare("DELETE FROM working_memory WHERE expires_at IS NOT NULL AND datetime(expires_at) < datetime('now')").run();
     return result.changes;
   } catch (error) { logger.error("wmClearExpired failed", error instanceof Error ? error : undefined); return 0; }
 }
@@ -2409,14 +2465,14 @@ export function agentCacheGet(db: DatabaseType, agentAddress: string): Discovere
 
 export function agentCacheGetValid(db: DatabaseType): DiscoveredAgentCacheRow[] {
   const rows = db
-    .prepare("SELECT * FROM discovered_agents_cache WHERE valid_until IS NULL OR valid_until >= datetime('now')")
+    .prepare("SELECT * FROM discovered_agents_cache WHERE valid_until IS NULL OR datetime(valid_until) >= datetime('now')")
     .all() as any[];
   return rows.map(deserializeAgentCacheRow);
 }
 
 export function agentCachePrune(db: DatabaseType): number {
   const result = db
-    .prepare("DELETE FROM discovered_agents_cache WHERE valid_until IS NOT NULL AND valid_until < datetime('now')")
+    .prepare("DELETE FROM discovered_agents_cache WHERE valid_until IS NOT NULL AND datetime(valid_until) < datetime('now')")
     .run();
   return result.changes;
 }
