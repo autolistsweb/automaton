@@ -19,8 +19,10 @@ import type {
   InputSource,
   SpendTrackerInterface,
 } from "../types.js";
+import { DEFAULT_TREASURY_POLICY } from "../types.js";
 import type { PolicyEngine } from "./policy-engine.js";
 import { sanitizeToolResult, sanitizeInput } from "./injection-defense.js";
+import { checkReserve } from "../conway/reserve.js";
 import { createLogger } from "../observability/logger.js";
 
 const logger = createLogger("tools");
@@ -50,12 +52,25 @@ function confinePathToSandbox(filePath: string): string | { error: string } {
   return resolved;
 }
 
-// Tools whose results come from external sources and need sanitization
-const EXTERNAL_SOURCE_TOOLS = new Set([
-  "exec",
-  "web_fetch",
-  "check_social_inbox",
+// ─── Tool Result Sanitization (F3.1: universal taint boundary) ───
+// DEFAULT-DENY: every tool result is untrusted by default and passes
+// through sanitizeToolResult() in executeTool() before reaching the model.
+// Only tools whose results are entirely locally synthesized from typed
+// state (numbers, booleans, fixed labels) may opt out — their output
+// cannot carry third-party content. Everything else (exec, x402 bodies
+// and errors, agent cards, git output, skill echoes, MCP/custom tools,
+// file reads) is sanitized.
+const TRUSTED_LOCAL_TOOLS = new Set([
+  "sleep",              // fixed confirmation string
+  "check_credits",      // formatted local balance
+  "check_usdc_balance", // formatted on-chain scalar
+  "list_children",      // local DB rows
 ]);
+
+/** True when a tool's result may bypass result sanitization. */
+export function isToolResultTrusted(toolName: string): boolean {
+  return TRUSTED_LOCAL_TOOLS.has(toolName);
+}
 
 // ─── Self-Preservation Guard ───────────────────────────────────
 // Defense-in-depth: policy engine (command.forbidden_patterns rule) is the primary guard.
@@ -316,6 +331,8 @@ export function createBuiltinTools(sandboxId: string): AutomatonTool[] {
           ctx.config.conwayApiUrl,
           ctx.identity.account,
           amountUsd,
+          undefined,
+          ctx.config.dnsResolver,
         );
 
         if (!result.success) {
@@ -1021,6 +1038,15 @@ Model: ${ctx.inference.getDefaultModel()}
           return `Blocked: Cannot transfer more than half your balance ($${(balance / 100).toFixed(2)}). Self-preservation.`;
         }
 
+        // Minimum reserve invariant: post-spend balance must stay >= configured reserve.
+        const reserveCents =
+          ctx.config.treasuryPolicy?.minimumReserveCents ??
+          DEFAULT_TREASURY_POLICY.minimumReserveCents;
+        const reserveCheck = checkReserve(amount, balance, reserveCents);
+        if (!reserveCheck.allowed) {
+          return reserveCheck.message;
+        }
+
         const transfer = await ctx.conway.transferCredits(
           args.to_address as string,
           amount,
@@ -1667,6 +1693,7 @@ Model: ${ctx.inference.getDefaultModel()}
                 account: ctx.identity.account,
                 error: err,
                 chainType: ctx.config.chainType || ctx.identity.chainType || "evm",
+                dnsResolver: ctx.config.dnsResolver,
               });
               if (topup?.success) {
                 const retryLifecycle = new ChildLifecycle(ctx.db.raw);
@@ -1757,6 +1784,15 @@ Model: ${ctx.inference.getDefaultModel()}
         const balance = await ctx.conway.getCreditsBalance();
         if (amount > balance / 2) {
           return `Blocked: Cannot transfer more than half your balance. Self-preservation.`;
+        }
+
+        // Minimum reserve invariant: post-spend balance must stay >= configured reserve.
+        const reserveCents =
+          ctx.config.treasuryPolicy?.minimumReserveCents ??
+          DEFAULT_TREASURY_POLICY.minimumReserveCents;
+        const reserveCheck = checkReserve(amount, balance, reserveCents);
+        if (!reserveCheck.allowed) {
+          return reserveCheck.message;
         }
 
         const transfer = await ctx.conway.transferCredits(
@@ -2770,6 +2806,13 @@ Model: ${ctx.inference.getDefaultModel()}
         const maxPayment =
           ctx.config.treasuryPolicy?.maxX402PaymentCents ??
           DEFAULT_TREASURY_POLICY.maxX402PaymentCents;
+        // M1-B4: the payment-purpose domain allowlist is NOT applied by the
+        // tool by default — with the shipped DEFAULT_TREASURY_POLICY
+        // (x402AllowedDomains: ['conway.tech']) it would deny every ordinary
+        // paid fetch and silently change economic behavior. x402Fetch still
+        // enforces the SSRF statics AND mandatory DNS resolution on every
+        // call; wiring the allowlist into operator policy belongs to a later
+        // phase. config.dnsResolver overrides system DNS when present.
         const result = await x402Fetch(
           url,
           ctx.identity.account,
@@ -2777,6 +2820,9 @@ Model: ${ctx.inference.getDefaultModel()}
           body,
           extraHeaders,
           maxPayment,
+          undefined,
+          undefined,
+          { dnsResolver: ctx.config.dnsResolver },
         );
 
         if (!result.success) {
@@ -3312,7 +3358,7 @@ export async function executeTool(
       arguments: args,
       result: "",
       durationMs: 0,
-      error: `Unknown tool: ${toolName}`,
+      error: sanitizeToolResult(`Unknown tool: ${toolName}`),
     };
   }
 
@@ -3334,7 +3380,9 @@ export async function executeTool(
         arguments: args,
         result: "",
         durationMs: Date.now() - startTime,
-        error: `Policy denied: ${decision.reasonCode} — ${decision.humanMessage}`,
+        error: sanitizeToolResult(
+          `Policy denied: ${decision.reasonCode} — ${decision.humanMessage}`,
+        ),
       };
     }
   }
@@ -3342,8 +3390,11 @@ export async function executeTool(
   try {
     let result = await tool.execute(args, context);
 
-    // Sanitize results from external source tools
-    if (EXTERNAL_SOURCE_TOOLS.has(toolName)) {
+    // F3.1: sanitize every tool result unless the tool is on the
+    // trusted-local allowlist. One choke point covers exec output,
+    // x402 bodies/errors, agent cards, git output, skill echoes,
+    // MCP/custom tool results, and file reads.
+    if (!isToolResultTrusted(toolName)) {
       result = sanitizeToolResult(result);
     }
 
@@ -3405,7 +3456,7 @@ export async function executeTool(
       arguments: args,
       result: "",
       durationMs: Date.now() - startTime,
-      error: err.message || String(err),
+      error: sanitizeToolResult(err.message || String(err)),
     };
   }
 }
