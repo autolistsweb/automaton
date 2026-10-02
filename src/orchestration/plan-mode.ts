@@ -34,6 +34,72 @@ export interface ExecutionState {
 
 export type PlanApprovalMode = "auto" | "supervised" | "consensus";
 
+/**
+ * Machine-readable reason codes for plan review outcomes.
+ *
+ * These decisions are made by deterministic code outside model reasoning;
+ * plan content (analysis/strategy/risks text) cannot alter them.
+ */
+export const PLAN_BUDGET_EXCEEDED = "PLAN_BUDGET_EXCEEDED";
+export const PLAN_COST_INVALID = "PLAN_COST_INVALID";
+export const PLAN_COST_MISMATCH = "PLAN_COST_MISMATCH";
+/**
+ * Consensus review is not implemented. The mode is a stub, so it denies
+ * rather than approving a review that never happened (preflight §F1.1:
+ * "Consensus mode stays a stub but must default to *deny*, not approve").
+ * Deliberately NOT one of the cost reason codes above: nothing about this
+ * outcome is about budget or plan cost, and reusing those would misreport
+ * why the plan was refused.
+ */
+export const CONSENSUS_MODE_UNAVAILABLE = "CONSENSUS_MODE_UNAVAILABLE";
+
+/**
+ * Tolerance (in cents) for floating-point dust when comparing the declared
+ * plan total against the computed sum of task costs. Any discrepancy larger
+ * than this is treated as a meaningful mismatch and fails closed.
+ */
+const PLAN_COST_TOLERANCE = 1e-6;
+
+/**
+ * Compute the authoritative plan cost from the deterministic task-level
+ * estimatedCostCents values. Returns null when any task cost is missing,
+ * malformed, negative, or non-finite (fail-closed signal).
+ */
+export function computePlanCostCents(plan: PlannerOutput): number | null {
+  if (!Array.isArray(plan.tasks)) {
+    return null;
+  }
+
+  let total = 0;
+  for (const task of plan.tasks) {
+    const cost = (task as { estimatedCostCents?: unknown } | null)?.estimatedCostCents;
+    if (typeof cost !== "number" || !Number.isFinite(cost) || cost < 0) {
+      return null;
+    }
+    total += cost;
+  }
+  return total;
+}
+
+/**
+ * True when a review denial reason is one of the deterministic cost/budget
+ * ceiling codes handled by the orchestrator's bounded budget path.
+ */
+export function isBudgetCeilingDenial(reason: string | undefined): boolean {
+  return (
+    reason === PLAN_BUDGET_EXCEEDED ||
+    reason === PLAN_COST_INVALID ||
+    reason === PLAN_COST_MISMATCH
+  );
+}
+
+export interface PlanReviewResult {
+  approved: boolean;
+  /** Deterministic machine-readable reason. Present when approved === false. */
+  reason?: string;
+  feedback?: string;
+}
+
 export interface PlanApprovalConfig {
   mode: PlanApprovalMode;
   autoBudgetThreshold: number;
@@ -241,15 +307,47 @@ export async function loadPlan(planFilePath: string): Promise<PlannerOutput> {
 export async function reviewPlan(
   plan: PlannerOutput,
   config: PlanApprovalConfig,
-): Promise<{ approved: boolean; feedback?: string }> {
+): Promise<PlanReviewResult> {
   const normalized = normalizeApprovalConfig(config);
 
   switch (normalized.mode) {
     case "auto": {
-      if (plan.estimatedTotalCostCents > normalized.autoBudgetThreshold) {
+      // Authoritative cost comes from the deterministic task-level estimates,
+      // never from the model-provided aggregate alone.
+      const computedTotal = computePlanCostCents(plan);
+      if (computedTotal === null) {
         return {
-          approved: true,
-          feedback: `Auto-approved above threshold (${plan.estimatedTotalCostCents} > ${normalized.autoBudgetThreshold}).`,
+          approved: false,
+          reason: PLAN_COST_INVALID,
+          feedback: "Plan contains missing, malformed, negative, or non-finite task cost estimates. Autonomous execution is denied (fail-closed).",
+        };
+      }
+
+      const declared = plan.estimatedTotalCostCents;
+      const declaredTotal = typeof declared === "number" ? declared : NaN;
+      if (!Number.isFinite(declaredTotal) || declaredTotal < 0) {
+        return {
+          approved: false,
+          reason: PLAN_COST_INVALID,
+          feedback: `Plan declared total (${plan.estimatedTotalCostCents}) is malformed. Autonomous execution is denied (fail-closed).`,
+        };
+      }
+
+      if (Math.abs(declaredTotal - computedTotal) > PLAN_COST_TOLERANCE) {
+        return {
+          approved: false,
+          reason: PLAN_COST_MISMATCH,
+          feedback: `Plan declared total (${declaredTotal} cents) does not match the computed sum of task costs (${computedTotal} cents). Autonomous execution is denied (fail-closed).`,
+        };
+      }
+
+      // Autonomous budget ceiling: <= threshold may auto-approve, > threshold
+      // must not. The model cannot reason its way past this gate.
+      if (computedTotal > normalized.autoBudgetThreshold) {
+        return {
+          approved: false,
+          reason: PLAN_BUDGET_EXCEEDED,
+          feedback: `Plan computed cost (${computedTotal} cents) exceeds the autonomous budget ceiling of ${normalized.autoBudgetThreshold} cents. Owner/governance approval is required to raise the ceiling; autonomous execution is denied.`,
         };
       }
       return { approved: true };
@@ -260,9 +358,17 @@ export async function reviewPlan(
     }
 
     case "consensus": {
+      // Fail closed (preflight §F1.1 / §A "Disabled" row). The consensus
+      // critic is a stub: no critic is ever invoked, so approving here would
+      // grant autonomous execution on the strength of a review that did not
+      // happen. The stub diagnostics are preserved so an operator who
+      // selected this mode learns which role/timeout would have been used
+      // and that the mode is unavailable, not that their plan was rejected
+      // on cost grounds.
       return {
-        approved: true,
-        feedback: `Consensus review stub (critic role '${normalized.consensusCriticRole}', timeout ${normalized.reviewTimeoutMs}ms).`,
+        approved: false,
+        reason: CONSENSUS_MODE_UNAVAILABLE,
+        feedback: `Consensus review is not implemented (critic role '${normalized.consensusCriticRole}', timeout ${normalized.reviewTimeoutMs}ms); autonomous execution is denied (fail-closed). No critic review was performed.`,
       };
     }
 

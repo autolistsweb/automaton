@@ -68,6 +68,12 @@ export interface AutomatonConfig {
   parentAddress?: string;
   socialRelayUrl?: string;
   treasuryPolicy?: TreasuryPolicy;
+  /**
+   * Optional DNS resolver override for the mandatory resolution-time SSRF
+   * tier on the payment path (M1-B4). Production defaults to system DNS
+   * (node:dns); tests and air-gapped deployments may inject a resolver.
+   */
+  dnsResolver?: import("./net/policy.js").DnsResolver;
   // Phase 2 config additions
   soulConfig?: SoulConfig;
   modelStrategy?: ModelStrategyConfig;
@@ -608,6 +614,11 @@ export interface HttpClientConfig {
   circuitBreakerThreshold: number;   // default: 5
   circuitBreakerResetMs: number;     // default: 60_000ms
   allowHttpOnLoopback: boolean;      // default: false (for local dev only)
+  // M1-B4 (F4.3): outbound-network policy wiring (all optional)
+  outboundPurpose?: import("./net/policy.js").OutboundPurpose;
+  allowedDomains?: string[];         // payment allowlist (x402AllowedDomains)
+  dnsResolver?: import("./net/policy.js").DnsResolver;
+  requireDnsResolution?: boolean;    // deny when DNS tier cannot run
 }
 
 export const DEFAULT_HTTP_CLIENT_CONFIG: HttpClientConfig = {

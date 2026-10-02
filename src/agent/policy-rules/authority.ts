@@ -59,6 +59,24 @@ const EXTERNAL_BLOCKED_TOOLS = [
   "spawn_child",
   "fund_child",
   "update_genesis_prompt",
+  // M1-B7 promotion pipeline: external/heartbeat input must never queue a
+  // self-update proposal or reset the promotion machine. Only agent- or
+  // creator-initiated turns may touch the pipeline surface.
+  "propose_self_update",
+  "rollback_last_promotion",
+  // M1-B8 capability registration: external/heartbeat input must never
+  // reach the capability-registration surface at all. Registration is
+  // owner-side governance tooling (preflight §10: "never model-grantable
+  // to itself") and the policy denial must land BEFORE any side effect —
+  // before npm, before an installed_tools row, before conway.exec.
+  "install_mcp_server",
+  "install_npm_package",
+  // M1-B10 scoped workers: the worker authority surface (create, fund,
+  // revoke) is agent/creator-initiated only. A heartbeat task must never be
+  // able to mint a worker, move credits to one, or cut one off.
+  "spawn_child",
+  "fund_child",
+  "revoke_worker",
 ] as const;
 
 /**

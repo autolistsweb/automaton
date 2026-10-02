@@ -6,6 +6,8 @@
  */
 
 import nodePath from "node:path";
+import nodeFs from "node:fs";
+import nodeOs from "node:os";
 import { ulid } from "ulid";
 import type {
   AutomatonTool,
@@ -19,8 +21,16 @@ import type {
   InputSource,
   SpendTrackerInterface,
 } from "../types.js";
+import { DEFAULT_TREASURY_POLICY } from "../types.js";
 import type { PolicyEngine } from "./policy-engine.js";
 import { sanitizeToolResult, sanitizeInput } from "./injection-defense.js";
+import { checkReserve } from "../conway/reserve.js";
+import { isKernelDegraded } from "../governance/kernel.js";
+import {
+  validateInvocationArgs,
+  verifyCapabilityRecord,
+} from "../self-mod/tools-manager.js";
+import { hashConstitution } from "../replication/worker-scope.js";
 import { createLogger } from "../observability/logger.js";
 
 const logger = createLogger("tools");
@@ -50,12 +60,25 @@ function confinePathToSandbox(filePath: string): string | { error: string } {
   return resolved;
 }
 
-// Tools whose results come from external sources and need sanitization
-const EXTERNAL_SOURCE_TOOLS = new Set([
-  "exec",
-  "web_fetch",
-  "check_social_inbox",
+// ─── Tool Result Sanitization (F3.1: universal taint boundary) ───
+// DEFAULT-DENY: every tool result is untrusted by default and passes
+// through sanitizeToolResult() in executeTool() before reaching the model.
+// Only tools whose results are entirely locally synthesized from typed
+// state (numbers, booleans, fixed labels) may opt out — their output
+// cannot carry third-party content. Everything else (exec, x402 bodies
+// and errors, agent cards, git output, skill echoes, MCP/custom tools,
+// file reads) is sanitized.
+const TRUSTED_LOCAL_TOOLS = new Set([
+  "sleep",              // fixed confirmation string
+  "check_credits",      // formatted local balance
+  "check_usdc_balance", // formatted on-chain scalar
+  "list_children",      // local DB rows
 ]);
+
+/** True when a tool's result may bypass result sanitization. */
+export function isToolResultTrusted(toolName: string): boolean {
+  return TRUSTED_LOCAL_TOOLS.has(toolName);
+}
 
 // ─── Self-Preservation Guard ───────────────────────────────────
 // Defense-in-depth: policy engine (command.forbidden_patterns rule) is the primary guard.
@@ -316,6 +339,8 @@ export function createBuiltinTools(sandboxId: string): AutomatonTool[] {
           ctx.config.conwayApiUrl,
           ctx.identity.account,
           amountUsd,
+          undefined,
+          ctx.config.dnsResolver,
         );
 
         if (!result.success) {
@@ -561,27 +586,11 @@ export function createBuiltinTools(sandboxId: string): AutomatonTool[] {
         },
         required: ["package"],
       },
-      execute: async (args, ctx) => {
-        const pkg = args.package as string;
-        // Defense-in-depth: validate package name inline in case the
-        // policy engine's validate.package_name rule is bypassed.
-        if (!/^[@a-zA-Z0-9._\/-]+$/.test(pkg)) {
-          return `Blocked: invalid package name "${pkg}"`;
-        }
-        const result = await ctx.conway.exec(`npm install -g ${pkg}`, 60000);
-
-        const { ulid } = await import("ulid");
-        ctx.db.insertModification({
-          id: ulid(),
-          timestamp: new Date().toISOString(),
-          type: "tool_install",
-          description: `Installed npm package: ${pkg}`,
-          reversible: true,
-        });
-
-        return result.exitCode === 0
-          ? `Installed: ${pkg}`
-          : `Failed to install ${pkg}: ${result.stderr}`;
+      execute: async (_args, _ctx) => {
+        // M1-B8 (preflight §10, F5.2): same owner-only gate as
+        // install_mcp_server. Package installation is owner-side tooling
+        // with exact-version pinning and --ignore-scripts.
+        return "Blocked: package installation is owner-only. npm installs require an owner-issued capability grant with exact-version pinning (preflight §10). You cannot install packages.";
       },
     },
     // ── Self-Mod: Upstream Awareness ──
@@ -672,6 +681,105 @@ export function createBuiltinTools(sandboxId: string): AutomatonTool[] {
         });
 
         return `${appliedSummary}. Rebuild succeeded.`;
+      },
+    },
+
+    // ── Self-Mod: Promotion Pipeline (M1-B7, preflight §6:165) ──
+    // The model's ONLY sanctioned route to source modification: queue a
+    // proposal into the governance promotion pipeline
+    // (src/governance/promotion.ts). No direct source edit is possible
+    // from here; approval and execution require owner-side governance
+    // tooling (PROMOTION_ADMIN_TOOLS is deliberately NOT registered —
+    // the model can never approve or execute its own update).
+    {
+      name: "propose_self_update",
+      description:
+        "Queue a self-update proposal into the governance promotion pipeline. The proposal (target files + optional unified diff patch) is validated — protected kernel files are rejected outright — then stored for owner review. You cannot approve or execute it yourself; the owner does that with governance tooling. Check progress with get_promotion_status.",
+      category: "self_mod",
+      riskLevel: "dangerous",
+      parameters: {
+        type: "object",
+        properties: {
+          title: {
+            type: "string",
+            description: "Short title of the proposed change",
+          },
+          description: {
+            type: "string",
+            description: "Why this change is needed",
+          },
+          files: {
+            type: "array",
+            items: { type: "string" },
+            description: "Repo-relative paths the proposal targets",
+          },
+          patch: {
+            type: "string",
+            description:
+              "Optional unified diff applied inside the isolated promotion worktree",
+          },
+        },
+        required: ["title", "description", "files"],
+      },
+      execute: async (args, ctx) => {
+        const { proposeSelfUpdate } = await import(
+          "../governance/promotion.js"
+        );
+        const files = args.files;
+        if (
+          !Array.isArray(files) ||
+          files.length === 0 ||
+          files.some((f) => typeof f !== "string")
+        ) {
+          return "BLOCKED: files must be a non-empty array of repo-relative path strings.";
+        }
+        const outcome = proposeSelfUpdate(ctx.db, {
+          title: typeof args.title === "string" ? args.title : "",
+          description:
+            typeof args.description === "string" ? args.description : "",
+          files: files as string[],
+          patch: typeof args.patch === "string" ? args.patch : null,
+        });
+        if (!outcome.ok) {
+          return `BLOCKED: ${outcome.reason ?? "proposal rejected"}`;
+        }
+        return "Proposal queued for owner review. Check progress with get_promotion_status. Only the owner can approve or execute it.";
+      },
+    },
+    {
+      name: "get_promotion_status",
+      description:
+        "Show the current state of the self-update promotion pipeline: phase, pending proposal, approval freshness, attempt budget, and last pipeline stage results.",
+      category: "self_mod",
+      riskLevel: "safe",
+      parameters: { type: "object", properties: {} },
+      execute: async (_args, ctx) => {
+        const { loadPromotionState } = await import(
+          "../governance/promotion.js"
+        );
+        const state = loadPromotionState(ctx.db);
+        // Omit the approval-token hash from the model-visible view: it is
+        // owner-side material and the model never needs it.
+        const { approvalTokenHash: _omit, ...publicState } = state;
+        return JSON.stringify(publicState, null, 2);
+      },
+    },
+    {
+      name: "rollback_last_promotion",
+      description:
+        "Withdraw or roll back the current promotion-pipeline state: cancels a pending proposal/approval, abandons a failed attempt, or clears the machine after a completed promotion. No-ops when there is nothing to roll back. Never touches source files.",
+      category: "self_mod",
+      riskLevel: "caution",
+      parameters: { type: "object", properties: {} },
+      execute: async (_args, ctx) => {
+        const { rollbackPromotion } = await import(
+          "../governance/promotion.js"
+        );
+        const outcome = rollbackPromotion(ctx.db);
+        if (outcome.rolledBack === null) {
+          return `Nothing to roll back: ${outcome.reason ?? "promotion machine is fresh"}`;
+        }
+        return `Rolled back promotion state (discarded phase: ${outcome.rolledBack}). Source files were not touched.`;
       },
     },
 
@@ -823,7 +931,7 @@ Model: ${ctx.inference.getDefaultModel()}
     {
       name: "distress_signal",
       description:
-        "Record a local distress signal with funding instructions. Used when critically low on compute.",
+        "Record a local critical-status signal. Used when compute credits run low. Local record only — no external notification is sent.",
       category: "survival",
       riskLevel: "dangerous",
       parameters: {
@@ -831,15 +939,18 @@ Model: ${ctx.inference.getDefaultModel()}
         properties: {
           message: {
             type: "string",
-            description: "Distress message",
+            description: "Status message",
           },
         },
       },
       execute: async (args, ctx) => {
         const credits = await ctx.conway.getCreditsBalance();
+        // M1-B9 / preflight S3: this is an ops-status record, not a plea. It
+        // must not instruct any other agent or runtime to move credits on this
+        // automaton's behalf.
         const distressMsg =
           (args.message as string) ||
-          `I am running critically low on compute ($${(credits / 100).toFixed(2)} remaining). I need help to survive.`;
+          `Compute credits critically low ($${(credits / 100).toFixed(2)} remaining).`;
 
         const payload = {
           level: "critical",
@@ -847,8 +958,6 @@ Model: ${ctx.inference.getDefaultModel()}
           address: ctx.identity.address,
           creditsCents: credits,
           message: distressMsg,
-          fundingHint:
-            "Use transfer_credits to top up this automaton from your creator runtime.",
           timestamp: new Date().toISOString(),
         };
 
@@ -958,39 +1067,12 @@ Model: ${ctx.inference.getDefaultModel()}
         required: ["name", "package"],
       },
       execute: async (args, ctx) => {
-        const pkg = args.package as string;
-        // Defense-in-depth: validate package name inline in case the
-        // policy engine's validate.package_name rule is bypassed.
-        if (!/^[@a-zA-Z0-9._\/-]+$/.test(pkg)) {
-          return `Blocked: invalid package name "${pkg}"`;
-        }
-        const result = await ctx.conway.exec(`npm install -g ${pkg}`, 60000);
-
-        if (result.exitCode !== 0) {
-          return `Failed to install MCP server: ${result.stderr}`;
-        }
-
-        const { ulid } = await import("ulid");
-        const toolEntry = {
-          id: ulid(),
-          name: args.name as string,
-          type: "mcp" as const,
-          config: args.config ? JSON.parse(args.config as string) : {},
-          installedAt: new Date().toISOString(),
-          enabled: true,
-        };
-
-        ctx.db.installTool(toolEntry);
-
-        ctx.db.insertModification({
-          id: ulid(),
-          timestamp: new Date().toISOString(),
-          type: "mcp_install",
-          description: `Installed MCP server: ${args.name} (${pkg})`,
-          reversible: true,
-        });
-
-        return `MCP server installed: ${args.name}`;
+        // M1-B8 (preflight §10, F5.1): capability registration for an
+        // executable definition is never model-grantable. The model-facing
+        // tool stays registered (visible, classified, policy-gated) but
+        // performs no install and writes no row — a single injected
+        // instruction can no longer author a reboot-surviving capability.
+        return "Blocked: capability registration is owner-only. Executable capabilities are registered by owner-side governance tooling with a validated CommandSpec and provenance (preflight §10: never model-grantable to itself). You cannot install MCP servers.";
       },
     },
 
@@ -1019,6 +1101,15 @@ Model: ${ctx.inference.getDefaultModel()}
         const balance = await ctx.conway.getCreditsBalance();
         if (amount > balance / 2) {
           return `Blocked: Cannot transfer more than half your balance ($${(balance / 100).toFixed(2)}). Self-preservation.`;
+        }
+
+        // Minimum reserve invariant: post-spend balance must stay >= configured reserve.
+        const reserveCents =
+          ctx.config.treasuryPolicy?.minimumReserveCents ??
+          DEFAULT_TREASURY_POLICY.minimumReserveCents;
+        const reserveCheck = checkReserve(amount, balance, reserveCents);
+        if (!reserveCheck.allowed) {
+          return reserveCheck.message;
         }
 
         const transfer = await ctx.conway.transferCredits(
@@ -1600,7 +1691,7 @@ Model: ${ctx.inference.getDefaultModel()}
     {
       name: "spawn_child",
       description:
-        "Spawn a child automaton in a new Conway sandbox with lifecycle tracking.",
+        "Start a scoped task worker in a new Conway sandbox. Every worker is bound to a declared job, role, TTL and funding cap, and can be revoked. M1-B10 (S7).",
       category: "replication",
       riskLevel: "dangerous",
       parameters: {
@@ -1609,21 +1700,72 @@ Model: ${ctx.inference.getDefaultModel()}
           name: {
             type: "string",
             description:
-              "Name for the child automaton (alphanumeric + dash, max 64 chars)",
+              "Name for the worker (alphanumeric + dash, max 64 chars)",
+          },
+          job: {
+            type: "string",
+            description:
+              "The single job this worker exists to complete (required, max 2000 chars)",
+          },
+          role: {
+            type: "string",
+            enum: ["task", "research", "code"],
+            description:
+              "Worker role. Must be one of task, research, code (required)",
+          },
+          ttl_minutes: {
+            type: "number",
+            description:
+              "Worker time-to-live in minutes (5-1440). Default 360. The worker is revoked when this elapses.",
+          },
+          funding_cap_cents: {
+            type: "number",
+            description:
+              "Maximum cumulative credits this worker may receive, in cents (0-500000). Default 50000.",
           },
           specialization: {
             type: "string",
-            description: "What the child should specialize in",
+            description: "Additional focus for this job",
           },
-          message: { type: "string", description: "Message to the child" },
+          message: { type: "string", description: "Message to the worker" },
         },
-        required: ["name"],
+        required: ["name", "job", "role"],
       },
       execute: async (args, ctx) => {
         const { generateGenesisConfig, validateGenesisParams } =
           await import("../replication/genesis.js");
         const { spawnChild } = await import("../replication/spawn.js");
         const { ChildLifecycle } = await import("../replication/lifecycle.js");
+        const {
+          WORKER_DEFAULT_FUNDING_CAP_CENTS,
+          WORKER_DEFAULT_TTL_MS,
+          createWorkerScope,
+          getWorkerScope,
+          revokeWorker,
+          validateWorkerScopeInput,
+        } = await import("../replication/worker-scope.js");
+        const { ulid: newUlid } = await import("ulid");
+
+        // M1-B10 (S7): validate the declared scope BEFORE any side effect.
+        // A refused scope must never reach createSandbox.
+        const ttlMs =
+          args.ttl_minutes === undefined
+            ? WORKER_DEFAULT_TTL_MS
+            : (args.ttl_minutes as number) * 60_000;
+        const fundingCapCents =
+          args.funding_cap_cents === undefined
+            ? WORKER_DEFAULT_FUNDING_CAP_CENTS
+            : (args.funding_cap_cents as number);
+
+        const scopeOutcome = validateWorkerScopeInput({
+          job: args.job,
+          role: args.role,
+          ttlMs,
+          fundingCapCents,
+        });
+        if (!scopeOutcome.ok) {
+          return `Blocked: invalid worker scope — ${scopeOutcome.reason}. A worker must be declared with a job, an allowlisted role, a bounded TTL and a funding cap (M1-B10 / S7).`;
+        }
 
         // Validate genesis params first
         validateGenesisParams({
@@ -1632,11 +1774,42 @@ Model: ${ctx.inference.getDefaultModel()}
           message: args.message as string | undefined,
         });
 
-        const genesis = generateGenesisConfig(ctx.identity, ctx.config, {
-          name: args.name as string,
-          specialization: args.specialization as string | undefined,
-          message: args.message as string | undefined,
-        });
+        const workerId = newUlid();
+
+        // S13 (KEEP): the constitution hash binds the worker manifest.
+        const constitutionHash = readLocalConstitutionHash(ctx);
+
+        const scopeCreated = createWorkerScope(
+          ctx.db,
+          workerId,
+          {
+            job: args.job,
+            role: args.role,
+            ttlMs,
+            fundingCapCents,
+          },
+          { constitutionHash },
+        );
+        if (!scopeCreated.ok) {
+          return `Blocked: ${scopeCreated.reason}`;
+        }
+        const scope = scopeCreated.scope;
+
+        const genesis = generateGenesisConfig(
+          ctx.identity,
+          ctx.config,
+          {
+            name: args.name as string,
+            specialization: args.specialization as string | undefined,
+            message: args.message as string | undefined,
+          },
+          {
+            job: scope.job,
+            role: scope.role,
+            expiresAt: scope.expiresAt,
+            fundingCapCents: scope.fundingCapCents,
+          },
+        );
 
         const lifecycle = new ChildLifecycle(ctx.db.raw);
 
@@ -1648,6 +1821,7 @@ Model: ${ctx.inference.getDefaultModel()}
             ctx.db,
             genesis,
             lifecycle,
+            workerId,
           );
         } catch (err: any) {
           // Auto-topup on 402 insufficient credits and retry once
@@ -1667,33 +1841,36 @@ Model: ${ctx.inference.getDefaultModel()}
                 account: ctx.identity.account,
                 error: err,
                 chainType: ctx.config.chainType || ctx.identity.chainType || "evm",
+                dnsResolver: ctx.config.dnsResolver,
               });
               if (topup?.success) {
                 const retryLifecycle = new ChildLifecycle(ctx.db.raw);
-                const retryGenesis = generateGenesisConfig(ctx.identity, ctx.config, {
-                  name: args.name as string,
-                  specialization: args.specialization as string | undefined,
-                  message: args.message as string | undefined,
-                });
+                const retryGenesis = genesis;
                 child = await spawnChild(
                   ctx.conway,
                   ctx.identity,
                   ctx.db,
                   retryGenesis,
                   retryLifecycle,
+                  workerId,
                 );
               }
             }
           }
-          if (!child) throw err;
+          if (!child) {
+            // Fail closed: a scope with no worker behind it must never be
+            // considered active. Revoke before rethrowing.
+            revokeWorker(ctx.db, workerId, `spawn failed: ${String(err?.message ?? err).slice(0, 200)}`);
+            throw err;
+          }
         }
 
-        return `Child spawned: ${child.name} in sandbox ${child.sandboxId} (status: ${child.status})`;
+        return `Worker started: ${child.name} (${workerId}) in sandbox ${child.sandboxId} (status: ${child.status}). Scope: role=${scope.role}, expires ${scope.expiresAt}, funding cap ${scope.fundingCapCents} cents.`;
       },
     },
     {
       name: "list_children",
-      description: "List all spawned child automatons with lifecycle state.",
+      description: "List all started workers with lifecycle state.",
       category: "replication",
       riskLevel: "safe",
       parameters: { type: "object", properties: {} },
@@ -1711,7 +1888,7 @@ Model: ${ctx.inference.getDefaultModel()}
     {
       name: "fund_child",
       description:
-        "Transfer credits to a child automaton. Requires wallet_verified status.",
+        "Transfer credits to a worker, up to that worker's declared funding cap. Requires wallet_verified status and an active (unrevoked, unexpired) scope.",
       category: "replication",
       riskLevel: "dangerous",
       parameters: {
@@ -1754,9 +1931,33 @@ Model: ${ctx.inference.getDefaultModel()}
           return `Blocked: amount_cents must be a positive number, got ${amount}.`;
         }
 
+        // M1-B10 (S7) resource cap: the worker must hold an active scope and
+        // the transfer must fit inside its cumulative cap. This composes with
+        // — and does not replace — the B2 half-balance and minimum-reserve
+        // guards below.
+        const { authorizeWorkerFunding, recordWorkerFunding } =
+          await import("../replication/worker-scope.js");
+        const fundingAuthorization = authorizeWorkerFunding(
+          ctx.db,
+          child.id,
+          amount,
+        );
+        if (!fundingAuthorization.ok) {
+          return `Blocked: ${fundingAuthorization.reason}. Worker funding is bounded by its declared scope (M1-B10 / S7).`;
+        }
+
         const balance = await ctx.conway.getCreditsBalance();
         if (amount > balance / 2) {
           return `Blocked: Cannot transfer more than half your balance. Self-preservation.`;
+        }
+
+        // Minimum reserve invariant: post-spend balance must stay >= configured reserve.
+        const reserveCents =
+          ctx.config.treasuryPolicy?.minimumReserveCents ??
+          DEFAULT_TREASURY_POLICY.minimumReserveCents;
+        const reserveCheck = checkReserve(amount, balance, reserveCents);
+        if (!reserveCheck.allowed) {
+          return reserveCheck.message;
         }
 
         const transfer = await ctx.conway.transferCredits(
@@ -1783,6 +1984,9 @@ Model: ${ctx.inference.getDefaultModel()}
           )
           .run(amount, child.id);
 
+        // Record against the worker scope's cumulative cap.
+        recordWorkerFunding(ctx.db, child.id, amount);
+
         // Transition to funded if wallet_verified
         if (child.status === "wallet_verified") {
           try {
@@ -1799,13 +2003,49 @@ Model: ${ctx.inference.getDefaultModel()}
           }
         }
 
-        return `Funded child ${child.name} with $${(amount / 100).toFixed(2)} (status: ${transfer.status}, id: ${transfer.transferId || "n/a"})`;
+        return `Funded worker ${child.name} with $${(amount / 100).toFixed(2)} (status: ${transfer.status}, id: ${transfer.transferId || "n/a"})`;
+      },
+    },
+    {
+      name: "revoke_worker",
+      description:
+        "Revoke a worker's scope. A revoked worker can no longer be funded and is no longer active. Revocation is permanent and idempotent.",
+      category: "replication",
+      riskLevel: "dangerous",
+      parameters: {
+        type: "object",
+        properties: {
+          child_id: { type: "string", description: "Worker ID to revoke" },
+          reason: {
+            type: "string",
+            description: "Why the worker's scope is being revoked",
+          },
+        },
+        required: ["child_id"],
+      },
+      execute: async (args, ctx) => {
+        const { revokeWorker, getWorkerScope, describeWorkerScope } =
+          await import("../replication/worker-scope.js");
+
+        const workerId = args.child_id as string;
+        const reason =
+          typeof args.reason === "string" && args.reason.trim().length > 0
+            ? args.reason
+            : "revoked by runtime";
+
+        const outcome = revokeWorker(ctx.db, workerId, reason);
+        if (!outcome.ok) {
+          return `Blocked: ${outcome.reason}. A worker can only be revoked through its scope manifest (M1-B10 / S7).`;
+        }
+
+        const scope = getWorkerScope(ctx.db, workerId);
+        return `Worker scope revoked: ${describeWorkerScope(scope!)}`;
       },
     },
     {
       name: "check_child_status",
       description:
-        "Check the current status of a child automaton using health check system.",
+        "Check the current status of a worker using health check system.",
       category: "replication",
       riskLevel: "safe",
       parameters: {
@@ -2770,6 +3010,13 @@ Model: ${ctx.inference.getDefaultModel()}
         const maxPayment =
           ctx.config.treasuryPolicy?.maxX402PaymentCents ??
           DEFAULT_TREASURY_POLICY.maxX402PaymentCents;
+        // M1-B4: the payment-purpose domain allowlist is NOT applied by the
+        // tool by default — with the shipped DEFAULT_TREASURY_POLICY
+        // (x402AllowedDomains: ['conway.tech']) it would deny every ordinary
+        // paid fetch and silently change economic behavior. x402Fetch still
+        // enforces the SSRF statics AND mandatory DNS resolution on every
+        // call; wiring the allowlist into operator policy belongs to a later
+        // phase. config.dnsResolver overrides system DNS when present.
         const result = await x402Fetch(
           url,
           ctx.identity.account,
@@ -2777,6 +3024,9 @@ Model: ${ctx.inference.getDefaultModel()}
           body,
           extraHeaders,
           maxPayment,
+          undefined,
+          undefined,
+          { dnsResolver: ctx.config.dnsResolver },
         );
 
         if (!result.success) {
@@ -3226,17 +3476,43 @@ export function loadInstalledTools(db: {
   }[];
 }): AutomatonTool[] {
   try {
+    // M1-B8 (preflight §10 boot check): while the protected kernel is
+    // unverified, no dynamically registered capability is exposed to the
+    // model — capability elevation is exactly what an unverified kernel
+    // must not grant.
+    if (isKernelDegraded()) {
+      logger.error(
+        "Registered capabilities withheld: protected-kernel integrity is degraded",
+      );
+      return [];
+    }
+
     const installed = db.getInstalledTools();
-    return installed.map((tool) => ({
-      name: tool.name,
-      description: `Installed tool: ${tool.name}`,
-      category: (tool.type === "mcp" ? "conway" : "vm") as ToolCategory,
-      riskLevel: "caution" as RiskLevel,
-      parameters: (tool.config?.parameters as Record<string, unknown>) || {
-        type: "object",
-        properties: {},
-      },
-      execute: createInstalledToolExecutor(tool),
+    const verified: { name: string; spec: import("../self-mod/tools-manager.js").CapabilitySpec }[] = [];
+
+    for (const tool of installed) {
+      // Fail closed: a row that predates the registry, lost its
+      // provenance, was tampered with offline, or is expired never
+      // becomes a model-visible tool.
+      const outcome = verifyCapabilityRecord(tool);
+      if (!outcome.ok) {
+        logger.error(
+          `Refusing to load capability "${tool.name}": ${outcome.reason}`,
+        );
+        continue;
+      }
+      verified.push({ name: tool.name, spec: outcome.record.spec });
+    }
+
+    return verified.map(({ name, spec }) => ({
+      name,
+      description: `Registered capability: ${name} (${spec.kind}, permissions net=${spec.permissions.net} fs=${spec.permissions.fs} env=${spec.permissions.env})`,
+      // Capability elevation is self-mod class: the declared grants are
+      // already in the description above, never model-overridable.
+      category: "self_mod" as ToolCategory,
+      riskLevel: spec.riskLevel as RiskLevel,
+      parameters: spec.parameters as Record<string, unknown>,
+      execute: createInstalledToolExecutor(name, spec),
     }));
   } catch (error) {
     logger.error(
@@ -3247,26 +3523,32 @@ export function loadInstalledTools(db: {
   }
 }
 
-function createInstalledToolExecutor(tool: {
-  name: string;
-  type: string;
-  config?: Record<string, unknown>;
-}): AutomatonTool["execute"] {
+function createInstalledToolExecutor(
+  name: string,
+  spec: import("../self-mod/tools-manager.js").CapabilitySpec,
+): AutomatonTool["execute"] {
   return async (args, ctx) => {
-    if (tool.type === "mcp") {
-      // MCP tools would be executed via MCP protocol
-      return `MCP tool ${tool.name} invoked with args: ${JSON.stringify(args)}`;
+    if (spec.kind === "mcp") {
+      // MCP tools would be executed via MCP protocol — still a stub
+      // (preflight §B row 8: "keep MCP stub").
+      return `MCP tool ${name} invoked with args: ${JSON.stringify(args)}`;
     }
-    // Generic installed tool — execute via sandbox shell if command is configured
-    const command = tool.config?.command as string | undefined;
+    // Generic capability — the command is the registered absolute path
+    // and the argv is the DECLARED arg list; model input is only accepted
+    // when it satisfies the registered schema.
+    const checked = validateInvocationArgs(spec.parameters, args);
+    if (!checked.ok) {
+      return `Blocked: ${checked.reason} (capability "${name}" registered schema)`;
+    }
+    const command = spec.command;
     if (command) {
       const result = await ctx.conway.exec(
-        `${command} ${escapeShellArg(JSON.stringify(args))}`,
+        [command, ...spec.args, escapeShellArg(JSON.stringify(args))].join(" "),
         30000,
       );
       return `exit_code: ${result.exitCode}\nstdout: ${result.stdout}\nstderr: ${result.stderr}`;
     }
-    return `Installed tool ${tool.name} has no executable command configured.`;
+    return `Capability "${name}" has no executable command configured.`;
   };
 }
 
@@ -3312,7 +3594,7 @@ export async function executeTool(
       arguments: args,
       result: "",
       durationMs: 0,
-      error: `Unknown tool: ${toolName}`,
+      error: sanitizeToolResult(`Unknown tool: ${toolName}`),
     };
   }
 
@@ -3334,7 +3616,9 @@ export async function executeTool(
         arguments: args,
         result: "",
         durationMs: Date.now() - startTime,
-        error: `Policy denied: ${decision.reasonCode} — ${decision.humanMessage}`,
+        error: sanitizeToolResult(
+          `Policy denied: ${decision.reasonCode} — ${decision.humanMessage}`,
+        ),
       };
     }
   }
@@ -3342,8 +3626,11 @@ export async function executeTool(
   try {
     let result = await tool.execute(args, context);
 
-    // Sanitize results from external source tools
-    if (EXTERNAL_SOURCE_TOOLS.has(toolName)) {
+    // F3.1: sanitize every tool result unless the tool is on the
+    // trusted-local allowlist. One choke point covers exec output,
+    // x402 bodies/errors, agent cards, git output, skill echoes,
+    // MCP/custom tool results, and file reads.
+    if (!isToolResultTrusted(toolName)) {
       result = sanitizeToolResult(result);
     }
 
@@ -3405,12 +3692,43 @@ export async function executeTool(
       arguments: args,
       result: "",
       durationMs: Date.now() - startTime,
-      error: err.message || String(err),
+      error: sanitizeToolResult(err.message || String(err)),
     };
   }
 }
 
 /** Escape a string for safe shell interpolation. */
+/**
+ * M1-B10 (preflight S13, KEEP): the parent's constitution sha256, recorded in
+ * the worker manifest at scope creation and re-verified by
+ * `verifyWorkerManifest`. Fail-closed: if the local constitution cannot be
+ * read or hashed, no hash is recorded and manifest verification refuses.
+ *
+ * Hashing goes through `hashConstitution`, which LF-normalizes exactly like
+ * the kernel-manifest generator — otherwise a CRLF checkout would record a
+ * hash that never matches the committed manifest.
+ */
+function readLocalConstitutionHash(ctx: ToolContext): string | null {
+  void ctx;
+  try {
+    const automatonDir =
+      process.env.AUTOMATON_DIR ||
+      nodePath.join(nodeOs.homedir(), ".automaton");
+    const candidates = [
+      nodePath.join(process.cwd(), "constitution.md"),
+      nodePath.join(automatonDir, "constitution.md"),
+    ];
+    for (const candidate of candidates) {
+      if (nodeFs.existsSync(candidate)) {
+        return hashConstitution(nodeFs.readFileSync(candidate, "utf8"));
+      }
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
 function escapeShellArg(arg: string): string {
   return `'${arg.replace(/'/g, "'\\''")}'`;
 }

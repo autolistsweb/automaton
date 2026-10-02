@@ -75,15 +75,16 @@ export const BUILTIN_TASKS: Record<string, HeartbeatTaskFn> = {
         name: taskCtx.config.name,
         address: taskCtx.identity.address,
         creditsCents: credits,
-        fundingHint:
-          "Use credit transfer API from a creator runtime to top this wallet up.",
+        // M1-B9 / preflight S3: ops-status record only. The heartbeat path
+        // writes the same last_distress key as the distress_signal tool, so it
+        // must not instruct any other agent or runtime to transfer credits.
         timestamp: new Date().toISOString(),
       };
       taskCtx.db.setKV("last_distress", JSON.stringify(distressPayload));
 
       return {
         shouldWake: true,
-        message: `Distress: ${tier}. Credits: $${(credits / 100).toFixed(2)}. Need funding.`,
+        message: `Distress: ${tier}. Credits: $${(credits / 100).toFixed(2)}. Compute credits exhausted.`,
       };
     }
 
@@ -126,7 +127,7 @@ export const BUILTIN_TASKS: Record<string, HeartbeatTaskFn> = {
           });
           return {
             shouldWake: true,
-            message: `Dead: zero credits for ${Math.round(elapsed / 60_000)} minutes. Need funding.`,
+            message: `Dead: zero credits for ${Math.round(elapsed / 60_000)} minutes. Compute exhausted.`,
           };
         }
       }
@@ -174,6 +175,7 @@ export const BUILTIN_TASKS: Record<string, HeartbeatTaskFn> = {
         account: taskCtx.identity.account,
         creditsCents: credits,
         chainType: taskCtx.config.chainType || taskCtx.identity.chainType || "evm",
+        dnsResolver: taskCtx.config.dnsResolver,
       });
 
       if (result?.success) {
@@ -688,14 +690,31 @@ export const BUILTIN_TASKS: Record<string, HeartbeatTaskFn> = {
       const { ChildLifecycle } = await import("../replication/lifecycle.js");
       const { SandboxCleanup } = await import("../replication/cleanup.js");
       const { pruneDeadChildren } = await import("../replication/lineage.js");
+      const { enforceWorkerExpiry } = await import("../replication/worker-scope.js");
 
       const lifecycle = new ChildLifecycle(taskCtx.db.raw);
       const cleanup = new SandboxCleanup(taskCtx.conway, lifecycle, taskCtx.db.raw);
+
+      // M1-B10 TTL remediation: this is the parent-owned periodic worker
+      // maintenance task, so the TTL sweep runs here rather than on a new
+      // scheduler. Enforces job lifetime before general pruning.
+      const expiry = await enforceWorkerExpiry(taskCtx.db, taskCtx.conway);
+      if (expiry.revoked.length > 0 || expiry.cleanedUp.length > 0 || expiry.malformed.length > 0) {
+        logger.info(
+          `Worker TTL sweep: ${expiry.revoked.length} revoked, ${expiry.cleanedUp.length} cleaned, ${expiry.malformed.length} malformed`,
+        );
+      }
+      for (const failure of expiry.errors) {
+        logger.error(`Worker TTL sweep failed for ${failure.workerId}: ${failure.reason}`);
+      }
+
       const cleaned = await pruneDeadChildren(taskCtx.db, cleanup);
 
       taskCtx.db.setKV("last_dead_agent_cleanup", JSON.stringify({
         timestamp: new Date().toISOString(),
         cleaned,
+        expiredWorkersRevoked: expiry.revoked.length,
+        expiredWorkersCleaned: expiry.cleanedUp.length,
       }));
 
       return { shouldWake: false };

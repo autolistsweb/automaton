@@ -91,6 +91,11 @@ describe("DurableScheduler", () => {
   let conway: MockConwayClient;
 
   beforeEach(() => {
+    // Defensive timer hygiene: some sibling suites in the shared worker
+    // install fake timers; a leaked install freezes every setTimeout in
+    // later files (including the bounded-balance-fetch timeouts), so the
+    // overlap-prevention test then hits the 30 s vitest timeout.
+    vi.useRealTimers();
     db = createTestDb();
     rawDb = db.raw;
     conway = new MockConwayClient();
@@ -98,6 +103,19 @@ describe("DurableScheduler", () => {
 
   afterEach(() => {
     db.close();
+  });
+
+  describe("worker timer sanity", () => {
+    it("real setTimeout resolves (fake-timer leak guard)", async () => {
+      // A sibling suite that creates vi.spyOn(globalThis, "setTimeout")
+      // while fake timers are active poisons the shared fork worker so
+      // real timers never fire in later files — previously surfacing as a
+      // confusing 30 s timeout in the overlap-prevention test below. This
+      // guard fails fast with the actual cause if that pattern regresses.
+      const t0 = Date.now();
+      await new Promise<void>((resolve) => setTimeout(resolve, 50));
+      expect(Date.now() - t0).toBeLessThan(10_000);
+    });
   });
 
   describe("tick overlap prevention", () => {
@@ -371,6 +389,40 @@ describe("DurableScheduler", () => {
       expect(ctx.lowComputeMultiplier).toBe(4);
       expect(ctx.config).toBe(DEFAULT_HB_CONFIG);
       expect(ctx.db).toBe(rawDb);
+    });
+
+    it("completes when the credit balance fetch hangs (CI regression)", async () => {
+      // Regression for the M1 CI failure: buildTickContext awaited the
+      // credit-balance fetch without a bound, so a stalled RPC froze the
+      // tick (and the scheduler suite timed out after 30 s). The fetch is
+      // now bounded; the context must complete with the degraded value.
+      conway.getCreditsBalance = () => new Promise(() => {}); // never resolves
+
+      const ctx = await buildTickContext(rawDb, conway, DEFAULT_HB_CONFIG);
+
+      expect(ctx.creditBalance).toBe(0);
+      expect(ctx.survivalTier).toBe("critical");
+    });
+
+    it("completes when the USDC balance fetch hangs (CI regression)", async () => {
+      // Same bound for the on-chain USDC read (real viem/Solana RPC).
+      vi.resetModules();
+      vi.doMock("../conway/x402.js", () => ({
+        getUsdcBalance: () => new Promise(() => {}), // never resolves
+      }));
+      const { buildTickContext: buildCtxMocked } = await import(
+        "../heartbeat/tick-context.js"
+      );
+
+      const ctx = await buildCtxMocked(
+        rawDb,
+        conway,
+        DEFAULT_HB_CONFIG,
+        createTestIdentity().address,
+        "evm",
+      );
+
+      expect(ctx.usdcBalance).toBe(0);
     });
 
     it("handles API failure gracefully", async () => {
