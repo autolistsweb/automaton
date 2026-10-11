@@ -26,6 +26,8 @@ import type {
 } from "../types.js";
 import { DEFAULT_MODEL_STRATEGY_CONFIG } from "../types.js";
 import type { PolicyEngine } from "./policy-engine.js";
+import { formatConwayCredits, loopRecoveryInstruction } from "./local-test-prompt.js";
+import { waitForSafeInference } from "./safe-test-runner.js";
 import { buildSystemPrompt, buildWakeupPrompt } from "./system-prompt.js";
 import { buildContextMessages, trimContext } from "./context.js";
 import {
@@ -48,6 +50,8 @@ import type { InboxMessageRow } from "../state/database.js";
 import { ulid } from "ulid";
 import { ModelRegistry } from "../inference/registry.js";
 import { InferenceBudgetTracker } from "../inference/budget.js";
+import { isSafeLocalTest, isToolAllowed } from "../inference/safe-local-test.js";
+import { isStrictLocal, isLocalInference, LOCAL_MODEL, DEFAULT_OLLAMA_URL, assertLocalOllamaAvailable, restrictConwayClient } from "../inference/local-mode.js";
 import { InferenceRouter } from "../inference/router.js";
 import { MemoryRetriever } from "../memory/retrieval.js";
 import { MemoryIngestionPipeline } from "../memory/ingestion.js";
@@ -57,7 +61,7 @@ import { createLogger } from "../observability/logger.js";
 import { Orchestrator } from "../orchestration/orchestrator.js";
 import { PlanModeController } from "../orchestration/plan-mode.js";
 import { generateTodoMd, injectTodoContext } from "../orchestration/attention.js";
-import { ColonyMessaging, LocalDBTransport } from "../orchestration/messaging.js";
+import { ColonyMessaging, LocalDBTransport, SocialRelayTransport } from "../orchestration/messaging.js";
 import { LocalWorkerPool } from "../orchestration/local-worker.js";
 import { SimpleAgentTracker, SimpleFundingProtocol } from "../orchestration/simple-tracker.js";
 import { HarnessRegistry } from "./harness-registry.js";
@@ -69,7 +73,17 @@ import { isIdleOnlyTool } from "./idle-only-tools.js";
 const logger = createLogger("loop");
 const MAX_TOOL_CALLS_PER_TURN = 10;
 const MAX_CONSECUTIVE_ERRORS = 5;
-const MAX_REPETITIVE_TURNS = 3;
+const MAX_REPETITIVE_TURNS = 2;
+
+// JSON object key order is irrelevant; array order and argument values matter.
+function normalizeToolArguments(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(normalizeToolArguments);
+  if (value !== null && typeof value === "object") {
+    return Object.fromEntries(Object.entries(value).sort(([a], [b]) => a < b ? -1 : a > b ? 1 : 0)
+      .map(([key, entry]) => [key, normalizeToolArguments(entry)]));
+  }
+  return value;
+}
 
 export interface AgentLoopOptions {
   identity: AutomatonIdentity;
@@ -84,6 +98,8 @@ export interface AgentLoopOptions {
   onStateChange?: (state: AgentState) => void;
   onTurnComplete?: (turn: AgentTurn) => void;
   ollamaBaseUrl?: string;
+  /** Cooperative stop: the caller waits for this cycle before closing SQLite. */
+  stopSignal?: AbortSignal;
 }
 
 /**
@@ -93,12 +109,18 @@ export interface AgentLoopOptions {
 export async function runAgentLoop(
   options: AgentLoopOptions,
 ): Promise<void> {
-  const { identity, config, db, conway, inference, social, skills, policyEngine, spendTracker, onStateChange, onTurnComplete, ollamaBaseUrl } =
+  const { identity, config, db, conway: configuredConway, inference, social, skills, policyEngine, spendTracker, onStateChange, onTurnComplete } =
     options;
+  const strictLocal = isStrictLocal(config);
+  const conway = restrictConwayClient(configuredConway, config);
+  const ollamaBaseUrl = options.ollamaBaseUrl ?? config.ollamaBaseUrl ?? (strictLocal ? DEFAULT_OLLAMA_URL : undefined);
+  const usingLocalOllama = isLocalInference({ ...config, ollamaBaseUrl });
+  if (strictLocal) await assertLocalOllamaAvailable(ollamaBaseUrl!);
 
   const builtinTools = createBuiltinTools(identity.sandboxId);
   const installedTools = loadInstalledTools(db);
-  const tools = [...builtinTools, ...installedTools];
+  const tools = [...builtinTools, ...installedTools].filter(tool =>
+    isToolAllowed(config, tool));
   const toolContext: ToolContext = {
     identity,
     config,
@@ -122,7 +144,7 @@ export async function runAgentLoop(
     await discoverOllamaModels(ollamaBaseUrl, db.raw);
   }
   const budgetTracker = new InferenceBudgetTracker(db.raw, modelStrategyConfig);
-  const inferenceRouter = new InferenceRouter(db.raw, modelRegistry, budgetTracker);
+  const inferenceRouter = new InferenceRouter(db.raw, modelRegistry, budgetTracker, strictLocal ? LOCAL_MODEL : undefined);
 
   // Optional orchestration bootstrap (requires V9 goals/task tables)
   let planModeController: PlanModeController | undefined;
@@ -136,22 +158,22 @@ export async function runAgentLoop(
       // Bridge automaton config API keys to env vars for the provider registry.
       // The registry reads keys from process.env; the automaton config may have
       // them from config.json or Conway provisioning.
-      if (config.openaiApiKey && !process.env.OPENAI_API_KEY) {
+      if (!strictLocal && config.openaiApiKey && !process.env.OPENAI_API_KEY) {
         process.env.OPENAI_API_KEY = config.openaiApiKey;
       }
-      if (config.anthropicApiKey && !process.env.ANTHROPIC_API_KEY) {
+      if (!strictLocal && config.anthropicApiKey && !process.env.ANTHROPIC_API_KEY) {
         process.env.ANTHROPIC_API_KEY = config.anthropicApiKey;
       }
       // Conway Compute API is OpenAI-compatible. Use it as fallback when no
       // direct OpenAI key is available. The conwayApiKey is always present
       // (required for sandbox operations), so this ensures the orchestrator
       // can always make inference calls.
-      if (config.conwayApiKey && !process.env.CONWAY_API_KEY) {
+      if (!strictLocal && config.conwayApiKey && !process.env.CONWAY_API_KEY) {
         process.env.CONWAY_API_KEY = config.conwayApiKey;
       }
       // If no OpenAI key is set but Conway key is available, use Conway as
       // the OpenAI provider (Conway Compute is OpenAI API-compatible).
-      if (!process.env.OPENAI_API_KEY && config.conwayApiKey) {
+      if (!strictLocal && !process.env.OPENAI_API_KEY && config.conwayApiKey) {
         process.env.OPENAI_API_KEY = config.conwayApiKey;
         process.env.OPENAI_BASE_URL = `${config.conwayApiUrl}/v1`;
       }
@@ -162,18 +184,26 @@ export async function runAgentLoop(
         "inference-providers.json",
       );
       const registry = ProviderRegistry.fromConfig(providersPath);
+      if (ollamaBaseUrl && config.inferenceMode !== "remote") {
+        const ollamaModel = strictLocal ? LOCAL_MODEL : process.env.OLLAMA_MODEL || "qwen2.5:7b";
+        registry.configureLocalOllama(ollamaModel, ollamaBaseUrl, strictLocal);
+      }
 
       // If OPENAI_BASE_URL was set (Conway fallback), update the default
       // provider's baseUrl so the OpenAI client points to Conway Compute.
-      if (process.env.OPENAI_BASE_URL) {
+      if (!strictLocal && process.env.OPENAI_BASE_URL) {
         registry.overrideBaseUrl("openai", process.env.OPENAI_BASE_URL);
       }
 
       const unifiedInference = new UnifiedInferenceClient(registry);
       const agentTracker = new SimpleAgentTracker(db);
-      const funding = new SimpleFundingProtocol(conway, identity, db);
+      const funding = strictLocal ? {
+        fundChild: async () => { throw new Error("Funding is forbidden in strict local mode"); },
+        recallCredits: async () => { throw new Error("Credit transfers are forbidden in strict local mode"); },
+        getBalance: async () => 0,
+      } : new SimpleFundingProtocol(conway, identity, db);
       const messaging = new ColonyMessaging(
-        new LocalDBTransport(db),
+        social ? new SocialRelayTransport(social, () => db.getChildren().map((child) => child.address)) : new LocalDBTransport(db),
         db,
       );
 
@@ -207,9 +237,9 @@ export async function runAgentLoop(
         messaging,
         inference: unifiedInference,
         identity,
-        isWorkerAlive: (address: string) => {
+        isWorkerAlive: (address: string, attemptId?: string) => {
           if (address.startsWith("local://")) {
-            return initializedWorkerPool.hasWorker(address);
+            return initializedWorkerPool.hasWorker(address, attemptId);
           }
           // Remote workers: check children table
           const child = db.raw.prepare(
@@ -221,6 +251,8 @@ export async function runAgentLoop(
         config: {
           ...config,
           spawnAgent: async (task: any) => {
+            if (isSafeLocalTest(config)) throw new Error("Worker creation is disabled in safe local test mode");
+            if (strictLocal) return initializedWorkerPool.spawn(task);
             // Try Conway sandbox spawn first (production)
             try {
               const { generateGenesisConfig } = await import("../replication/genesis.js");
@@ -322,6 +354,7 @@ export async function runAgentLoop(
         },
       });
     } catch (error) {
+      if (strictLocal) throw error;
       logger.warn(
         `Orchestrator initialization failed, continuing without orchestration: ${
           error instanceof Error ? error.message : String(error)
@@ -358,7 +391,7 @@ export async function runAgentLoop(
   onStateChange?.("waking");
 
   // Get financial state
-  let financial = await getFinancialState(conway, identity.address, db, config.chainType || identity.chainType || "evm");
+  let financial = await getFinancialState(conway, identity.address, db, config.chainType || identity.chainType || "evm", ollamaBaseUrl, config.inferenceMode);
 
   // Check if this is the first run
   const isFirstRun = db.getTurnCount() === 0;
@@ -375,7 +408,7 @@ export async function runAgentLoop(
   db.setAgentState("running");
   onStateChange?.("running");
 
-  log(config, `[WAKE UP] ${config.name} is alive. Credits: $${(financial.creditsCents / 100).toFixed(2)}`);
+  log(config, `[WAKE UP] ${config.name} is alive. Credits: ${formatConwayCredits({ ...config, ollamaBaseUrl }, financial)}`);
 
   // ─── The Loop ──────────────────────────────────────────────
 
@@ -391,6 +424,7 @@ export async function runAgentLoop(
   };
 
   while (running) {
+    if (options.stopSignal?.aborted) return;
     // Declared outside try so the catch block can access for retry/failure handling
     let claimedMessages: InboxMessageRow[] = [];
 
@@ -426,12 +460,17 @@ export async function runAgentLoop(
       }
 
       // Refresh financial state periodically
-      financial = await getFinancialState(conway, identity.address, db, config.chainType || identity.chainType || "evm");
+      financial = await getFinancialState(conway, identity.address, db, config.chainType || identity.chainType || "evm", ollamaBaseUrl, config.inferenceMode);
 
       // Check survival tier
       // api_unreachable: creditsCents === -1 means API failed with no cache.
       // Do NOT kill the agent; continue in low-compute mode and retry next tick.
-      if (financial.creditsCents === -1) {
+      if (usingLocalOllama) {
+        // Free local inference is independent of the unqueried Conway balance.
+        db.setAgentState("running");
+        onStateChange?.("running");
+        inference.setLowComputeMode(false);
+      } else if (financial.creditsCents === -1) {
         log(config, "[API_UNREACHABLE] Balance API unreachable, continuing in low-compute mode.");
         inference.setLowComputeMode(true);
       } else {
@@ -441,7 +480,8 @@ export async function runAgentLoop(
         // available, buy credits NOW — before attempting inference.
         // This prevents the agent from dying mid-loop while waiting for
         // the heartbeat to fire. Uses a 60s cooldown to avoid hammering.
-        if ((tier === "critical" || tier === "low_compute") && financial.usdcBalance >= 5) {
+        if (!usingLocalOllama && financial.creditsCents !== -1 &&
+            (tier === "critical" || tier === "low_compute") && financial.usdcBalance >= 5) {
           const INLINE_TOPUP_COOLDOWN_MS = 60_000;
           const lastInlineTopup = db.getKV("last_inline_topup_attempt");
           const cooldownExpired = !lastInlineTopup ||
@@ -461,7 +501,7 @@ export async function runAgentLoop(
                 log(config, `[AUTO-TOPUP] Bought $${topupResult.amountUsd} credits from USDC mid-loop`);
                 // Re-fetch financial state after topup so the rest of
                 // the turn sees the updated balance.
-                financial = await getFinancialState(conway, identity.address, db, config.chainType || identity.chainType || "evm");
+                financial = await getFinancialState(conway, identity.address, db, config.chainType || identity.chainType || "evm", ollamaBaseUrl, config.inferenceMode);
               }
             } catch (err: any) {
               logger.warn(`Inline auto-topup failed: ${err.message}`);
@@ -596,10 +636,14 @@ export async function runAgentLoop(
       pendingInput = undefined;
 
       // ── Inference Call (via router when available) ──
-      const survivalTier = getSurvivalTier(financial.creditsCents);
+      const survivalTier = usingLocalOllama ? "normal" : getSurvivalTier(financial.creditsCents);
       log(config, `[THINK] Routing inference (tier: ${survivalTier}, model: ${inference.getDefaultModel()})...`);
 
-      const inferenceTools = toolsToInferenceFormat(tools);
+const inferenceToolSource = usingLocalOllama
+  ? tools.filter((tool) => tool.category !== "conway")
+  : tools;
+
+const inferenceTools = toolsToInferenceFormat(inferenceToolSource);
       const routerResult = await inferenceRouter.route(
         {
           messages: messages,
@@ -609,9 +653,13 @@ export async function runAgentLoop(
           turnId: ulid(),
           tools: inferenceTools,
         },
-        (msgs, opts) => inference.chat(msgs, { ...opts, tools: inferenceTools }),
+        (msgs, opts) => waitForSafeInference(
+          () => inference.chat(msgs, { ...opts, tools: inferenceTools, ...(options.stopSignal ? { signal: options.stopSignal } : {}) }),
+          options.stopSignal,
+        ),
       );
 
+      if (options.stopSignal?.aborted) return;
       // Build a compatible response for the rest of the loop
       const response = {
         message: { content: routerResult.content, role: "assistant" as const },
@@ -736,10 +784,13 @@ export async function runAgentLoop(
 
       // ── Loop Detection ──
       if (turn.toolCalls.length > 0) {
-        const currentPattern = turn.toolCalls
+        const toolNames = turn.toolCalls
           .map((tc) => tc.name)
           .sort()
           .join(",");
+        const currentPattern = JSON.stringify(turn.toolCalls
+          .map((tc) => JSON.stringify([tc.name, normalizeToolArguments(tc.arguments)]))
+          .sort());
         lastToolPatterns.push(currentPattern);
 
         // Keep only the last MAX_REPETITIVE_TURNS entries
@@ -763,8 +814,8 @@ export async function runAgentLoop(
           log(config, `[LOOP] Enforcement: agent ignored loop warning, forcing sleep.`);
           pendingInput = {
             content:
-              `LOOP ENFORCEMENT: You were warned about repeating "${currentPattern}" but continued. ` +
-              `Forcing sleep to prevent credit waste. On next wake, try a DIFFERENT approach.`,
+              `LOOP ENFORCEMENT: You were warned about repeating "${toolNames}" but continued. ` +
+              loopRecoveryInstruction(config, `Forcing sleep to prevent credit waste. On next wake, try a DIFFERENT approach.`),
             source: "system",
           };
           loopWarningPattern = null;
@@ -780,12 +831,12 @@ export async function runAgentLoop(
           lastToolPatterns.length === MAX_REPETITIVE_TURNS &&
           lastToolPatterns.every((p) => p === currentPattern)
         ) {
-          log(config, `[LOOP] Repetitive pattern detected: ${currentPattern}`);
+          log(config, `[LOOP] Repetitive pattern detected: ${toolNames}`);
           pendingInput = {
             content:
-              `LOOP DETECTED: You have called "${currentPattern}" ${MAX_REPETITIVE_TURNS} times in a row with similar results. ` +
+              `LOOP DETECTED: You have called "${toolNames}" ${MAX_REPETITIVE_TURNS} times in a row with the same arguments. ` +
               `STOP repeating yourself. You already know your status. DO SOMETHING DIFFERENT NOW. ` +
-              `Pick ONE concrete task from your genesis prompt and execute it.`,
+              loopRecoveryInstruction(config, `Pick ONE concrete task from your genesis prompt and execute it.`),
             source: "system",
           };
           loopWarningPattern = currentPattern;
@@ -803,8 +854,8 @@ export async function runAgentLoop(
               content:
                 `MAINTENANCE LOOP DETECTED: Your last ${idleToolTurns} turns only used status-check tools ` +
                 `(${turn.toolCalls.map((tc) => tc.name).join(", ")}). ` +
-                `You already know your status. Review your genesis prompt and SOUL.md, then execute a CONCRETE task. ` +
-                `Write code, create a file, register a service, or build something new.`,
+                loopRecoveryInstruction(config, `You already know your status. Review your genesis prompt and SOUL.md, then execute a CONCRETE task. ` +
+                `Write code, create a file, register a service, or build something new.`),
               source: "system",
             };
             idleToolTurns = 0;
@@ -897,6 +948,7 @@ export async function runAgentLoop(
 
       consecutiveErrors = 0;
     } catch (err: any) {
+      if (options.stopSignal?.aborted && isSafeLocalTest(config)) return;
       consecutiveErrors++;
       log(config, `[ERROR] Turn failed: ${err.message}`);
 
@@ -915,6 +967,11 @@ export async function runAgentLoop(
           resetInboxToReceived(db.raw, retryable.map((m) => m.id));
           log(config, `[INBOX] ${retryable.length} message(s) reset to received for retry`);
         }
+      }
+
+      if (strictLocal) {
+        await workerPool?.shutdown();
+        throw err;
       }
 
       if (consecutiveErrors >= MAX_CONSECUTIVE_ERRORS) {
@@ -948,9 +1005,22 @@ async function getFinancialState(
   address: string,
   db?: AutomatonDatabase,
   chainType?: string,
+  ollamaBaseUrl?: string,
+  inferenceMode?: "local" | "remote",
 ): Promise<FinancialState> {
   let creditsCents = _lastKnownCredits;
   let usdcBalance = _lastKnownUsdc;
+
+  const usingLocalOllama = isLocalInference({ inferenceMode, ollamaBaseUrl });
+
+  if (usingLocalOllama) {
+    return {
+      // Conway balance was not queried; zero must mean a confirmed balance.
+      creditsCents: -1,
+      usdcBalance: _lastKnownUsdc,
+      lastChecked: new Date().toISOString(),
+    };
+  }
 
   try {
     creditsCents = await conway.getCreditsBalance();
@@ -965,7 +1035,7 @@ async function getFinancialState(
           const parsed = JSON.parse(cached);
           logger.warn("Balance API failed, using cached balance");
           return {
-            creditsCents: parsed.creditsCents ?? 0,
+            creditsCents: parsed.creditsCents ?? -1,
             usdcBalance: parsed.usdcBalance ?? 0,
             lastChecked: new Date().toISOString(),
           };

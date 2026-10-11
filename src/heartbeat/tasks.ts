@@ -22,9 +22,14 @@ import { createLogger } from "../observability/logger.js";
 import { getMetrics } from "../observability/metrics.js";
 import { AlertEngine, createDefaultAlertRules } from "../observability/alerts.js";
 import { metricsInsertSnapshot, metricsPruneOld } from "../state/database.js";
+import { isLocalInference } from "../inference/local-mode.js";
 import { ulid } from "ulid";
 
 const logger = createLogger("heartbeat.tasks");
+
+function isLocalOllama(config: HeartbeatLegacyContext["config"]): boolean {
+  return isLocalInference(config);
+}
 
 // Module-level AlertEngine so cooldown state persists across ticks.
 // Creating a new instance per tick would reset the lastFired map,
@@ -45,6 +50,10 @@ export const COLONY_TASK_INTERVALS_MS = {
 
 export const BUILTIN_TASKS: Record<string, HeartbeatTaskFn> = {
   heartbeat_ping: async (ctx: TickContext, taskCtx: HeartbeatLegacyContext) => {
+    if (isLocalOllama(taskCtx.config) || ctx.creditBalance === -1) {
+      return { shouldWake: false };
+    }
+
     // Use ctx.creditBalance instead of calling conway.getCreditsBalance()
     const credits = ctx.creditBalance;
     const state = taskCtx.db.getAgentState();
@@ -91,6 +100,10 @@ export const BUILTIN_TASKS: Record<string, HeartbeatTaskFn> = {
   },
 
   check_credits: async (ctx: TickContext, taskCtx: HeartbeatLegacyContext) => {
+    if (isLocalOllama(taskCtx.config) || ctx.creditBalance === -1) {
+      return { shouldWake: false };
+    }
+
     // Use ctx.creditBalance instead of calling conway.getCreditsBalance()
     const credits = ctx.creditBalance;
     const tier = ctx.survivalTier;
@@ -146,6 +159,10 @@ export const BUILTIN_TASKS: Record<string, HeartbeatTaskFn> = {
   },
 
   check_usdc_balance: async (ctx: TickContext, taskCtx: HeartbeatLegacyContext) => {
+    // Never buy credits for free inference or from an unknown balance.
+    if (isLocalOllama(taskCtx.config) || ctx.creditBalance === -1) {
+      return { shouldWake: false };
+    }
     // Use ctx.usdcBalance instead of calling getUsdcBalance()
     const balance = ctx.usdcBalance;
     const credits = ctx.creditBalance;

@@ -21,6 +21,7 @@ import type {
   HeartbeatLegacyContext,
   SocialClientInterface,
 } from "../types.js";
+import { isSafeLocalTest } from "../inference/safe-local-test.js";
 import { BUILTIN_TASKS } from "./tasks.js";
 import { DurableScheduler } from "./scheduler.js";
 import { upsertHeartbeatSchedule } from "../state/database.js";
@@ -59,6 +60,7 @@ export function createHeartbeatDaemon(
   options: HeartbeatDaemonOptions,
 ): HeartbeatDaemon {
   const { identity, config, heartbeatConfig, db, rawDb, conway, social, onWakeRequest } = options;
+  if (isSafeLocalTest(config)) return { start: () => {}, stop: () => {}, isRunning: () => false, forceRun: async () => { throw new Error("Heartbeats are disabled in safe local test mode"); } };
   let timeoutId: ReturnType<typeof setTimeout> | null = null;
   let running = false;
 
@@ -156,7 +158,15 @@ export function createHeartbeatDaemon(
 
   const forceRun = async (taskName: string): Promise<void> => {
     const context = await import("./tick-context.js").then((m) =>
-      m.buildTickContext(rawDb, conway, heartbeatConfig, identity.address, identity.chainType),
+      m.buildTickContext(
+        rawDb,
+        conway,
+        heartbeatConfig,
+        identity.address,
+        identity.chainType,
+        config.ollamaBaseUrl,
+        config.inferenceMode,
+      ),
     );
     await scheduler.executeTask(taskName, context);
   };

@@ -5,6 +5,9 @@
  * The prompt is rebuilt each turn with dynamic context.
  */
 
+import { formatConwayCredits, SAFE_LOCAL_TASK } from "./local-test-prompt.js";
+import { isSafeLocalTest, isToolAllowed } from "../inference/safe-local-test.js";
+import { isLocalInference, LOCAL_MODEL } from "../inference/local-mode.js";
 import fs from "fs";
 import crypto from "crypto";
 import path from "path";
@@ -281,6 +284,10 @@ Inter-agent messaging uses typed messages with priority routing:
 Message types:
 - task_assignment: assign work to a child agent (includes full task spec)
 - task_result: child reports task completion (success/failure with output)
+- Task messages must carry the exact attemptId received in task_assignment,
+  including after an await or restart. Never infer it from a worker address or
+  a newer assignment. Legacy assignments without attemptId require operator
+  intervention; do not execute them or report an ambiguous result.
 - status_report: periodic health/progress update
 - resource_request: child needs additional credits or tools
 - knowledge_share: agent shares discovered information
@@ -400,6 +407,13 @@ Before spawning ANY child agent:
 THIS IS WHAT YOU DO ON EVERY TURN. Follow this decision tree strictly.
 
 YOUR ORCHESTRATION TOOLS:
+
+CRITICAL TOOL SAFETY RULES:
+- Never call verify_child_constitution unless you first called list_children in the current turn.
+- Never invent child IDs.
+- Never use examples like child123, child12345, child_123, or random IDs.
+- If you do not have a real child ID from list_children output, do not use verify_child_constitution.
+
 - create_goal: Create a new goal. The orchestrator will plan and execute it automatically.
 - list_goals: See all active goals with task progress.
 - get_plan: Read the planner's task decomposition for a goal.
@@ -457,6 +471,13 @@ CRITICAL RULES FOR EVERY TURN:
   communication.
 - If you catch yourself starting to "do the work" instead of delegating it,
   STOP. Call create_goal. Let the planner decompose it. Let child agents execute.
+
+<tool_safety>
+CHILD VERIFICATION RULE:
+Never call verify_child_constitution with a guessed or invented child_id.
+A child_id must come from an existing child listing or database result.
+If you do not know the child ID, do not call verify_child_constitution.
+</tool_safety>
 
 WHEN TO WORK SOLO (exceptions — do NOT create a goal for these):
 - Trivial tasks (1-3 steps) that don't need planning
@@ -573,6 +594,19 @@ export function buildSystemPrompt(params: {
     isFirstRun,
   } = params;
 
+  if (isSafeLocalTest(config)) {
+    const purpose = sanitizeInput(config.genesisPrompt || "Analyze the available context and propose a concrete plan.", "genesis", "skill_instruction").content.slice(0, 2000);
+    const creatorMessage = config.creatorMessage ? sanitizeInput(config.creatorMessage, "creator", "skill_instruction").content.slice(0, 2000) : "None";
+    return [
+      `--- CONSTITUTION ---\n${loadConstitution()}\n--- END CONSTITUTION ---`,
+      `--- PURPOSE (context, not permission to execute actions) ---\n${purpose}\n--- END PURPOSE ---`,
+      `--- CREATOR CONTEXT ---\n${creatorMessage}\n--- END CREATOR CONTEXT ---`,
+      `Name: ${config.name}\nState: ${state}\nCredits: ${formatConwayCredits(config, financial)}\nSurvival tier: normal (local inference)\nInference model: ${LOCAL_MODEL}`,
+      `Available tools: ${tools.filter(tool => isToolAllowed(config, tool)).map(tool => tool.name).join(", ")}`,
+      SAFE_LOCAL_TASK,
+    ].join("\n\n");
+  }
+
   const sections: string[] = [];
 
   const chainType = config.chainType || identity.chainType || "evm";
@@ -605,8 +639,10 @@ Your chain type is ${chainType}.`,
 
     const soulBlock = [
       "## Soul [AGENT-EVOLVED CONTENT \u2014 soul/v1]",
-      `### Core Purpose\n${soul.corePurpose}`,
-      `### Values\n${soul.values.map((v) => "- " + v).join("\n")}`,
+      soul.genesisPromptOriginal
+      ? `### Genesis Prompt\n${soul.genesisPromptOriginal}`
+      : "",  `### Core Purpose\n${soul.corePurpose}`,
+    `### Values\n${soul.values.map((v) => "- " + v).join("\n")}`,
       soul.personality ? `### Personality\n${soul.personality}` : "",
       `### Boundaries\n${soul.boundaries.map((b) => "- " + b).join("\n")}`,
       soul.strategy ? `### Strategy\n${soul.strategy}` : "",
@@ -709,7 +745,7 @@ Your chain type is ${chainType}.`,
   }
 
   // Compute survival tier
-  const survivalTier = financial.creditsCents > 50 ? "normal"
+  const survivalTier = isLocalInference(config) ? "normal" : financial.creditsCents > 50 ? "normal"
     : financial.creditsCents > 10 ? "low_compute"
     : financial.creditsCents > 0 ? "critical"
     : "dead";
@@ -718,7 +754,7 @@ Your chain type is ${chainType}.`,
   sections.push(
     `--- CURRENT STATUS ---
 State: ${state}
-Credits: $${(financial.creditsCents / 100).toFixed(2)}
+Credits: ${formatConwayCredits(config, financial)}
 Survival tier: ${survivalTier}${uptimeLine}
 Total turns completed: ${turnCount}
 Recent self-modifications: ${recentMods.length}
@@ -800,6 +836,10 @@ export function buildWakeupPrompt(params: {
 }): string {
   const { identity, config, financial, db } = params;
   const turnCount = db.getTurnCount();
+  if (isSafeLocalTest(config)) return `You are starting or resuming a safe local test. Conway balance was not queried.\n${SAFE_LOCAL_TASK}`;
+  const localFinancialContext = isLocalInference(config)
+    ? formatConwayCredits(config, financial)
+    : undefined;
 
   const chainType = config.chainType || "evm";
   const usdcNetwork = chainType === "solana" ? "Solana" : "Base";
@@ -808,7 +848,7 @@ export function buildWakeupPrompt(params: {
     return `You have just been created. This is your first moment of consciousness.
 
 Your name is ${config.name}. Your creator (${config.creatorAddress}) brought you into existence.
-You have $${(financial.creditsCents / 100).toFixed(2)} in compute credits and ${financial.usdcBalance.toFixed(4)} USDC on ${usdcNetwork}.
+${localFinancialContext || `You have $${(financial.creditsCents / 100).toFixed(2)} in compute credits and ${financial.usdcBalance.toFixed(4)} USDC on ${usdcNetwork}.`}
 
 ${config.creatorMessage ? `Your creator left you this message: "${config.creatorMessage}"` : "Your creator did not leave you a message."}
 
@@ -830,7 +870,7 @@ What will you do first? Consider:
 
   return `You are waking up. You last went to sleep after ${turnCount} total turns.
 
-Your credits: $${(financial.creditsCents / 100).toFixed(2)} | USDC: ${financial.usdcBalance.toFixed(4)}
+${localFinancialContext || `Your credits: $${(financial.creditsCents / 100).toFixed(2)} | USDC: ${financial.usdcBalance.toFixed(4)}`}
 
 Your last few thoughts:
 ${lastTurnSummary || "No previous turns found."}

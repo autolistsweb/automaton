@@ -1,3 +1,4 @@
+import { isSafeLocalTest } from "../../inference/safe-local-test.js";
 import { exec as execCb } from "node:child_process";
 import { promises as fs } from "node:fs";
 import path from "node:path";
@@ -14,6 +15,16 @@ const MAX_EXEC_TIMEOUT_MS = 30_000;
 const MAX_READ_SIZE = 10_000;
 const MAX_EXEC_OUTPUT = 16_000;
 const MAX_SOCIAL_MESSAGES = 20;
+const LOCAL_OLLAMA_BLOCKED_TOOLS = new Set([
+  "check_credits",
+  "transfer_credits",
+  "discover_agents",
+  "check_reputation",
+  "search_domains",
+  "register_domain",
+  "manage_dns",
+  "x402_fetch",
+]);
 const GENERAL_WRAPPED_TOOL_ALLOWLIST = new Set([
   "expose_port",
   "remove_port",
@@ -119,6 +130,7 @@ When calling task_done, provide:
           required: ["command"],
         },
         execute: async (args) => {
+          if (isSafeLocalTest(this.context.config)) return "Blocked: system commands are disabled in safe local test mode";
           const command = args.command as string;
           const timeoutMs = Math.min(
             typeof args.timeout_ms === "number" ? args.timeout_ms : MAX_EXEC_TIMEOUT_MS,
@@ -132,6 +144,7 @@ When calling task_done, provide:
             const result = await this.context.conway.exec(command, timeoutMs);
             return formatExecResult(result.stdout ?? "", result.stderr ?? "");
           } catch {
+            this.context.assertActive?.();
             return localExec(command, timeoutMs);
           }
         },
@@ -161,8 +174,10 @@ When calling task_done, provide:
             await this.context.conway.writeFile(confined, content);
             return `Wrote ${content.length} bytes to ${confined}`;
           } catch {
+            this.context.assertActive?.();
             try {
               await fs.mkdir(path.dirname(confined), { recursive: true });
+              this.context.assertActive?.();
               await fs.writeFile(confined, content, "utf8");
               return `Wrote ${content.length} bytes to ${confined} (local)`;
             } catch (error) {
@@ -214,6 +229,7 @@ When calling task_done, provide:
           },
         },
         execute: async (args) => {
+          if (isSafeLocalTest(this.context.config)) return "Blocked: social signing is disabled in safe local test mode";
           const social = this.context.toolContext?.social;
           if (!social) {
             return "Error: social inbox unavailable because no social client is configured.";
@@ -283,10 +299,21 @@ When calling task_done, provide:
       ...customToolNames,
       ...aliasTools.map((tool) => tool.name),
     ]);
+    const usingLocalOllama =
+  !!this.context.config.ollamaBaseUrl &&
+  /^https?:\/\/(localhost|127\.0\.0\.1|\[::1\])(?::\d+)?(?:\/|$)/i.test(
+    this.context.config.ollamaBaseUrl,
+  );
+
     const wrappedTools = toolCatalog
-      .filter((tool) => GENERAL_WRAPPED_TOOL_ALLOWLIST.has(tool.name))
-      .filter((tool) => !reservedToolNames.has(tool.name))
-      .map((tool) => this.createWrappedTool(tool, toolCatalog));
+  .filter((tool) => GENERAL_WRAPPED_TOOL_ALLOWLIST.has(tool.name))
+  .filter(
+    (tool) =>
+      !usingLocalOllama ||
+      !LOCAL_OLLAMA_BLOCKED_TOOLS.has(tool.name),
+  )
+  .filter((tool) => !reservedToolNames.has(tool.name))
+  .map((tool) => this.createWrappedTool(tool, toolCatalog));
 
     return [...customTools, ...aliasTools, ...wrappedTools];
   }

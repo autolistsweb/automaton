@@ -224,6 +224,26 @@ describe("InferenceRouter", () => {
   });
 
   describe("selectModel", () => {
+    it.each(["normal", "high", "critical", "dead"] as const)("strict local routing uses Qwen at %s with remote models enabled", tier => {
+      registry.upsert({ ...registry.get("gpt-5-mini")!, modelId: "qwen2.5:7b", provider: "ollama", costPer1kInput: 0, costPer1kOutput: 0, enabled: true });
+      const localRouter = new InferenceRouter(db, registry, budget, "qwen2.5:7b");
+      expect(localRouter.selectModel(tier, "agent_turn")?.modelId).toBe("qwen2.5:7b");
+    });
+    it("strict local routing rejects stale disabled Qwen instead of selecting GPT", () => {
+      registry.upsert({ ...registry.get("gpt-5-mini")!, modelId: "qwen2.5:7b", provider: "ollama", enabled: false });
+      const localRouter = new InferenceRouter(db, registry, budget, "qwen2.5:7b");
+      expect(() => localRouter.selectModel("normal", "agent_turn")).toThrow(/Strict local Ollama/);
+    });
+
+    it.each(["normal", "high", "critical", "dead"] as const)("limits Ollama preference to critical/dead at %s", (tier) => {
+      const local = { ...registry.get("gpt-5-mini")!, modelId: "qwen2.5:7b", provider: "ollama" as const,
+        tierMinimum: "critical" as const, costPer1kInput: 0, costPer1kOutput: 0, enabled: true };
+      registry.upsert(local);
+      const expected = tier === "critical" || tier === "dead"
+        ? local.modelId : DEFAULT_ROUTING_MATRIX[tier].agent_turn.candidates[0];
+      expect(router.selectModel(tier, "agent_turn")?.modelId).toBe(expected);
+    });
+
     it("returns correct model for normal/agent_turn", () => {
       const model = router.selectModel("normal", "agent_turn");
       expect(model).not.toBeNull();

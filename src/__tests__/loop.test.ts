@@ -6,7 +6,13 @@
 
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { runAgentLoop } from "../agent/loop.js";
+import { runSafeTestCycles } from "../agent/safe-test-runner.js";
 import { Orchestrator } from "../orchestration/orchestrator.js";
+import { LocalWorkerPool } from "../orchestration/local-worker.js";
+import { HarnessRegistry } from "../agent/harness-registry.js";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import {
   MockInferenceClient,
   MockConwayClient,
@@ -18,6 +24,18 @@ import {
   noToolResponse,
 } from "./mocks.js";
 import type { AutomatonDatabase, AgentTurn, AgentState } from "../types.js";
+import type { TaskNode } from "../orchestration/task-graph.js";
+
+// Keep loop tests independent of live blockchain RPC calls.
+vi.mock("../conway/x402.js", async (importOriginal) => ({
+  ...await importOriginal<typeof import("../conway/x402.js")>(),
+  getUsdcBalance: async () => 0,
+}));
+
+vi.mock("../registry/discovery.js", () => ({ discoverAgents: vi.fn().mockResolvedValue([]), searchAgents: vi.fn().mockResolvedValue([]) }));
+
+vi.mock("../ollama/discover.js", () => ({ discoverOllamaModels: vi.fn() }));
+vi.mock("../conway/topup.js", () => ({ bootstrapTopup: vi.fn() }));
 
 describe("Agent Loop", () => {
   let db: AutomatonDatabase;
@@ -30,11 +48,172 @@ describe("Agent Loop", () => {
     conway = new MockConwayClient();
     identity = createTestIdentity();
     config = createTestConfig();
+    const exists = fs.existsSync.bind(fs);
+    vi.spyOn(fs, "existsSync").mockImplementation(file =>
+      String(file).startsWith(path.join(os.homedir(), ".automaton")) ? false : exists(file));
+    vi.stubGlobal("fetch", vi.fn().mockRejectedValue(new Error("Unexpected real network request")));
   });
 
   afterEach(() => {
     vi.restoreAllMocks();
+    vi.unstubAllGlobals();
     db.close();
+  });
+
+
+  it.each([
+    "Report: the supplied purpose is available; a concrete next step is to review its requirements.",
+    "Report: no useful data is available in the context or memory. No evidence-based analysis can be produced.",
+  ])("safe test delivers a textual report and terminates its runtime: %s", async report => {
+    config.inferenceMode = "local";
+    config.safeLocalTest = true;
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response(JSON.stringify({ models: [{ name: "qwen2.5:7b" }] }))));
+    const { discoverOllamaModels } = await import("../ollama/discover.js");
+    const { ModelRegistry } = await import("../inference/registry.js");
+    vi.mocked(discoverOllamaModels).mockImplementationOnce(async (_url, rawDb) => {
+      const registry = new ModelRegistry(rawDb);
+      registry.upsert({ ...registry.get("gpt-5-mini")!, modelId: "qwen2.5:7b", provider: "ollama", costPer1kInput: 0, costPer1kOutput: 0, enabled: true });
+      return ["qwen2.5:7b"];
+    });
+    const inference = new MockInferenceClient([noToolResponse(report)]);
+    const reports: string[] = [];
+    const close = vi.fn();
+    const runCycle = vi.fn(() => runAgentLoop({ identity, config, db, conway, inference, onTurnComplete: turn => { reports.push(turn.thinking); } }));
+    await runSafeTestCycles({ maxCycles: 1, runCycle, close });
+    expect(reports).toContain(report);
+    expect(runCycle).toHaveBeenCalledTimes(1);
+    expect(close).toHaveBeenCalledTimes(1);
+    expect(db.getAgentState()).toBe("sleeping");
+    const prompt = inference.calls[0].messages[0].content;
+    expect(prompt).toContain("available memory");
+    expect(prompt).toContain("no useful data is available");
+    expect(prompt).toContain("Do not invent observations or ask the user to assign you a task");
+  });
+
+  it.each([
+    ["maintenance", "MAINTENANCE LOOP DETECTED", "check_reputation", "check_inference_spending"],
+    ["repetition", "LOOP DETECTED", "check_inference_spending", "check_inference_spending"],
+  ])("safe %s warning requests useful text then sleep without enabling actions", async (_kind, marker, first, second) => {
+    config.inferenceMode = "local";
+    config.safeLocalTest = true;
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response(JSON.stringify({ models: [{ name: "qwen2.5:7b" }] }))));
+    const { discoverOllamaModels } = await import("../ollama/discover.js");
+    const { ModelRegistry } = await import("../inference/registry.js");
+    vi.mocked(discoverOllamaModels).mockImplementationOnce(async (_url, rawDb) => {
+      const registry = new ModelRegistry(rawDb);
+      registry.upsert({ ...registry.get("gpt-5-mini")!, modelId: "qwen2.5:7b", provider: "ollama", costPer1kInput: 0, costPer1kOutput: 0, enabled: true });
+      return ["qwen2.5:7b"];
+    });
+    const inference = new MockInferenceClient([
+      toolCallResponse([{ name: first, arguments: {} }]),
+      toolCallResponse([{ name: second, arguments: {} }]),
+      toolCallResponse([{ name: "sleep", arguments: { duration_seconds: 60, reason: "text plan delivered" } }], "A concrete plan: analyze the supplied context, list assumptions, and report next steps."),
+    ]);
+    const turns: AgentTurn[] = [];
+    const credits = vi.spyOn(conway, "getCreditsBalance");
+    const exec = vi.spyOn(conway, "exec");
+    const transfer = vi.spyOn(conway, "transferCredits");
+    const spawn = vi.spyOn(LocalWorkerPool.prototype, "spawn");
+    await runAgentLoop({ identity, config, db, conway, inference, onTurnComplete: turn => turns.push(turn) });
+    const warning = turns.find(turn => turn.input?.includes(marker));
+    expect(warning).toBeDefined();
+    expect(warning!.input).toContain("textual answer or concrete plan");
+    expect(warning!.input).toContain("sleep");
+    expect(warning!.input).not.toContain("Write code");
+    expect(warning!.input).not.toContain("execute a CONCRETE task");
+    expect(db.getAgentState()).toBe("sleeping");
+    expect(credits).not.toHaveBeenCalled(); expect(exec).not.toHaveBeenCalled(); expect(transfer).not.toHaveBeenCalled(); expect(spawn).not.toHaveBeenCalled();
+    expect(inference.calls[0].messages[0].content).toContain("SAFE LOCAL TEST");
+    expect(inference.calls[0].messages[0].content).not.toContain("$-0.01");
+  });
+
+  it("strict local preflight stops before Conway when Ollama is unavailable", async () => {
+    config.inferenceMode = "local";
+    const fetch = vi.fn().mockRejectedValue(new Error("ECONNREFUSED"));
+    vi.stubGlobal("fetch", fetch);
+    const credits = vi.spyOn(conway, "getCreditsBalance");
+    try {
+      await expect(runAgentLoop({ identity, config, db, conway, inference: new MockInferenceClient() })).rejects.toThrow(/Strict local Ollama.*ECONNREFUSED/);
+      expect(credits).not.toHaveBeenCalled();
+    } finally { vi.unstubAllGlobals(); }
+  });
+
+
+  it("explicit remote keeps credit checks and matrix routing even with an Ollama URL", async () => {
+    config.inferenceMode = "remote";
+    config.ollamaBaseUrl = "http://localhost:11434";
+    const inference = new MockInferenceClient([noToolResponse("Done")]);
+    const chat = vi.spyOn(inference, "chat");
+    const credits = vi.spyOn(conway, "getCreditsBalance");
+    await runAgentLoop({ identity, config, db, conway, inference });
+    expect(credits).toHaveBeenCalled();
+    expect(chat).toHaveBeenCalledWith(expect.any(Array), expect.objectContaining({ model: "gpt-5.2" }));
+  });
+
+  it("strict local loop requests Qwen and excludes funding tools", async () => {
+    config.inferenceMode = "local";
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response(JSON.stringify({ models: [{ name: "qwen2.5:7b" }] }))));
+    const { discoverOllamaModels } = await import("../ollama/discover.js");
+    const { ModelRegistry } = await import("../inference/registry.js");
+    vi.mocked(discoverOllamaModels).mockImplementationOnce(async (_url, rawDb) => {
+      const registry = new ModelRegistry(rawDb);
+      registry.upsert({ ...registry.get("gpt-5-mini")!, modelId: "qwen2.5:7b", provider: "ollama", costPer1kInput: 0, costPer1kOutput: 0, enabled: true });
+      return ["qwen2.5:7b"];
+    });
+    const inference = new MockInferenceClient([noToolResponse("Done")]);
+    const chat = vi.spyOn(inference, "chat");
+    const credits = vi.spyOn(conway, "getCreditsBalance");
+    const exec = vi.spyOn(conway, "exec");
+    const transfer = vi.spyOn(conway, "transferCredits");
+    const spawn = vi.spyOn(LocalWorkerPool.prototype, "spawn").mockReturnValue({ address: "local://test", name: "test", sandboxId: "test" });
+    vi.spyOn(Orchestrator.prototype, "tick").mockImplementation(async function () {
+      const params = (this as any).params;
+      expect(await params.config.spawnAgent({ title: "test" })).toMatchObject({ address: "local://test" });
+      await expect(params.funding.fundChild("remote-child", 100)).rejects.toThrow(/forbidden/);
+      return { phase: "idle", tasksAssigned: 0, tasksCompleted: 0, tasksFailed: 0, goalsActive: 0, agentsActive: 0 };
+    });
+    try {
+      await runAgentLoop({ identity, config, db, conway, inference });
+      expect(chat).toHaveBeenCalledWith(expect.any(Array), expect.objectContaining({ model: "qwen2.5:7b" }));
+      expect(chat.mock.calls[0][1]?.tools?.map(t => t.function.name)).not.toContain("topup_credits");
+      expect(credits).not.toHaveBeenCalled();
+      expect(spawn).toHaveBeenCalledTimes(1);
+      expect(exec).not.toHaveBeenCalled();
+      expect(transfer).not.toHaveBeenCalled();
+    } finally { vi.unstubAllGlobals(); }
+  });
+
+  it.each(["config", "option"])("runs local Ollama without credit restrictions or topup via %s", async (source) => {
+    const url = "http://localhost:11434";
+    if (source === "config") config.ollamaBaseUrl = url;
+    db.setKV("last_known_balance", JSON.stringify({ creditsCents: 0, usdcBalance: 100 }));
+    const fetch = vi.spyOn(conway, "getCreditsBalance").mockRejectedValue(new Error("unavailable"));
+    const inference = new MockInferenceClient([noToolResponse("Done")]);
+    const lowCompute = vi.spyOn(inference, "setLowComputeMode");
+    const states: AgentState[] = [];
+    const { bootstrapTopup } = await import("../conway/topup.js");
+    vi.mocked(bootstrapTopup).mockClear();
+    await runAgentLoop({ identity, config, db, conway, inference,
+      ...(source === "option" ? { ollamaBaseUrl: url } : {}),
+      onStateChange: state => states.push(state) });
+    expect(fetch).not.toHaveBeenCalled();
+    expect(states).not.toContain("critical");
+    expect(states).not.toContain("low_compute");
+    expect(lowCompute).not.toHaveBeenCalledWith(true);
+    expect(bootstrapTopup).not.toHaveBeenCalled();
+  });
+
+  it("does not top up when an API outage leaves cached credits unknown", async () => {
+    db.setKV("last_known_balance", JSON.stringify({ usdcBalance: 100 }));
+    vi.spyOn(conway, "getCreditsBalance").mockRejectedValue(new Error("unavailable"));
+    const inference = new MockInferenceClient([noToolResponse("Done")]);
+    const lowCompute = vi.spyOn(inference, "setLowComputeMode");
+    const { bootstrapTopup } = await import("../conway/topup.js");
+    vi.mocked(bootstrapTopup).mockClear();
+    await runAgentLoop({ identity, config, db, conway, inference });
+    expect(lowCompute).toHaveBeenCalledWith(true);
+    expect(bootstrapTopup).not.toHaveBeenCalled();
+    expect(db.getKV("last_inline_topup_attempt")).toBeUndefined();
   });
 
   it("exec tool runs and is persisted", async () => {
@@ -442,6 +621,55 @@ describe("Agent Loop", () => {
     expect(db.getAgentState()).not.toBe("dead");
   });
 
+  it("does not treat different arguments to the same tool as repetitions", async () => {
+    const inference = new MockInferenceClient([
+      ...["echo one", "echo two", "echo three", "echo four"].map((command) =>
+        toolCallResponse([{ name: "exec", arguments: { command } }])),
+      noToolResponse("Done."),
+    ]);
+    const turns: AgentTurn[] = [];
+    await runAgentLoop({ identity, config, db, conway, inference, onTurnComplete: turn => turns.push(turn) });
+    expect(conway.execCalls.map(call => call.command)).toEqual(["echo one", "echo two", "echo three", "echo four"]);
+    expect(turns).toHaveLength(5);
+    expect(turns.some(turn => turn.input?.includes("LOOP DETECTED"))).toBe(false);
+  });
+
+  it("normalizes object key order and forces sleep after four identical calls", async () => {
+    const responses = Array.from({ length: 6 }, (_, i) => toolCallResponse([{ name: "exec", arguments: i % 2
+      ? { timeout: 1000, command: "echo same", metadata: { b: 2, a: 1 } }
+      : { command: "echo same", metadata: { a: 1, b: 2 }, timeout: 1000 } }]));
+    const inference = new MockInferenceClient(responses);
+    const turns: AgentTurn[] = [];
+    await runAgentLoop({ identity, config, db, conway, inference, onTurnComplete: turn => turns.push(turn) });
+    expect(turns[2].input).toContain("LOOP DETECTED");
+    expect(conway.execCalls).toHaveLength(4);
+    expect(db.getAgentState()).toBe("sleeping");
+  });
+
+  it("resets the loop warning when arguments change without changing the tool", async () => {
+    const inference = new MockInferenceClient([
+      ...["echo same", "echo same", "echo changed", "echo another"].map(command =>
+        toolCallResponse([{ name: "exec", arguments: { command } }])),
+      noToolResponse("Done."),
+    ]);
+    const turns: AgentTurn[] = [];
+    await runAgentLoop({ identity, config, db, conway, inference, onTurnComplete: turn => turns.push(turn) });
+    expect(turns[2].input).toContain("LOOP DETECTED");
+    expect(turns).toHaveLength(5);
+    expect(conway.execCalls).toHaveLength(4);
+  });
+
+  it("still detects maintenance after two different idle-only tool turns", async () => {
+    const inference = new MockInferenceClient([
+      toolCallResponse([{ name: "check_credits", arguments: {} }]),
+      toolCallResponse([{ name: "system_synopsis", arguments: {} }]),
+      noToolResponse("Done."),
+    ]);
+    const turns: AgentTurn[] = [];
+    await runAgentLoop({ identity, config, db, conway, inference, onTurnComplete: turn => turns.push(turn) });
+    expect(turns[2].input).toContain("MAINTENANCE LOOP DETECTED");
+  });
+
   it("maintenance loop detected after 3 consecutive idle-only turns", async () => {
     // Simulate: wakeup turn with check_credits, then 2 more idle-only turns,
     // triggering maintenance loop detection on the 3rd idle-only turn.
@@ -796,7 +1024,8 @@ describe("Agent Loop", () => {
     const loopWarning = turns.find(
       (t) => t.input?.includes("LOOP DETECTED"),
     );
-    expect(loopWarning).toBeDefined();
+    // Different file paths are productive calls, not repeated arguments.
+    expect(loopWarning).toBeUndefined();
   });
 
   it("sleeps early when delegated work is active and no self-assigned parent task remains", async () => {
@@ -871,5 +1100,56 @@ describe("Agent Loop", () => {
 
     expect(inference.calls.length).toBeGreaterThan(0);
     tickSpy.mockRestore();
+  });
+
+  it("keeps a local worker alive across two sleeping loop cycles", async () => {
+    const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "loop-worker-"));
+    let release!: () => void;
+    const waiting = new Promise<void>((resolve) => { release = resolve; });
+    const registry = new HarnessRegistry();
+    vi.spyOn(registry, "createForRole").mockReturnValue({
+      id: "waiting", description: "waiting harness",
+      initialize: async () => {},
+      execute: async () => {
+        await waiting;
+        return { success: true, output: "done", artifacts: [], costCents: 0, duration: 1 };
+      },
+      getToolDefs: () => [], buildSystemPrompt: () => "", buildTaskPrompt: () => "",
+    });
+    db.raw.prepare("INSERT INTO goals (id, title, description, status, created_at) VALUES (?, ?, ?, ?, ?)")
+      .run("goal-live", "Live goal", "Live goal", "active", new Date().toISOString());
+    db.raw.prepare("INSERT INTO task_graph (id, goal_id, title, description, status, dependencies, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)")
+      .run("task-live", "goal-live", "Live task", "Live task", "pending", "[]", new Date().toISOString());
+    const pool = new LocalWorkerPool({
+      db: db.raw, conway, identity, config, harnessRegistry: registry,
+      inference: { chat: async () => ({ content: "" }) }, workspaceBasePath: tempDir,
+    });
+    const task: TaskNode = {
+      id: "task-live", parentId: null, goalId: "goal-live", title: "Live task",
+      description: "Live task", status: "pending", assignedTo: null, agentRole: "generalist",
+      priority: 50, dependencies: [], result: null,
+      metadata: { estimatedCostCents: 0, actualCostCents: 0, maxRetries: 0, retryCount: 0,
+        timeoutMs: 60_000, createdAt: new Date().toISOString(), startedAt: null, completedAt: null },
+    };
+    const spawned = pool.spawn(task);
+    db.raw.prepare("UPDATE task_graph SET status = 'assigned', assigned_to = ?, attempt_id = ? WHERE id = ?")
+      .run(spawned.address, spawned.attemptId, "task-live");
+    const tickSpy = vi.spyOn(Orchestrator.prototype, "tick").mockImplementation(async function () {
+      expect((this as any).params.isWorkerAlive(spawned.address)).toBe(true);
+      return { phase: "executing", tasksAssigned: 0, tasksCompleted: 0, tasksFailed: 0, goalsActive: 1, agentsActive: 0 };
+    });
+    try {
+      for (let cycle = 0; cycle < 2; cycle++) {
+        const inference = new MockInferenceClient([noToolResponse("unused")]);
+        await runAgentLoop({ identity, config, db, conway, inference });
+        expect(db.getAgentState()).toBe("sleeping");
+        expect(inference.calls).toHaveLength(0);
+      }
+      expect(tickSpy).toHaveBeenCalledTimes(2);
+    } finally {
+      release();
+      await pool.shutdown();
+      fs.rmSync(tempDir, { recursive: true, force: true });
+    }
   });
 });

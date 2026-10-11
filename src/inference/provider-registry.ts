@@ -1,3 +1,4 @@
+import { assertLocalOllamaUrl } from "./local-mode.js";
 import fs from "node:fs";
 import OpenAI from "openai";
 
@@ -206,15 +207,15 @@ const DEFAULT_PROVIDERS: ProviderConfig[] = [
   },
   {
     id: "local",
-    name: "Local (Ollama/vLLM)",
+    name: "Ollama Local",
     baseUrl: "http://localhost:11434/v1",
-    apiKeyEnvVar: "LOCAL_API_KEY",
+    apiKeyEnvVar: "OLLAMA_API_KEY",
     models: [
       {
-        id: "llama3.3:70b",
-        tier: "fast",
-        contextWindow: 131072,
-        maxOutputTokens: 8192,
+        id: "qwen2.5:7b",
+        tier: "reasoning",
+        contextWindow: 32768,
+        maxOutputTokens: 4096,
         costPerInputToken: 0,
         costPerOutputToken: 0,
         supportsTools: true,
@@ -222,9 +223,20 @@ const DEFAULT_PROVIDERS: ProviderConfig[] = [
         supportsStreaming: true,
       },
       {
-        id: "llama3.1:8b",
+        id: "qwen2.5:7b",
+        tier: "fast",
+        contextWindow: 32768,
+        maxOutputTokens: 4096,
+        costPerInputToken: 0,
+        costPerOutputToken: 0,
+        supportsTools: true,
+        supportsVision: false,
+        supportsStreaming: true,
+      },
+      {
+        id: "qwen2.5:7b",
         tier: "cheap",
-        contextWindow: 131072,
+        contextWindow: 32768,
         maxOutputTokens: 4096,
         costPerInputToken: 0,
         costPerOutputToken: 0,
@@ -234,13 +246,14 @@ const DEFAULT_PROVIDERS: ProviderConfig[] = [
       },
     ],
     maxRequestsPerMinute: 100,
-    maxTokensPerMinute: 200000,
+    maxTokensPerMinute: 100000,
     priority: 10,
     enabled: false,
   },
 ];
 
 export class ProviderRegistry {
+  private localOnly = false;
   private readonly providers: ProviderConfig[];
   private readonly tierDefaults: Record<ModelTier, TierDefault>;
   private readonly disablements = new Map<string, ProviderDisablement>();
@@ -250,6 +263,7 @@ export class ProviderRegistry {
     providers: ProviderConfig[],
     tierDefaults: Record<ModelTier, TierDefault> = DEFAULT_TIER_DEFAULTS,
     emergencyStopCredits = DEFAULT_EMERGENCY_STOP_CREDITS,
+    private readonly useDefaultLocalKeyFallback = false,
   ) {
     this.providers = providers
       .map((provider) => deepCloneProvider(provider))
@@ -263,19 +277,81 @@ export class ProviderRegistry {
   }
 
   overrideBaseUrl(providerId: string, baseUrl: string): void {
+    if (this.localOnly && providerId === "local") assertLocalOllamaUrl(baseUrl.replace(/\/v1\/?$/, ""));
     const provider = this.providers.find((p) => p.id === providerId);
     if (provider) {
       provider.baseUrl = baseUrl;
     }
   }
 
-  static fromConfig(configPath: string): ProviderRegistry {
+  configureLocalOllama(modelId: string, baseUrl: string, localOnly = false): void {
+    if (localOnly) assertLocalOllamaUrl(baseUrl);
+    this.localOnly = localOnly;
+    const local = this.providers.find((provider) => provider.id === "local");
+    if (!local) {
+      if (localOnly) throw new Error("Strict local Ollama provider is missing");
+      return;
+    }
+
+    local.enabled = true;
+    local.baseUrl = `${baseUrl.replace(/\/$/, "")}/v1`;
+    local.models = [
+      {
+        id: modelId,
+        tier: "reasoning",
+        contextWindow: 32768,
+        maxOutputTokens: 4096,
+        costPerInputToken: 0,
+        costPerOutputToken: 0,
+        supportsTools: true,
+        supportsVision: false,
+        supportsStreaming: true,
+      },
+      {
+        id: modelId,
+        tier: "fast",
+        contextWindow: 32768,
+        maxOutputTokens: 4096,
+        costPerInputToken: 0,
+        costPerOutputToken: 0,
+        supportsTools: true,
+        supportsVision: false,
+        supportsStreaming: true,
+      },
+      {
+        id: modelId,
+        tier: "cheap",
+        contextWindow: 32768,
+        maxOutputTokens: 4096,
+        costPerInputToken: 0,
+        costPerOutputToken: 0,
+        supportsTools: true,
+        supportsVision: false,
+        supportsStreaming: true,
+      },
+    ];
+
+    this.tierDefaults.reasoning = {
+      preferredProvider: "local",
+      fallbackOrder: [],
+    };
+    this.tierDefaults.fast = {
+      preferredProvider: "local",
+      fallbackOrder: [],
+    };
+    this.tierDefaults.cheap = {
+      preferredProvider: "local",
+      fallbackOrder: [],
+    };
+  }
+static fromConfig(configPath: string): ProviderRegistry {
     let providers = DEFAULT_PROVIDERS.map((provider) => deepCloneProvider(provider));
     let tierDefaults = DEFAULT_TIER_DEFAULTS;
     let emergencyStopCredits = DEFAULT_EMERGENCY_STOP_CREDITS;
+    let useDefaultLocalKeyFallback = true;
 
     if (!fs.existsSync(configPath)) {
-      return new ProviderRegistry(providers, tierDefaults, emergencyStopCredits);
+      return new ProviderRegistry(providers, tierDefaults, emergencyStopCredits, useDefaultLocalKeyFallback);
     }
 
     try {
@@ -283,6 +359,7 @@ export class ProviderRegistry {
       const configuredProviders = normalizeProviders(raw.providers);
       if (configuredProviders.length > 0) {
         providers = configuredProviders;
+        useDefaultLocalKeyFallback = false;
       }
 
       if (raw.tierDefaults && typeof raw.tierDefaults === "object") {
@@ -301,7 +378,7 @@ export class ProviderRegistry {
       // Keep defaults if config is invalid.
     }
 
-    return new ProviderRegistry(providers, tierDefaults, emergencyStopCredits);
+    return new ProviderRegistry(providers, tierDefaults, emergencyStopCredits, useDefaultLocalKeyFallback);
   }
 
   resolveModel(tier: ModelTier, survivalMode = false): ResolvedModel {
@@ -355,6 +432,7 @@ export class ProviderRegistry {
   }
 
   getModel(providerId: string, modelId: string): ResolvedModel {
+    if (this.localOnly && providerId !== "local") throw new Error("External inference is forbidden in strict local mode");
     const provider = this.providers.find((candidate) => candidate.id === providerId);
     if (!provider) {
       throw new Error(`Unknown provider '${providerId}'`);
@@ -371,6 +449,8 @@ export class ProviderRegistry {
 
     return this.buildResolvedModel(provider, model);
   }
+
+  isLocalOnly(): boolean { return this.localOnly; }
 
   getProviders(): ProviderConfig[] {
     return this.providers
@@ -399,6 +479,7 @@ export class ProviderRegistry {
   }
 
   private getProviderOrderForTier(tier: ModelTier): ProviderConfig[] {
+    if (this.localOnly) return this.providers.filter(provider => provider.id === "local");
     const preferred = this.tierDefaults[tier];
     const orderedIds = [
       preferred.preferredProvider,
@@ -434,6 +515,7 @@ export class ProviderRegistry {
     const client = new OpenAI({
       apiKey,
       baseURL: provider.baseUrl,
+      ...(this.localOnly ? { fetch: (url: RequestInfo | URL, init?: RequestInit) => globalThis.fetch(url, { ...init, redirect: "error" }) } : {}),
     });
 
     return {
@@ -450,6 +532,9 @@ export class ProviderRegistry {
     }
 
     if (provider.id === "local") {
+      if (this.useDefaultLocalKeyFallback && process.env.LOCAL_API_KEY) {
+        return process.env.LOCAL_API_KEY;
+      }
       return "local";
     }
 
@@ -491,6 +576,7 @@ export class ProviderRegistry {
   }
 
   private assertEmergencyPolicy(): void {
+    if (this.localOnly) return;
     const rawCredits = process.env.AUTOMATON_CREDITS_BALANCE;
     if (!rawCredits) {
       return;

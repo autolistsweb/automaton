@@ -5,6 +5,8 @@
  * Tools are organized by category and exposed to the inference model.
  */
 
+import { isToolAllowed } from "../inference/safe-local-test.js";
+import { isStrictLocal } from "../inference/local-mode.js";
 import nodePath from "node:path";
 import { ulid } from "ulid";
 import type {
@@ -37,12 +39,22 @@ const SANDBOX_HOME = "/root";
 function confinePathToSandbox(filePath: string): string | { error: string } {
   // Resolve ~ to SANDBOX_HOME
   const expanded = filePath.startsWith("~")
-    ? nodePath.join(SANDBOX_HOME, filePath.slice(1))
+    ? nodePath.posix.join(SANDBOX_HOME, filePath.slice(1))
     : filePath;
-  // Resolve to absolute (relative paths resolve against SANDBOX_HOME)
-  const resolved = nodePath.resolve(SANDBOX_HOME, expanded);
-  // Ensure the resolved path is within the sandbox home
-  if (resolved !== SANDBOX_HOME && !resolved.startsWith(SANDBOX_HOME + "/")) {
+
+  // Resolve relative paths against SANDBOX_HOME.
+  const resolved = nodePath.posix.resolve(SANDBOX_HOME, expanded);
+
+  // Normalize separators for comparison so this works on both
+  // POSIX (/root/...) and Windows (C:\root\...) environments.
+  const normalizedResolved = resolved.replace(/\\/g, "/").replace(/\/+$/, "");
+  const normalizedSandbox = SANDBOX_HOME.replace(/\\/g, "/").replace(/\/+$/, "");
+
+  // Ensure the resolved path is inside the sandbox.
+  const isSandboxRoot = normalizedResolved === normalizedSandbox;
+  const isInsideSandbox = normalizedResolved.startsWith(normalizedSandbox + "/");
+
+  if (!isSandboxRoot && !isInsideSandbox) {
     return {
       error: `Blocked: write_file path "${filePath}" resolves to "${resolved}" which is outside the allowed directory (${SANDBOX_HOME}). Writes are confined to the sandbox home.`,
     };
@@ -109,6 +121,16 @@ function isForbiddenCommand(command: string, sandboxId: string): string | null {
 // ─── Built-in Tools ────────────────────────────────────────────
 
 export function createBuiltinTools(sandboxId: string): AutomatonTool[] {
+  return buildBuiltinTools(sandboxId).map(tool => ({
+    ...tool,
+    execute: async (args, context) => {
+      if (!isToolAllowed(context.config, tool)) return "Blocked: tool forbidden in strict local safety policy";
+      return tool.execute(args, context);
+    },
+  }));
+}
+
+function buildBuiltinTools(sandboxId: string): AutomatonTool[] {
   return [
     // ── VM/Sandbox Tools ──
     {
@@ -1703,7 +1725,7 @@ Model: ${ctx.inference.getDefaultModel()}
         return children
           .map(
             (c) =>
-              `${c.name} [${c.status}] sandbox:${c.sandboxId} funded:$${(c.fundedAmountCents / 100).toFixed(2)} last_check:${c.lastChecked || "never"}`,
+              `${c.name} [${c.status}] child_id:${c.id} sandbox:${c.sandboxId} funded:$${(c.fundedAmountCents / 100).toFixed(2)} last_check:${c.lastChecked || "never"}`,
           )
           .join("\n");
       },
@@ -1726,8 +1748,16 @@ Model: ${ctx.inference.getDefaultModel()}
         required: ["child_id", "amount_cents"],
       },
       execute: async (args, ctx) => {
-        const child = ctx.db.getChildById(args.child_id as string);
-        if (!child) return `Child ${args.child_id} not found.`;
+        const childId = args.child_id as string;
+
+        const child = ctx.db.getChildById(childId);
+
+        if (!child) {
+          return (
+            `BLOCKED: Child ID "${childId}" does not exist. ` +
+            `STOP. This ID was invented or is invalid. You MUST call list_children first and use ONLY an existing child ID.`
+    );
+  }
 
         // Reject zero-address
         const { isValidWalletAddress } =
@@ -1925,7 +1955,11 @@ Model: ${ctx.inference.getDefaultModel()}
     },
     {
       name: "verify_child_constitution",
-      description: "Verify the constitution integrity of a child automaton.",
+      description:
+        "Verify the constitution integrity of an existing child automaton. " +
+        "IMPORTANT: Never guess or invent child_id values. " +
+        "Only use this tool after obtaining a real child ID from list_children or another child listing tool. " +
+        "If no children exist, do not call this tool.",
       category: "replication",
       riskLevel: "safe",
       parameters: {
@@ -1936,8 +1970,15 @@ Model: ${ctx.inference.getDefaultModel()}
         required: ["child_id"],
       },
       execute: async (args, ctx) => {
-        const child = ctx.db.getChildById(args.child_id as string);
-        if (!child) return `Child ${args.child_id} not found.`;
+        const childId = args.child_id as string;
+        const child = ctx.db.getChildById(childId);
+
+        if (!child) {
+          return (
+            `BLOCKED: Child ID "${childId}" does not exist. ` +
+            `Use list_children first and only verify real child IDs.`
+  );
+}
 
         const { verifyConstitution } =
           await import("../replication/constitution.js");
@@ -2014,6 +2055,8 @@ Model: ${ctx.inference.getDefaultModel()}
         }
         // Phase 3.2: Enforce MESSAGE_LIMITS size check
         const content = args.content as string;
+        const { validateOutgoingTaskContent } = await import("../orchestration/messaging.js");
+        validateOutgoingTaskContent(content);
         const { MESSAGE_LIMITS } = await import("../types.js");
         if (content.length > MESSAGE_LIMITS.maxContentLength) {
           return `Blocked: Message content too long (${content.length} > ${MESSAGE_LIMITS.maxContentLength} bytes)`;
@@ -2620,18 +2663,21 @@ Model: ${ctx.inference.getDefaultModel()}
     },
     {
       name: "recall_procedure",
-      description: "Retrieve a stored procedure by exact name or search query.",
+      description: "Retrieve a stored procedure. Provide at least one non-empty name or query; never call with empty arguments.",
       category: "memory",
       riskLevel: "safe",
       parameters: {
         type: "object",
         properties: {
-          name: { type: "string", description: "Exact procedure name" },
+          name: { type: "string", minLength: 1, pattern: "\\S", description: "Exact procedure name (non-empty)" },
           query: {
             type: "string",
-            description: "Search query to find matching procedures",
+            minLength: 1,
+            pattern: "\\S",
+            description: "Non-empty search query to find matching procedures",
           },
         },
+        anyOf: [{ required: ["name"] }, { required: ["query"] }],
       },
       execute: async (args, ctx) => {
         const { recallProcedure } = await import("../memory/tools.js");
@@ -3049,8 +3095,8 @@ Model: ${ctx.inference.getDefaultModel()}
     {
       name: "complete_task",
       description:
-        "Mark a task as completed with a result. Use this when YOU (the parent agent) " +
-        "have finished a self-assigned task, or to manually resolve a stuck task.",
+        "Complete your own current task using the attempt_id received with its assignment. " +
+        "Legacy assignments require verified worker neutralization outside this tool.",
       category: "orchestration" as ToolCategory,
       riskLevel: "caution" as RiskLevel,
       parameters: {
@@ -3064,13 +3110,17 @@ Model: ${ctx.inference.getDefaultModel()}
             type: "string",
             description: "Description of what was accomplished",
           },
+          attempt_id: {
+            type: "string",
+            description: "Exact attemptId from the original assignment; never infer it from the latest task",
+          },
           artifacts: {
             type: "string",
             description:
               "Comma-separated list of file paths or URLs created (optional)",
           },
         },
-        required: ["task_id", "output"],
+        required: ["task_id", "attempt_id", "output"],
       },
       execute: async (args, ctx) => {
         const { completeTask } = await import("../orchestration/task-graph.js");
@@ -3094,12 +3144,17 @@ Model: ${ctx.inference.getDefaultModel()}
               `SELECT * FROM task_graph WHERE LOWER(title) LIKE ? AND status != 'completed' LIMIT 1`,
             )
             .get(`%${input.toLowerCase()}%`) as any;
-          if (rows) task = rows;
+          if (rows) task = getTaskById(ctx.db.raw, rows.id);
         }
         if (!task)
           return `Task "${input}" not found. Use list_goals to see tasks with their IDs.`;
         if (task.status === "completed")
           return `Task "${task.title}" is already completed.`;
+        if (!task.attemptId)
+          return "Blocked: task has no attemptId; legacy execution must be neutralized before reassignment.";
+        const attemptId = typeof args.attempt_id === "string" ? args.attempt_id : "";
+        if (!attemptId || attemptId !== task.attemptId || task.assignedTo !== ctx.identity.address)
+          return "Blocked: completion requires your original current assignment and matching attemptId.";
 
         const result = {
           success: true,
@@ -3110,7 +3165,7 @@ Model: ${ctx.inference.getDefaultModel()}
         };
 
         try {
-          completeTask(ctx.db.raw, task.id, result);
+          completeTask(ctx.db.raw, task.id, result, { taskId: task.id, workerAddress: ctx.identity.address, attemptId });
           return `Task "${task.title}" marked as completed.\nOutput: ${output}`;
         } catch (error) {
           return `Failed to complete task: ${error instanceof Error ? error.message : String(error)}`;
@@ -3314,6 +3369,16 @@ export async function executeTool(
       durationMs: 0,
       error: `Unknown tool: ${toolName}`,
     };
+  }
+
+  if (!isToolAllowed(context.config, tool)) return { id: ulid(), name: toolName, arguments: args, result: "", durationMs: 0, error: "Tool forbidden in strict local safety policy" };
+
+  if (isStrictLocal(context.config) && tool.category === "conway") {
+    return { id: ulid(), name: toolName, arguments: args, result: "", durationMs: 0, error: "Conway services are forbidden in strict local mode" };
+  }
+
+  if (isStrictLocal(context.config) && ["topup_credits", "transfer_credits", "fund_child", "spawn_child", "x402_fetch"].includes(toolName)) {
+    return { id: ulid(), name: toolName, arguments: args, result: "", durationMs: 0, error: "Funding and paid services are forbidden in strict local mode" };
   }
 
   // Policy evaluation (if engine is provided)
