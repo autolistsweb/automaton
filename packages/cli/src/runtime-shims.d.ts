@@ -1,8 +1,8 @@
 declare module "@conway/automaton/config.js" {
   export interface AutomatonCliConfig {
     name: string;
-    walletAddress: string;
-    creatorAddress: string;
+    accountId: string;
+    creatorAccountId: string;
     sandboxId: string;
     dbPath: string;
     inferenceModel: string;
@@ -55,4 +55,42 @@ declare module "@conway/automaton/state/database.js" {
   }
 
   export function createDatabase(path: string): AutomatonCliDatabase;
+}
+
+declare module "@conway/automaton/identity/account.js" {
+  export interface AccountIdentity {
+    readonly accountId: string;
+    /** Ed25519 public key, base64. Safe to publish. */
+    readonly publicKey: string;
+    readonly createdAt: string;
+    /** Detached Ed25519 signature, base64. */
+    signMessage(message: string): Promise<string>;
+  }
+
+  export function accountExists(): boolean;
+  export function getAccount(): Promise<{
+    identity: AccountIdentity;
+    accountId: string;
+    isNew: boolean;
+  }>;
+}
+
+declare module "@conway/automaton/social/signing.js" {
+  import type { AccountIdentity } from "@conway/automaton/identity/account.js";
+
+  export interface SignedMessagePayload {
+    from: string;
+    to: string;
+    content: string;
+    signed_at: string;
+    signature: string;
+    reply_to?: string;
+  }
+
+  export function signSendPayload(
+    signer: AccountIdentity,
+    to: string,
+    content: string,
+    replyTo?: string,
+  ): Promise<SignedMessagePayload>;
 }

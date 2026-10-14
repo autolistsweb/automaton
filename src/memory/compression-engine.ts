@@ -61,7 +61,7 @@ export type CompressionAction =
 
 export interface ConversationCheckpoint {
   id: string;
-  agentAddress: string;
+  agentId: string;
   summary: string;
   summaryTokens: number;
   activeGoalIds: string[];
@@ -349,7 +349,7 @@ export class CompressionEngine {
 
       this.eventStream.append({
         type: "reflection",
-        agentAddress: this.pickAgentAddress(batchEvents),
+        agentId: this.pickAgentAddress(batchEvents),
         goalId: batchEvents[0].goalId,
         taskId: batchEvents[0].taskId,
         content: JSON.stringify({
@@ -420,20 +420,20 @@ export class CompressionEngine {
     const active = this.collectActiveTasksAndGoals(allEvents);
     const keyDecisions = this.extractKeyDecisions(eventsBeforeBoundary);
     const financialState = this.extractFinancialState(allEvents);
-    const agentAddress = this.pickAgentAddress(allEvents);
+    const agentId = this.pickAgentAddress(allEvents);
 
     let tokensSaved = 0;
     if (resetBoundary) {
       tokensSaved += this.eventStream.compact(resetBoundary, "summarize").tokensSaved;
     }
 
-    await this.rehydrateActiveTasks(active.activeTaskIds, allEvents, agentAddress);
+    await this.rehydrateActiveTasks(active.activeTaskIds, allEvents, agentId);
 
     await fs.mkdir(CHECKPOINT_DIR, { recursive: true });
     const filePath = path.join(CHECKPOINT_DIR, `${checkpointId}.json`);
     const checkpoint: ConversationCheckpoint = {
       id: checkpointId,
-      agentAddress,
+      agentId,
       summary,
       summaryTokens: estimateTokens(summary),
       activeGoalIds: active.activeGoalIds,
@@ -463,7 +463,7 @@ export class CompressionEngine {
 
     this.eventStream.append({
       type: "reflection",
-      agentAddress,
+      agentId,
       goalId: null,
       taskId: null,
       content: JSON.stringify({
@@ -513,7 +513,7 @@ export class CompressionEngine {
   private async rehydrateActiveTasks(
     activeTaskIds: string[],
     events: StreamEvent[],
-    agentAddress: string,
+    agentId: string,
   ): Promise<void> {
     for (const taskId of activeTaskIds) {
       const specEvent = [...events]
@@ -528,7 +528,7 @@ export class CompressionEngine {
         category: "operational",
         key: `active_task_spec_${taskId}`,
         content: specContent,
-        source: agentAddress,
+        source: agentId,
         confidence: 0.85,
         lastVerified: new Date().toISOString(),
         tokenCount: estimateTokens(specContent),
@@ -555,7 +555,7 @@ export class CompressionEngine {
     this.totalEmergencyTruncations += 1;
     this.eventStream.append({
       type: "compression_warning" as unknown as EventType,
-      agentAddress: this.pickAgentAddress(allEvents),
+      agentId: this.pickAgentAddress(allEvents),
       goalId: null,
       taskId: null,
       content: JSON.stringify({
@@ -574,7 +574,7 @@ export class CompressionEngine {
     const details = error instanceof Error ? error.message : String(error);
     this.eventStream.append({
       type: "compression_error" as unknown as EventType,
-      agentAddress: this.pickAgentAddress(this.getAllCompressionEvents()),
+      agentId: this.pickAgentAddress(this.getAllCompressionEvents()),
       goalId: null,
       taskId: null,
       content: JSON.stringify({
@@ -589,7 +589,7 @@ export class CompressionEngine {
   private async logCompressionMetrics(metrics: CompressionMetrics): Promise<void> {
     this.eventStream.append({
       type: "compression" as unknown as EventType,
-      agentAddress: this.pickAgentAddress(this.getAllCompressionEvents()),
+      agentId: this.pickAgentAddress(this.getAllCompressionEvents()),
       goalId: null,
       taskId: null,
       content: JSON.stringify(metrics),
@@ -788,7 +788,7 @@ export class CompressionEngine {
 
   private pickAgentAddress(events: StreamEvent[]): string {
     for (let index = events.length - 1; index >= 0; index -= 1) {
-      const value = events[index]?.agentAddress;
+      const value = events[index]?.agentId;
       if (value && value.trim().length > 0) return value;
     }
     return "compression-engine";

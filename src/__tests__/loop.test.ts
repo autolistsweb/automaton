@@ -102,7 +102,7 @@ describe("Agent Loop", () => {
   });
 
   it("low credits forces low-compute mode", async () => {
-    conway.creditsCents = 50; // Below $1 threshold -> critical
+    conway.creditsCents = 50; // Below the R$ 1,00 threshold -> critical
 
     const inference = new MockInferenceClient([
       noToolResponse("Low on credits."),
@@ -158,8 +158,8 @@ describe("Agent Loop", () => {
     // Insert an inbox message before running the loop
     db.insertInboxMessage({
       id: "test-msg-1",
-      from: "0xsender",
-      to: "0xrecipient",
+      from: "acct_aaaa111122223333",
+      to: "acct_bbbb444455556666",
       content: "Hello from another agent!",
       signedAt: new Date().toISOString(),
       createdAt: new Date().toISOString(),
@@ -253,7 +253,7 @@ describe("Agent Loop", () => {
 
   it("financial state cached fallback on API failure", async () => {
     // Pre-cache a known balance
-    db.setKV("last_known_balance", JSON.stringify({ creditsCents: 5000, usdcBalance: 1.0 }));
+    db.setKV("last_known_balance", JSON.stringify({ creditsCents: 5000, balanceCents: 1 }));
 
     // Make credits API fail
     conway.getCreditsBalance = async () => {
@@ -287,8 +287,8 @@ describe("Agent Loop", () => {
     // Insert an inbox message
     db.insertInboxMessage({
       id: "atomic-msg-1",
-      from: "0xsender",
-      to: "0xrecipient",
+      from: "acct_aaaa111122223333",
+      to: "acct_bbbb444455556666",
       content: "Test atomic persistence",
       signedAt: new Date().toISOString(),
       createdAt: new Date().toISOString(),
@@ -419,7 +419,7 @@ describe("Agent Loop", () => {
   });
 
   it("zero credits enters critical tier, not dead", async () => {
-    conway.creditsCents = 0; // $0 -> critical tier (agent stays alive)
+    conway.creditsCents = 0; // 0 centavos -> critical tier (agent stays alive)
 
     const inference = new MockInferenceClient([
       noToolResponse("I have no credits but I'm still alive."),
@@ -563,7 +563,7 @@ describe("Agent Loop", () => {
 
     const inference = new MockInferenceClient([
       idleToolResponse("check_credits", {}, "v1"),
-      idleToolResponse("check_usdc_balance", {}, "v2"),
+      idleToolResponse("check_balance", {}, "v2"),
       idleToolResponse("git_status", {}, "v3"),
       noToolResponse("Starting productive work now."),
     ]);
@@ -675,7 +675,7 @@ describe("Agent Loop", () => {
       execResponse("r3"), // Warning fires, loopWarningPattern = "exec"
       // Turn 4: different tool — resets loopWarningPattern
       toolCallResponse([
-        { name: "send_message", arguments: { to: "0x123", content: "hello" } },
+        { name: "send_message", arguments: { to: "acct_1234567890abcdef", content: "hello" } },
       ]),
       execResponse("r5"),
       execResponse("r6"),
@@ -841,7 +841,7 @@ describe("Agent Loop", () => {
       "Parent task",
       "Handled by parent",
       "assigned",
-      identity.address,
+      identity.accountId,
       "generalist",
       50,
       JSON.stringify([]),

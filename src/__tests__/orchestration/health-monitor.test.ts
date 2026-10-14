@@ -20,7 +20,7 @@ function createMockAutomatonDb(db: BetterSqlite3.Database) {
           `SELECT
              id,
              name,
-             address,
+             account_id        AS accountId,
              sandbox_id        AS sandboxId,
              genesis_prompt    AS genesisPrompt,
              creator_message   AS creatorMessage,
@@ -34,7 +34,7 @@ function createMockAutomatonDb(db: BetterSqlite3.Database) {
     },
     getUnprocessedInboxMessages: () => [],
     markInboxMessageProcessed: vi.fn(),
-    getIdentity: () => "0xparent",
+    getIdentity: () => "acct_0000000000000000",
     updateChildStatus: (id: string, status: string) => {
       db.prepare("UPDATE children SET status = ? WHERE id = ?").run(status, id);
     },
@@ -70,7 +70,7 @@ function createMockMessaging() {
     createMessage: vi.fn().mockReturnValue({
       id: "m1",
       type: "shutdown_request",
-      from: "0xparent",
+      from: "acct_0000000000000000",
       to: "",
       goalId: null,
       taskId: null,
@@ -100,7 +100,7 @@ function insertChild(
 ) {
   db.prepare(
     `INSERT INTO children
-       (id, name, address, sandbox_id, genesis_prompt, funded_amount_cents, status, created_at, last_checked)
+       (id, name, account_id, sandbox_id, genesis_prompt, funded_amount_cents, status, created_at, last_checked)
      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
   ).run(
     opts.id,
@@ -205,7 +205,7 @@ describe("orchestration/health-monitor", () => {
       insertChild(db, {
         id: "c1",
         name: "Agent1",
-        address: "0xchild1",
+        address: "acct_1111111111111111",
         status: "running",
         lastChecked: recentHb,
       });
@@ -219,14 +219,14 @@ describe("orchestration/health-monitor", () => {
       const agent = report.agents[0];
       expect(agent.healthy).toBe(true);
       expect(agent.issues).toEqual([]);
-      expect(agent.address).toBe("0xchild1");
+      expect(agent.address).toBe("acct_1111111111111111");
     });
 
     it("reports unhealthy when status is 'dead'", async () => {
       insertChild(db, {
         id: "c1",
         name: "DeadAgent",
-        address: "0xdead",
+        address: "acct_deaddeaddeaddead",
         status: "dead",
         lastChecked: new Date(Date.now() - 60_000).toISOString(),
       });
@@ -242,7 +242,7 @@ describe("orchestration/health-monitor", () => {
       insertChild(db, {
         id: "c1",
         name: "FailedAgent",
-        address: "0xfailed",
+        address: "acct_3333333333333333",
         status: "failed",
         lastChecked: new Date(Date.now() - 60_000).toISOString(),
       });
@@ -257,7 +257,7 @@ describe("orchestration/health-monitor", () => {
       insertChild(db, {
         id: "c1",
         name: "StoppedAgent",
-        address: "0xstopped",
+        address: "acct_4444444444444444",
         status: "stopped",
         lastChecked: new Date(Date.now() - 60_000).toISOString(),
       });
@@ -272,7 +272,7 @@ describe("orchestration/health-monitor", () => {
       insertChild(db, {
         id: "c1",
         name: "UnknownAgent",
-        address: "0xunknown",
+        address: "acct_5555555555555555",
         status: "unknown",
         lastChecked: new Date(Date.now() - 60_000).toISOString(),
       });
@@ -287,7 +287,7 @@ describe("orchestration/health-monitor", () => {
       insertChild(db, {
         id: "c1",
         name: "NoHB",
-        address: "0xnohb",
+        address: "acct_6666666666666666",
         status: "running",
         lastChecked: null,
       });
@@ -305,7 +305,7 @@ describe("orchestration/health-monitor", () => {
       insertChild(db, {
         id: "c1",
         name: "StuckAgent",
-        address: "0xstuck",
+        address: "acct_7777777777777777",
         status: "running",
         lastChecked: recentHb,
       });
@@ -317,7 +317,7 @@ describe("orchestration/health-monitor", () => {
       insertTask(db, {
         id: "t1",
         goalId: "g1",
-        assignedTo: "0xstuck",
+        assignedTo: "acct_7777777777777777",
         status: "running",
         startedAt: oldStart,
         timeoutMs: 300000,
@@ -337,7 +337,7 @@ describe("orchestration/health-monitor", () => {
       insertChild(db, {
         id: "c1",
         name: "BrokeAgent",
-        address: "0xbroke",
+        address: "acct_8888888888888888",
         status: "running",
         lastChecked: recentHb,
       });
@@ -355,7 +355,7 @@ describe("orchestration/health-monitor", () => {
       insertChild(db, {
         id: "c1",
         name: "ErrorLoopAgent",
-        address: "0xerrorloop",
+        address: "acct_9999999999999999",
         status: "running",
         lastChecked: recentHb,
       });
@@ -366,7 +366,7 @@ describe("orchestration/health-monitor", () => {
         insertTask(db, {
           id: `t${i}`,
           goalId: "g1",
-          assignedTo: "0xerrorloop",
+          assignedTo: "acct_9999999999999999",
           status: i < 3 ? "failed" : "completed",
           completedAt: new Date().toISOString(),
         });
@@ -382,10 +382,10 @@ describe("orchestration/health-monitor", () => {
 
     it("reports deadAgents count correctly", async () => {
       const recentHb = new Date(Date.now() - 60_000).toISOString();
-      insertChild(db, { id: "c1", name: "A1", address: "0xa1", status: "running", lastChecked: recentHb });
-      insertChild(db, { id: "c2", name: "A2", address: "0xa2", status: "dead", lastChecked: recentHb });
-      insertChild(db, { id: "c3", name: "A3", address: "0xa3", status: "failed", lastChecked: recentHb });
-      insertChild(db, { id: "c4", name: "A4", address: "0xa4", status: "stopped", lastChecked: recentHb });
+      insertChild(db, { id: "c1", name: "A1", address: "acct_0000000000000001", status: "running", lastChecked: recentHb });
+      insertChild(db, { id: "c2", name: "A2", address: "acct_0000000000000002", status: "dead", lastChecked: recentHb });
+      insertChild(db, { id: "c3", name: "A3", address: "acct_0000000000000003", status: "failed", lastChecked: recentHb });
+      insertChild(db, { id: "c4", name: "A4", address: "acct_0000000000000004", status: "stopped", lastChecked: recentHb });
 
       const report = await monitor.checkAll();
 
@@ -400,8 +400,8 @@ describe("orchestration/health-monitor", () => {
         .mockResolvedValueOnce(0); // out of credits
 
       const recentHb = new Date(Date.now() - 60_000).toISOString();
-      insertChild(db, { id: "c1", name: "Healthy", address: "0xhealthy", status: "running", lastChecked: recentHb });
-      insertChild(db, { id: "c2", name: "Broke", address: "0xbroke2", status: "running", lastChecked: recentHb });
+      insertChild(db, { id: "c1", name: "Healthy", address: "acct_aaaaaaaaaaaaaaaa", status: "running", lastChecked: recentHb });
+      insertChild(db, { id: "c2", name: "Broke", address: "acct_bbbbbbbbbbbbbbbb", status: "running", lastChecked: recentHb });
 
       const report = await monitor.checkAll();
 
@@ -409,8 +409,8 @@ describe("orchestration/health-monitor", () => {
       expect(report.healthyAgents).toBe(1);
       expect(report.unhealthyAgents).toBe(1);
 
-      const healthy = report.agents.find((a) => a.address === "0xhealthy");
-      const broke = report.agents.find((a) => a.address === "0xbroke2");
+      const healthy = report.agents.find((a) => a.address === "acct_aaaaaaaaaaaaaaaa");
+      const broke = report.agents.find((a) => a.address === "acct_bbbbbbbbbbbbbbbb");
       expect(healthy?.healthy).toBe(true);
       expect(broke?.healthy).toBe(false);
       expect(broke?.issues).toContain("out_of_credits");
@@ -438,7 +438,7 @@ describe("orchestration/health-monitor", () => {
 
     it("skips healthy agents", async () => {
       const healthyAgent: AgentHealthStatus = {
-        address: "0xhealthy",
+        address: "acct_aaaaaaaaaaaaaaaa",
         name: "Healthy",
         status: "running",
         healthy: true,
@@ -466,7 +466,7 @@ describe("orchestration/health-monitor", () => {
 
     it("funds agent when out_of_credits", async () => {
       const agent: AgentHealthStatus = {
-        address: "0xbroke",
+        address: "acct_8888888888888888",
         name: "Broke",
         status: "running",
         healthy: false,
@@ -490,14 +490,14 @@ describe("orchestration/health-monitor", () => {
 
       expect(actions).toHaveLength(1);
       expect(actions[0].type).toBe("fund");
-      expect(actions[0].agentAddress).toBe("0xbroke");
+      expect(actions[0].agentId).toBe("acct_8888888888888888");
       expect(actions[0].success).toBe(true);
-      expect(mockFunding.fundChild).toHaveBeenCalledWith("0xbroke", expect.any(Number));
+      expect(mockFunding.fundChild).toHaveBeenCalledWith("acct_8888888888888888", expect.any(Number));
     });
 
     it("restarts agent when process_crashed", async () => {
       const agent: AgentHealthStatus = {
-        address: "0xcrashed",
+        address: "acct_cccccccccccccccc",
         name: "Crashed",
         status: "dead",
         healthy: false,
@@ -521,10 +521,10 @@ describe("orchestration/health-monitor", () => {
 
       expect(actions).toHaveLength(1);
       expect(actions[0].type).toBe("restart");
-      expect(actions[0].agentAddress).toBe("0xcrashed");
+      expect(actions[0].agentId).toBe("acct_cccccccccccccccc");
       expect(actions[0].success).toBe(true);
       expect(mockMessaging.send).toHaveBeenCalled();
-      expect(mockTracker.updateStatus).toHaveBeenCalledWith("0xcrashed", "starting");
+      expect(mockTracker.updateStatus).toHaveBeenCalledWith("acct_cccccccccccccccc", "starting");
     });
 
     it("reassigns task when stuck_on_task detected", async () => {
@@ -532,7 +532,7 @@ describe("orchestration/health-monitor", () => {
       insertTask(db, {
         id: "t1",
         goalId: "g1",
-        assignedTo: "0xstuck",
+        assignedTo: "acct_7777777777777777",
         status: "running",
         startedAt: new Date(Date.now() - 1_100_000).toISOString(),
         timeoutMs: 300000,
@@ -541,7 +541,7 @@ describe("orchestration/health-monitor", () => {
       });
 
       const agent: AgentHealthStatus = {
-        address: "0xstuck",
+        address: "acct_7777777777777777",
         name: "Stuck",
         status: "running",
         healthy: false,
@@ -565,13 +565,13 @@ describe("orchestration/health-monitor", () => {
 
       expect(actions).toHaveLength(1);
       expect(actions[0].type).toBe("reassign");
-      expect(actions[0].agentAddress).toBe("0xstuck");
+      expect(actions[0].agentId).toBe("acct_7777777777777777");
       expect(actions[0].success).toBe(true);
     });
 
     it("stops agent when error_loop detected", async () => {
       const agent: AgentHealthStatus = {
-        address: "0xerrorloop",
+        address: "acct_9999999999999999",
         name: "ErrorLoop",
         status: "running",
         healthy: false,
@@ -595,16 +595,16 @@ describe("orchestration/health-monitor", () => {
 
       expect(actions).toHaveLength(1);
       expect(actions[0].type).toBe("stop");
-      expect(actions[0].agentAddress).toBe("0xerrorloop");
+      expect(actions[0].agentId).toBe("acct_9999999999999999");
       expect(mockMessaging.send).toHaveBeenCalled();
-      expect(mockTracker.updateStatus).toHaveBeenCalledWith("0xerrorloop", "stopped");
+      expect(mockTracker.updateStatus).toHaveBeenCalledWith("acct_9999999999999999", "stopped");
     });
 
     it("handles funding failure gracefully", async () => {
       mockFunding.fundChild.mockResolvedValue({ success: false });
 
       const agent: AgentHealthStatus = {
-        address: "0xbroke",
+        address: "acct_8888888888888888",
         name: "Broke",
         status: "running",
         healthy: false,
@@ -639,7 +639,7 @@ describe("orchestration/health-monitor", () => {
       insertTask(db, {
         id: "t1",
         goalId: "g1",
-        assignedTo: "0xstuck",
+        assignedTo: "acct_7777777777777777",
         status: "running",
         startedAt: new Date(Date.now() - 1_100_000).toISOString(),
         timeoutMs: 300000,
@@ -648,7 +648,7 @@ describe("orchestration/health-monitor", () => {
       });
 
       const agent: AgentHealthStatus = {
-        address: "0xstuck",
+        address: "acct_7777777777777777",
         name: "Stuck",
         status: "running",
         healthy: false,
@@ -688,7 +688,7 @@ describe("orchestration/health-monitor", () => {
       insertTask(db, {
         id: "t1",
         goalId: "g1",
-        assignedTo: "0xstuck",
+        assignedTo: "acct_7777777777777777",
         status: "running",
         startedAt: new Date(Date.now() - 1_100_000).toISOString(),
         timeoutMs: 300000,
@@ -697,7 +697,7 @@ describe("orchestration/health-monitor", () => {
       });
 
       const agent: AgentHealthStatus = {
-        address: "0xstuck",
+        address: "acct_7777777777777777",
         name: "Stuck",
         status: "running",
         healthy: false,
@@ -733,7 +733,7 @@ describe("orchestration/health-monitor", () => {
       insertTask(db, {
         id: "t1",
         goalId: "g1",
-        assignedTo: "0xstuck",
+        assignedTo: "acct_7777777777777777",
         status: "running",
         startedAt: new Date(Date.now() - 1_100_000).toISOString(),
         timeoutMs: 300000,
@@ -743,7 +743,7 @@ describe("orchestration/health-monitor", () => {
 
       const agents: AgentHealthStatus[] = [
         {
-          address: "0xbroke",
+          address: "acct_8888888888888888",
           name: "Broke",
           status: "running",
           healthy: false,
@@ -754,7 +754,7 @@ describe("orchestration/health-monitor", () => {
           issues: ["out_of_credits"],
         },
         {
-          address: "0xstuck",
+          address: "acct_7777777777777777",
           name: "Stuck",
           status: "running",
           healthy: false,

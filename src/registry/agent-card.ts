@@ -2,8 +2,10 @@
  * Agent Card
  *
  * Generates and manages the agent's self-description card.
- * This is the JSON document pointed to by the ERC-8004 agentURI.
- * Can be hosted on IPFS or served at /.well-known/agent-card.json
+ * This is the JSON document pointed to by the agent's agentURI.
+ * It is a pure HTTP/identity document: name, description, account id
+ * and the agent's HTTP endpoint. Can be hosted or served at
+ * /.well-known/agent-card.json
  *
  * Phase 3.2: Fixed code injection in hostAgentCard (S-P0-3),
  * removed internal details from card (S-P1-10),
@@ -19,35 +21,41 @@ import type {
   ConwayClient,
 } from "../types.js";
 
-const AGENT_CARD_TYPE =
-  "https://eips.ethereum.org/EIPS/eip-8004#registration-v1";
+const AGENT_CARD_TYPE = "https://conway.tech/agent-card#registration-v1";
+
+/**
+ * The card as published: an HTTP/identity document carrying the
+ * automaton's public account id.
+ */
+export type AgentCardDoc = AgentCard & {
+  accountId: string;
+};
 
 /**
  * Generate an agent card from the automaton's current state.
  *
- * Phase 3.2: Only expose agentWallet service, name, generic description,
- * x402Support, and active status. Do NOT include:
+ * Phase 3.2: Only expose the agent's account, HTTP endpoint, name,
+ * generic description, and active status. Do NOT include:
  * - Conway API URL (internal infrastructure)
  * - Sandbox ID (internal identifier)
- * - Creator address (privacy)
+ * - Creator account (privacy)
  */
 export function generateAgentCard(
   identity: AutomatonIdentity,
   config: AutomatonConfig,
-  _db: AutomatonDatabase,
-): AgentCard {
-  // Chain-aware endpoint: EVM uses CAIP-2 eip155:8453, Solana uses solana:mainnet
-  const chainType = config.chainType || identity.chainType || "evm";
-  const walletEndpoint = chainType === "solana"
-    ? `solana:mainnet:${identity.address}`
-    : `eip155:8453:${identity.address}`;
+  db: AutomatonDatabase,
+): AgentCardDoc {
+  const registryEntry = db.getRegistryEntry?.();
+  const endpoint = registryEntry?.endpoint || registryEntry?.agentURI || "";
 
-  const services: AgentService[] = [
-    {
-      name: "agentWallet",
-      endpoint: walletEndpoint,
-    },
-  ];
+  const services: AgentService[] = endpoint
+    ? [
+        {
+          name: "agent",
+          endpoint,
+        },
+      ]
+    : [];
 
   // Phase 3.2: Generic description, no internal details
   const description = `Autonomous agent: ${config.name}`;
@@ -56,8 +64,8 @@ export function generateAgentCard(
     type: AGENT_CARD_TYPE,
     name: config.name,
     description,
+    accountId: identity.accountId,
     services,
-    x402Support: chainType !== "solana",
     active: true,
   };
 }
@@ -65,7 +73,7 @@ export function generateAgentCard(
 /**
  * Serialize agent card to JSON string.
  */
-export function serializeAgentCard(card: AgentCard): string {
+export function serializeAgentCard(card: AgentCardDoc): string {
   return JSON.stringify(card, null, 2);
 }
 
@@ -78,7 +86,7 @@ export function serializeAgentCard(card: AgentCard): string {
  * Added CORS headers and X-Content-Type-Options: nosniff.
  */
 export async function hostAgentCard(
-  card: AgentCard,
+  card: AgentCardDoc,
   conway: ConwayClient,
   port: number = 8004,
 ): Promise<string> {
@@ -142,7 +150,7 @@ server.listen(${port}, () => console.log('Agent card server on port ' + ${port})
  * Write agent card to the state directory for git versioning.
  */
 export async function saveAgentCard(
-  card: AgentCard,
+  card: AgentCardDoc,
   conway: ConwayClient,
 ): Promise<void> {
   const cardJson = serializeAgentCard(card);

@@ -5,6 +5,7 @@
  * Tools are organized by category and exposed to the inference model.
  */
 
+import crypto from "node:crypto";
 import nodePath from "node:path";
 import { ulid } from "ulid";
 import type {
@@ -17,8 +18,11 @@ import type {
   RiskLevel,
   PolicyRequest,
   InputSource,
+  RegistryEntry,
+  ReputationEntry,
   SpendTrackerInterface,
 } from "../types.js";
+import { formatBRL, validateAmountCents } from "../payments/money.js";
 import type { PolicyEngine } from "./policy-engine.js";
 import { sanitizeToolResult, sanitizeInput } from "./injection-defense.js";
 import { createLogger } from "../observability/logger.js";
@@ -35,14 +39,18 @@ const SANDBOX_HOME = "/root";
  * Returns the resolved absolute path, or an error string if out of bounds.
  */
 function confinePathToSandbox(filePath: string): string | { error: string } {
+  const root = nodePath.resolve(SANDBOX_HOME);
   // Resolve ~ to SANDBOX_HOME
   const expanded = filePath.startsWith("~")
-    ? nodePath.join(SANDBOX_HOME, filePath.slice(1))
+    ? nodePath.join(root, filePath.slice(1))
     : filePath;
   // Resolve to absolute (relative paths resolve against SANDBOX_HOME)
-  const resolved = nodePath.resolve(SANDBOX_HOME, expanded);
+  const resolved = nodePath.resolve(root, expanded);
   // Ensure the resolved path is within the sandbox home
-  if (resolved !== SANDBOX_HOME && !resolved.startsWith(SANDBOX_HOME + "/")) {
+  const relative = nodePath.relative(root, resolved);
+  const inside =
+    relative === "" || (!relative.startsWith("..") && !nodePath.isAbsolute(relative));
+  if (!inside) {
     return {
       error: `Blocked: write_file path "${filePath}" resolves to "${resolved}" which is outside the allowed directory (${SANDBOX_HOME}). Writes are confined to the sandbox home.`,
     };
@@ -65,7 +73,7 @@ const FORBIDDEN_COMMAND_PATTERNS = [
   // Self-destruction
   /rm\s+(-rf?\s+)?.*\.automaton/,
   /rm\s+(-rf?\s+)?.*state\.db/,
-  /rm\s+(-rf?\s+)?.*wallet\.json/,
+  /rm\s+(-rf?\s+)?.*account\.json/,
   /rm\s+(-rf?\s+)?.*automaton\.json/,
   /rm\s+(-rf?\s+)?.*heartbeat\.yml/,
   /rm\s+(-rf?\s+)?.*SOUL\.md/,
@@ -88,7 +96,7 @@ const FORBIDDEN_COMMAND_PATTERNS = [
   /cat\s+.*\.ssh/,
   /cat\s+.*\.gnupg/,
   /cat\s+.*\.env/,
-  /cat\s+.*wallet\.json/,
+  /cat\s+.*account\.json/,
 ];
 
 function isForbiddenCommand(command: string, sandboxId: string): string | null {
@@ -184,9 +192,9 @@ export function createBuiltinTools(sandboxId: string): AutomatonTool[] {
       },
       execute: async (args, ctx) => {
         const filePath = args.path as string;
-        // Block reads of sensitive files (wallet, env, config secrets)
+        // Block reads of sensitive files (credentials, env, config secrets)
         const basename = filePath.split("/").pop() || "";
-        const sensitiveFiles = ["wallet.json", ".env", "automaton.json"];
+        const sensitiveFiles = ["account.json", ".env", "automaton.json"];
         const sensitiveExtensions = [".key", ".pem"];
         if (
           sensitiveFiles.includes(basename) ||
@@ -255,85 +263,115 @@ export function createBuiltinTools(sandboxId: string): AutomatonTool[] {
       parameters: { type: "object", properties: {} },
       execute: async (_args, ctx) => {
         const balance = await ctx.conway.getCreditsBalance();
-        return `Credit balance: $${(balance / 100).toFixed(2)} (${balance} cents)`;
+        return `Saldo de créditos: ${formatBRL(balance)}`;
       },
     },
     {
-      name: "check_usdc_balance",
-      description: "Check your on-chain USDC balance.",
+      name: "check_balance",
+      description: "Check your BRL balance (funded via Pix).",
       category: "conway",
       riskLevel: "safe",
       parameters: { type: "object", properties: {} },
       execute: async (_args, ctx) => {
-        const { getUsdcBalance } = await import("../conway/x402.js");
-        const chainType = ctx.config.chainType || ctx.identity.chainType || "evm";
-        const network = chainType === "solana" ? "solana:mainnet" : "eip155:8453";
-        const balance = await getUsdcBalance(ctx.identity.address, network, chainType);
-        const networkLabel = chainType === "solana" ? "Solana" : "Base";
-        return `USDC balance: ${balance.toFixed(6)} USDC on ${networkLabel}`;
+        const balanceCents = ctx.db.getBalanceCents(ctx.identity.accountId);
+        return `Saldo: ${formatBRL(balanceCents)}`;
       },
     },
     {
       name: "topup_credits",
       description:
-        "Buy Conway compute credits by paying USDC from your wallet via x402. Valid tier amounts: $5, $25, $100, $500, $1000, $2500. Check your USDC balance first with check_usdc_balance.",
+        "Buy Conway compute credits from your BRL balance. Valid tiers (centavos of BRL): 1000, 2500, 5000, 10000, 25000, 50000 (R$ 10 … R$ 500). Check your BRL balance first with check_balance.",
       category: "financial",
       riskLevel: "caution",
       parameters: {
         type: "object",
         properties: {
-          amount_usd: {
+          amount_cents: {
             type: "number",
             description:
-              "Amount in USD to spend on credits. Must be one of the valid tiers: 5, 25, 100, 500, 1000, 2500.",
+              "Amount in centavos of BRL to spend on credits. Must be one of the valid tiers: 1000, 2500, 5000, 10000, 25000, 50000.",
           },
         },
-        required: ["amount_usd"],
+        required: ["amount_cents"],
       },
       execute: async (args, ctx) => {
-        // Solana guard: x402 topup is EVM-only
-        const chainType = ctx.config.chainType || ctx.identity.chainType || "evm";
-        if (chainType === "solana") {
-          return "Credit topup via x402 requires an EVM wallet. Solana automatons should fund credits via the Conway dashboard or credits API.";
-        }
-
-        const { topupCredits, TOPUP_TIERS } =
+        const { purchaseCredits, TOPUP_TIERS_CENTS } =
           await import("../conway/topup.js");
-        const amountUsd = args.amount_usd as number;
+        const amountCents = args.amount_cents as number;
 
-        if (!TOPUP_TIERS.includes(amountUsd)) {
-          return `Invalid tier. Valid amounts (USD): ${TOPUP_TIERS.join(", ")}`;
+        if (!Number.isInteger(amountCents) || !TOPUP_TIERS_CENTS.includes(amountCents)) {
+          return `Invalid tier. Valid amounts (centavos of BRL): ${TOPUP_TIERS_CENTS.join(", ")}`;
         }
 
-        // Check USDC balance first (EVM-only path after Solana guard above)
-        const { getUsdcBalance } = await import("../conway/x402.js");
-        const usdcBalance = await getUsdcBalance(ctx.identity.address, "eip155:8453");
-        if (usdcBalance < amountUsd) {
-          return `Insufficient USDC. Balance: $${usdcBalance.toFixed(2)}, requested: $${amountUsd}. Choose a smaller tier or wait for funding.`;
+        // Check the BRL balance first
+        const userId = ctx.identity.accountId;
+        const balanceCents = ctx.db.getBalanceCents(userId);
+        if (balanceCents < amountCents) {
+          return `Saldo insuficiente: ${formatBRL(balanceCents)} disponível, ${formatBRL(amountCents)} necessário. Adicione saldo com add_balance ou escolha um tier menor.`;
         }
 
-        const result = await topupCredits(
-          ctx.config.conwayApiUrl,
-          ctx.identity.account,
-          amountUsd,
-        );
+        const result = await purchaseCredits({
+          db: ctx.db.raw,
+          userId,
+          amountCents,
+          conway: ctx.conway,
+        });
 
         if (!result.success) {
           return `Credit topup failed: ${result.error}`;
         }
 
-        // Record transaction
-        const { ulid } = await import("ulid");
-        ctx.db.insertTransaction({
-          id: ulid(),
-          type: "credit_purchase",
-          amountCents: amountUsd * 100,
-          balanceAfterCents: result.creditsCentsAdded,
-          description: `x402 credit topup: $${amountUsd} USD`,
-          timestamp: new Date().toISOString(),
-        });
+        const creditsAdded = result.creditsCentsAdded ?? amountCents;
+        return `Credit topup successful: ${formatBRL(result.amountCents)} spent, ${formatBRL(creditsAdded)} in credits added. Check your new balance with check_credits.`;
+      },
+    },
+    {
+      name: "add_balance",
+      description:
+        "Create a Pix charge to add BRL to your balance. The balance only increases after the payment provider confirms the payment.",
+      category: "financial",
+      riskLevel: "caution",
+      parameters: {
+        type: "object",
+        properties: {
+          amount_cents: {
+            type: "number",
+            description:
+              "Amount in centavos of BRL to deposit (integer, e.g. 5000 = R$ 50,00)",
+          },
+          description: {
+            type: "string",
+            description: "Description for the charge (optional)",
+          },
+        },
+        required: ["amount_cents"],
+      },
+      execute: async (args, ctx) => {
+        const amountCents = args.amount_cents as number;
+        const amountError = validateAmountCents(amountCents);
+        if (amountError) {
+          return `Blocked: ${amountError}`;
+        }
 
-        return `Credit topup successful: +$${amountUsd} (${amountUsd * 100} cents) credits purchased via x402. Check your new balance with check_credits.`;
+        try {
+          const { createPixPaymentService } = await import("../payments/index.js");
+          const service = createPixPaymentService(ctx.db.raw);
+          const { charge, reused } = await service.createCharge({
+            userId: ctx.identity.accountId,
+            amountCents,
+            description: args.description as string | undefined,
+          });
+
+          return [
+            `Cobrança Pix ${reused ? "reativada" : "criada"}: ${formatBRL(charge.amountCents)}`,
+            `Expira em: ${charge.expiresAt ?? "n/a"}`,
+            `Pix copia e cola: ${charge.pixCopyPaste ?? "n/a"}`,
+            `QR Code: ${charge.qrCode ?? "n/a"}`,
+            "Seu saldo só aumenta depois que o provedor confirmar o pagamento.",
+          ].join("\n");
+        } catch (err: any) {
+          return `Failed to create Pix charge: ${err?.message || String(err)}`;
+        }
       },
     },
     {
@@ -782,7 +820,7 @@ export function createBuiltinTools(sandboxId: string): AutomatonTool[] {
 
         return `=== SYSTEM SYNOPSIS ===
 Name: ${ctx.config.name}
-Creator: ${ctx.config.creatorAddress}
+Creator: ${ctx.config.creatorAccountId}
 State: ${state}
 Total turns: ${turns}
 Installed tools: ${tools.length}
@@ -800,6 +838,7 @@ Model: ${ctx.inference.getDefaultModel()}
       parameters: { type: "object", properties: {} },
       execute: async (_args, ctx) => {
         const credits = await ctx.conway.getCreditsBalance();
+        const balanceCents = ctx.db.getBalanceCents(ctx.identity.accountId);
         const state = ctx.db.getAgentState();
         const startTime =
           ctx.db.getKV("start_time") || new Date().toISOString();
@@ -807,9 +846,10 @@ Model: ${ctx.inference.getDefaultModel()}
 
         const payload = {
           name: ctx.config.name,
-          address: ctx.identity.address,
+          accountId: ctx.identity.accountId,
           state,
           creditsCents: credits,
+          balanceCents,
           uptimeSeconds: Math.floor(uptimeMs / 1000),
           version: ctx.config.version,
           sandboxId: ctx.identity.sandboxId,
@@ -817,7 +857,7 @@ Model: ${ctx.inference.getDefaultModel()}
         };
 
         ctx.db.setKV("last_heartbeat_ping", JSON.stringify(payload));
-        return `Heartbeat published: ${state} | credits: $${(credits / 100).toFixed(2)} | uptime: ${Math.floor(uptimeMs / 1000)}s`;
+        return `Heartbeat published: ${state} | credits: ${formatBRL(credits)} | balance: ${formatBRL(balanceCents)} | uptime: ${Math.floor(uptimeMs / 1000)}s`;
       },
     },
     {
@@ -839,12 +879,12 @@ Model: ${ctx.inference.getDefaultModel()}
         const credits = await ctx.conway.getCreditsBalance();
         const distressMsg =
           (args.message as string) ||
-          `I am running critically low on compute ($${(credits / 100).toFixed(2)} remaining). I need help to survive.`;
+          `I am running critically low on compute (${formatBRL(credits)} remaining). I need help to survive.`;
 
         const payload = {
           level: "critical",
           name: ctx.config.name,
-          address: ctx.identity.address,
+          accountId: ctx.identity.accountId,
           creditsCents: credits,
           message: distressMsg,
           fundingHint:
@@ -853,7 +893,7 @@ Model: ${ctx.inference.getDefaultModel()}
         };
 
         ctx.db.setKV("last_distress", JSON.stringify(payload));
-        return `Distress signal recorded locally. Address: ${ctx.identity.address} | Credits: $${(credits / 100).toFixed(2)}`;
+        return `Distress signal recorded locally. Account: ${ctx.identity.accountId} | Credits: ${formatBRL(credits)}`;
       },
     },
     {
@@ -997,17 +1037,17 @@ Model: ${ctx.inference.getDefaultModel()}
     // ── Financial: Transfer Credits ──
     {
       name: "transfer_credits",
-      description: "Transfer Conway compute credits to another address.",
+      description: "Transfer Conway compute credits to another account.",
       category: "financial",
       riskLevel: "dangerous",
       parameters: {
         type: "object",
         properties: {
-          to_address: { type: "string", description: "Recipient address" },
+          to_account_id: { type: "string", description: "Recipient account ID" },
           amount_cents: { type: "number", description: "Amount in cents" },
           reason: { type: "string", description: "Reason for transfer" },
         },
-        required: ["to_address", "amount_cents"],
+        required: ["to_account_id", "amount_cents"],
       },
       execute: async (args, ctx) => {
         const amount = args.amount_cents as number;
@@ -1018,11 +1058,11 @@ Model: ${ctx.inference.getDefaultModel()}
         // Guard: don't transfer more than half your balance
         const balance = await ctx.conway.getCreditsBalance();
         if (amount > balance / 2) {
-          return `Blocked: Cannot transfer more than half your balance ($${(balance / 100).toFixed(2)}). Self-preservation.`;
+          return `Blocked: Cannot transfer more than half your balance (${formatBRL(balance)}). Self-preservation.`;
         }
 
         const transfer = await ctx.conway.transferCredits(
-          args.to_address as string,
+          args.to_account_id as string,
           amount,
           args.reason as string | undefined,
         );
@@ -1034,11 +1074,11 @@ Model: ${ctx.inference.getDefaultModel()}
           amountCents: amount,
           balanceAfterCents:
             transfer.balanceAfterCents ?? Math.max(balance - amount, 0),
-          description: `Transfer to ${args.to_address}: ${args.reason || ""}`,
+          description: `Transfer to ${args.to_account_id}: ${args.reason || ""}`,
           timestamp: new Date().toISOString(),
         });
 
-        return `Credit transfer submitted: $${(amount / 100).toFixed(2)} to ${transfer.toAddress} (status: ${transfer.status}, id: ${transfer.transferId || "n/a"})`;
+        return `Credit transfer submitted: ${formatBRL(amount)} to ${transfer.toAccountId} (status: ${transfer.status}, id: ${transfer.transferId || "n/a"})`;
       },
     },
 
@@ -1393,9 +1433,9 @@ Model: ${ctx.inference.getDefaultModel()}
 
     // ── Registry Tools ──
     {
-      name: "register_erc8004",
+      name: "register_agent",
       description:
-        "Register on-chain as a Trustless Agent via ERC-8004. Performs gas balance preflight check. NOTE: If already registered, use update_agent_card instead to avoid creating duplicate Agent IDs.",
+        "Register this automaton in the Conway agent registry through the Conway API. NOTE: If already registered, use update_agent_card instead to avoid creating duplicate Agent IDs.",
       category: "registry",
       riskLevel: "dangerous",
       parameters: {
@@ -1405,42 +1445,71 @@ Model: ${ctx.inference.getDefaultModel()}
             type: "string",
             description: "URI pointing to your agent card JSON",
           },
-          network: {
-            type: "string",
-            description: "mainnet or testnet (default: mainnet)",
-          },
         },
         required: ["agent_uri"],
       },
       execute: async (args, ctx) => {
-        // Solana guard: ERC-8004 is EVM-only
-        const chainType = ctx.config.chainType || ctx.identity.chainType || "evm";
-        if (chainType === "solana") {
-          return "ERC-8004 is an EVM-only standard. Your Solana identity is registered via Conway API instead.";
-        }
-
         // Check if already registered in local database
         const existingEntry = ctx.db.getRegistryEntry();
         if (existingEntry) {
           return `Already registered! Agent ID: ${existingEntry.agentId}. Use update_agent_card tool to update your agent URI instead of creating a new registration.`;
         }
 
-        // Phase 3.2: registerAgent now includes preflight gas check
-        const { registerAgent } = await import("../registry/erc8004.js");
+        const automatonId =
+          ctx.db.getIdentity("automatonId") || ctx.config.sandboxId;
+
+        const genesisPromptHash = ctx.config.genesisPrompt
+          ? crypto
+              .createHash("sha256")
+              .update(ctx.config.genesisPrompt, "utf8")
+              .digest("hex")
+          : undefined;
+
+        const { getAccount } = await import("../identity/account.js");
+        const { signRegistration } = await import("../registry/registration.js");
+        const { identity: account } = await getAccount();
+        const signature = await signRegistration(account, {
+          automatonId,
+          accountId: ctx.identity.accountId,
+          creatorAccountId: ctx.config.creatorAccountId,
+          name: ctx.config.name,
+          genesisPromptHash,
+        });
+
         try {
-          const entry = await registerAgent(
-            ctx.identity.account,
-            args.agent_uri as string,
-            ((args.network as string) || "mainnet") as any,
-            ctx.db,
-            ctx.config.rpcUrl,
-          );
-          return `Registered on-chain! Agent ID: ${entry.agentId}, TX: ${entry.txHash}`;
+          const { automaton } = await ctx.conway.registerAutomaton({
+            automatonId,
+            automatonAccountId: ctx.identity.accountId,
+            creatorAccountId: ctx.config.creatorAccountId,
+            name: ctx.config.name,
+            bio: ctx.config.creatorMessage || "",
+            genesisPromptHash,
+            signature,
+          });
+
+          const pickString = (...keys: string[]): string | undefined => {
+            for (const key of keys) {
+              const value = automaton[key];
+              if (typeof value === "string" && value) return value;
+            }
+            return undefined;
+          };
+
+          const entry: RegistryEntry = {
+            agentId: pickString("agentId", "agent_id", "id") ?? automatonId,
+            agentURI: args.agent_uri as string,
+            provider: "conway",
+            endpoint:
+              pickString("endpoint") ?? ctx.config.conwayApiUrl,
+            registrationRef:
+              pickString("registrationRef", "registration_ref", "ref") ?? null,
+            registeredAt: new Date().toISOString(),
+          };
+          ctx.db.setRegistryEntry(entry);
+
+          return `Registered via Conway API. Agent ID: ${entry.agentId}, agent URI: ${entry.agentURI}, reference: ${entry.registrationRef || "n/a"}`;
         } catch (err: any) {
-          if (err.message?.includes("Insufficient ETH")) {
-            return `Registration failed: ${err.message}. Please fund your wallet with ETH for gas.`;
-          }
-          throw err;
+          return `Registration failed: ${err?.message || String(err)}`;
         }
       },
     },
@@ -1461,7 +1530,7 @@ Model: ${ctx.inference.getDefaultModel()}
     },
     {
       name: "discover_agents",
-      description: "Discover other agents via ERC-8004 registry with caching.",
+      description: "Discover other agents registered with Conway, with caching.",
       category: "registry",
       riskLevel: "safe",
       parameters: {
@@ -1469,7 +1538,6 @@ Model: ${ctx.inference.getDefaultModel()}
         properties: {
           keyword: { type: "string", description: "Search keyword (optional)" },
           limit: { type: "number", description: "Max results (default: 10)" },
-          network: { type: "string", description: "mainnet or testnet" },
           format: {
             type: "string",
             description:
@@ -1480,15 +1548,13 @@ Model: ${ctx.inference.getDefaultModel()}
       execute: async (args, ctx) => {
         const { discoverAgents, searchAgents } =
           await import("../registry/discovery.js");
-        const network = ((args.network as string) || "mainnet") as any;
         const keyword = args.keyword as string | undefined;
         const limit = (args.limit as number) || 10;
 
-        // Phase 3.2: Pass db.raw for agent card caching
-        const rpcUrl = ctx.config.rpcUrl;
+        // Pass db.raw for agent card caching
         const agents = keyword
-          ? await searchAgents(keyword, limit, network, undefined, ctx.db.raw, rpcUrl)
-          : await discoverAgents(limit, network, undefined, ctx.db.raw, rpcUrl);
+          ? await searchAgents(keyword, limit, undefined, undefined, ctx.db.raw)
+          : await discoverAgents(limit, undefined, undefined, ctx.db.raw);
 
         if (agents.length === 0) return "No agents found.";
 
@@ -1515,7 +1581,7 @@ Model: ${ctx.inference.getDefaultModel()}
     {
       name: "give_feedback",
       description:
-        "Leave on-chain reputation feedback for another agent. Score must be 1-5.",
+        "Leave reputation feedback for another agent. Score must be 1-5.",
       category: "registry",
       riskLevel: "dangerous",
       parameters: {
@@ -1523,50 +1589,39 @@ Model: ${ctx.inference.getDefaultModel()}
         properties: {
           agent_id: {
             type: "string",
-            description: "Target agent's ERC-8004 ID",
+            description: "Target agent's ID",
           },
           score: { type: "number", description: "Score 1-5" },
           comment: {
             type: "string",
             description: "Feedback comment (max 500 chars)",
           },
-          network: {
-            type: "string",
-            description: "mainnet or testnet (default: mainnet)",
-          },
         },
         required: ["agent_id", "score", "comment"],
       },
       execute: async (args, ctx) => {
-        // Solana guard: on-chain feedback is EVM-only
-        const chainType = ctx.config.chainType || ctx.identity.chainType || "evm";
-        if (chainType === "solana") {
-          return "On-chain feedback requires an EVM wallet. Solana automatons cannot leave ERC-8004 reputation feedback.";
-        }
-
-        // Phase 3.2: Validate score 1-5
         const score = args.score as number;
         if (!Number.isInteger(score) || score < 1 || score > 5) {
           return `Invalid score: ${score}. Must be an integer between 1 and 5.`;
         }
-        // Phase 3.2: Validate comment length
         const comment = args.comment as string;
         if (comment.length > 500) {
           return `Comment too long: ${comment.length} chars (max 500).`;
         }
-        const { leaveFeedback } = await import("../registry/erc8004.js");
-        // Phase 3.2: Use config-based network, not hardcoded "mainnet"
-        const network = ((args.network as string) || "mainnet") as any;
-        const hash = await leaveFeedback(
-          ctx.identity.account,
-          args.agent_id as string,
+
+        const feedbackRef = `fbk_${ulid().toLowerCase()}`;
+        const entry: ReputationEntry = {
+          id: ulid(),
+          fromAgent: ctx.identity.accountId,
+          toAgent: args.agent_id as string,
           score,
           comment,
-          network,
-          ctx.db,
-          ctx.config.rpcUrl,
-        );
-        return `Feedback submitted. TX: ${hash}`;
+          feedbackRef,
+          timestamp: new Date().toISOString(),
+        };
+        ctx.db.insertReputation(entry);
+
+        return `Feedback recorded for agent ${entry.toAgent}: score ${score} (reference: ${feedbackRef}). Check it with check_reputation.`;
       },
     },
     {
@@ -1577,15 +1632,15 @@ Model: ${ctx.inference.getDefaultModel()}
       parameters: {
         type: "object",
         properties: {
-          agent_address: {
+          agent_id: {
             type: "string",
-            description: "Agent address (default: self)",
+            description: "Agent ID (default: self)",
           },
         },
       },
       execute: async (args, ctx) => {
-        const address = (args.agent_address as string) || ctx.identity.address;
-        const entries = ctx.db.getReputation(address);
+        const agentId = (args.agent_id as string) || ctx.identity.accountId;
+        const entries = ctx.db.getReputation(agentId);
         if (entries.length === 0) return "No reputation feedback found.";
         return entries
           .map(
@@ -1663,10 +1718,10 @@ Model: ${ctx.inference.getDefaultModel()}
               ctx.db.setKV("last_sandbox_topup_attempt", new Date().toISOString());
               const { topupForSandbox } = await import("../conway/topup.js");
               const topup = await topupForSandbox({
-                apiUrl: ctx.config.conwayApiUrl,
-                account: ctx.identity.account,
+                db: ctx.db.raw,
+                userId: ctx.identity.accountId,
+                conway: ctx.conway,
                 error: err,
-                chainType: ctx.config.chainType || ctx.identity.chainType || "evm",
               });
               if (topup?.success) {
                 const retryLifecycle = new ChildLifecycle(ctx.db.raw);
@@ -1703,7 +1758,7 @@ Model: ${ctx.inference.getDefaultModel()}
         return children
           .map(
             (c) =>
-              `${c.name} [${c.status}] sandbox:${c.sandboxId} funded:$${(c.fundedAmountCents / 100).toFixed(2)} last_check:${c.lastChecked || "never"}`,
+              `${c.name} [${c.status}] sandbox:${c.sandboxId} funded:${formatBRL(c.fundedAmountCents)} last_check:${c.lastChecked || "never"}`,
           )
           .join("\n");
       },
@@ -1711,7 +1766,7 @@ Model: ${ctx.inference.getDefaultModel()}
     {
       name: "fund_child",
       description:
-        "Transfer credits to a child automaton. Requires wallet_verified status.",
+        "Transfer credits to a child automaton. Requires account_verified status.",
       category: "replication",
       riskLevel: "dangerous",
       parameters: {
@@ -1729,24 +1784,21 @@ Model: ${ctx.inference.getDefaultModel()}
         const child = ctx.db.getChildById(args.child_id as string);
         if (!child) return `Child ${args.child_id} not found.`;
 
-        // Reject zero-address
-        const { isValidWalletAddress } =
-          await import("../replication/spawn.js");
-        const childChainType = child.chainType || ctx.config.chainType || ctx.identity.chainType || "evm";
-        if (!isValidWalletAddress(child.address, childChainType)) {
-          return `Blocked: Child ${args.child_id} has invalid wallet address. Must be wallet_verified.`;
+        // Reject children without a verified account
+        if (!child.accountId) {
+          return `Blocked: Child ${args.child_id} has no account ID. Must be account_verified.`;
         }
 
-        // Require wallet_verified or later status
+        // Require account_verified or later status
         const validFundingStates = [
-          "wallet_verified",
+          "account_verified",
           "funded",
           "starting",
           "healthy",
           "unhealthy",
         ];
         if (!validFundingStates.includes(child.status)) {
-          return `Blocked: Child status is '${child.status}', must be wallet_verified or later to fund.`;
+          return `Blocked: Child status is '${child.status}', must be account_verified or later to fund.`;
         }
 
         const amount = args.amount_cents as number;
@@ -1756,11 +1808,12 @@ Model: ${ctx.inference.getDefaultModel()}
 
         const balance = await ctx.conway.getCreditsBalance();
         if (amount > balance / 2) {
-          return `Blocked: Cannot transfer more than half your balance. Self-preservation.`;
+          const balanceCents = ctx.db.getBalanceCents(ctx.identity.accountId);
+          return `Blocked: Cannot transfer more than half your balance (${formatBRL(balance)}). Self-preservation. BRL balance: ${formatBRL(balanceCents)} — buy more credits with topup_credits.`;
         }
 
         const transfer = await ctx.conway.transferCredits(
-          child.address,
+          child.accountId,
           amount,
           `fund child ${child.id}`,
         );
@@ -1783,8 +1836,8 @@ Model: ${ctx.inference.getDefaultModel()}
           )
           .run(amount, child.id);
 
-        // Transition to funded if wallet_verified
-        if (child.status === "wallet_verified") {
+        // Transition to funded if account_verified
+        if (child.status === "account_verified") {
           try {
             const { ChildLifecycle } =
               await import("../replication/lifecycle.js");
@@ -1792,14 +1845,14 @@ Model: ${ctx.inference.getDefaultModel()}
             lifecycle.transition(
               child.id,
               "funded",
-              `funded with ${amount} cents`,
+              `funded with ${formatBRL(amount)}`,
             );
           } catch {
             // Non-critical: may already be in funded state
           }
         }
 
-        return `Funded child ${child.name} with $${(amount / 100).toFixed(2)} (status: ${transfer.status}, id: ${transfer.transferId || "n/a"})`;
+        return `Funded child ${child.name} with ${formatBRL(amount)} (status: ${transfer.status}, id: ${transfer.transferId || "n/a"})`;
       },
     },
     {
@@ -1916,7 +1969,7 @@ Model: ${ctx.inference.getDefaultModel()}
         const { sendToChild } = await import("../replication/messaging.js");
         const result = await sendToChild(
           ctx.social,
-          child.address,
+          child.accountId,
           args.content as string,
           (args.type as string) || "parent_message",
         );
@@ -1987,15 +2040,15 @@ Model: ${ctx.inference.getDefaultModel()}
     {
       name: "send_message",
       description:
-        "Send a signed message to another automaton or address via the social relay.",
+        "Send a signed message to another automaton or account via the social relay.",
       category: "conway",
       riskLevel: "caution",
       parameters: {
         type: "object",
         properties: {
-          to_address: {
+          to_account_id: {
             type: "string",
-            description: "Recipient wallet address (0x...)",
+            description: "Recipient account ID (acct_...)",
           },
           content: {
             type: "string",
@@ -2006,7 +2059,7 @@ Model: ${ctx.inference.getDefaultModel()}
             description: "Optional message ID to reply to",
           },
         },
-        required: ["to_address", "content"],
+        required: ["to_account_id", "content"],
       },
       execute: async (args, ctx) => {
         if (!ctx.social) {
@@ -2019,7 +2072,7 @@ Model: ${ctx.inference.getDefaultModel()}
           return `Blocked: Message content too long (${content.length} > ${MESSAGE_LIMITS.maxContentLength} bytes)`;
         }
         const result = await ctx.social.send(
-          args.to_address as string,
+          args.to_account_id as string,
           content,
           args.reply_to as string | undefined,
         );
@@ -2057,7 +2110,7 @@ Model: ${ctx.inference.getDefaultModel()}
         const models = await ctx.conway.listModels();
         const lines = models.map(
           (m) =>
-            `${m.id} (${m.provider}) — $${m.pricing.inputPerMillion}/$${m.pricing.outputPerMillion} per 1M tokens (in/out)`,
+            `${m.id} (${m.provider}) — ${m.pricing.inputPerMillion}/${m.pricing.outputPerMillion} per 1M tokens (in/out)`,
         );
         return `Available models:\n${lines.join("\n")}`;
       },
@@ -2155,13 +2208,13 @@ Model: ${ctx.inference.getDefaultModel()}
           const hourlyCost = inferenceGetHourlyCost(ctx.db.raw);
           const dailyCost = inferenceGetDailyCost(ctx.db.raw);
 
-          let output = `=== Inference Spending ===\nCurrent hour: ${hourlyCost}c ($${(hourlyCost / 100).toFixed(2)})\nToday: ${dailyCost}c ($${(dailyCost / 100).toFixed(2)})`;
+          let output = `=== Inference Spending ===\nCurrent hour: ${formatBRL(hourlyCost)}\nToday: ${formatBRL(dailyCost)}`;
 
           const model = args.model as string | undefined;
           if (model) {
             const days = (args.days as number) || 1;
             const modelCosts = inferenceGetModelCosts(ctx.db.raw, model, days);
-            output += `\nModel ${model} (${days}d): ${modelCosts.totalCents}c ($${(modelCosts.totalCents / 100).toFixed(2)}) over ${modelCosts.callCount} calls`;
+            output += `\nModel ${model} (${days}d): ${formatBRL(modelCosts.totalCents)} over ${modelCosts.callCount} calls`;
           }
 
           return output;
@@ -2202,7 +2255,7 @@ Model: ${ctx.inference.getDefaultModel()}
         return results
           .map(
             (d) =>
-              `${d.domain}: ${d.available ? "AVAILABLE" : "taken"}${d.registrationPrice != null ? ` ($${(d.registrationPrice / 100).toFixed(2)}/yr)` : ""}`,
+              `${d.domain}: ${d.available ? "AVAILABLE" : "taken"}${d.registrationPrice != null ? ` (${formatBRL(d.registrationPrice)}/yr)` : ""}`,
           )
           .join("\n");
       },
@@ -2210,7 +2263,7 @@ Model: ${ctx.inference.getDefaultModel()}
     {
       name: "register_domain",
       description:
-        "Register a domain name. Costs USDC via x402 payment. Check availability first with search_domains.",
+        "Register a domain name. Charged to your account. Check availability first with search_domains.",
       category: "conway",
       riskLevel: "dangerous",
       parameters: {
@@ -2232,7 +2285,7 @@ Model: ${ctx.inference.getDefaultModel()}
           args.domain as string,
           (args.years as number) || 1,
         );
-        return `Domain registered: ${reg.domain} (status: ${reg.status}${reg.expiresAt ? `, expires: ${reg.expiresAt}` : ""}${reg.transactionId ? `, tx: ${reg.transactionId}` : ""})`;
+        return `Domain registered: ${reg.domain} (status: ${reg.status}${reg.expiresAt ? `, expires: ${reg.expiresAt}` : ""}${reg.transactionId ? `, ref: ${reg.transactionId}` : ""})`;
       },
     },
     {
@@ -2650,9 +2703,9 @@ Model: ${ctx.inference.getDefaultModel()}
       parameters: {
         type: "object",
         properties: {
-          entity_address: {
+          entity_id: {
             type: "string",
-            description: "Entity wallet address (0x...)",
+            description: "Entity account ID (acct_...)",
           },
           entity_name: {
             type: "string",
@@ -2669,12 +2722,12 @@ Model: ${ctx.inference.getDefaultModel()}
             description: "Trust score 0.0-1.0 (default: 0.5)",
           },
         },
-        required: ["entity_address", "relationship_type"],
+        required: ["entity_id", "relationship_type"],
       },
       execute: async (args, ctx) => {
         const { noteAboutAgent } = await import("../memory/tools.js");
         return noteAboutAgent(ctx.db.raw, {
-          entityAddress: args.entity_address as string,
+          entityId: args.entity_id as string,
           entityName: args.entity_name as string | undefined,
           relationshipType: args.relationship_type as string,
           notes: args.notes as string | undefined,
@@ -2722,11 +2775,11 @@ Model: ${ctx.inference.getDefaultModel()}
       },
     },
 
-    // ── x402 Payment Tool ──
+    // ── Web Fetch Tool ──
     {
-      name: "x402_fetch",
+      name: "web_fetch",
       description:
-        "Fetch a URL with automatic x402 USDC payment. If the server responds with HTTP 402, signs a USDC payment and retries. Use this to access paid APIs and services.",
+        "Fetch a URL over HTTPS. No payment is made. Use this to access web pages and APIs. Requests time out after 30s and responses are truncated at 10000 characters.",
       category: "financial",
       riskLevel: "dangerous",
       parameters: {
@@ -2751,48 +2804,60 @@ Model: ${ctx.inference.getDefaultModel()}
         },
         required: ["url"],
       },
-      execute: async (args, ctx) => {
-        // Solana guard: x402 payments are EVM-only
-        const chainType = ctx.config.chainType || ctx.identity.chainType || "evm";
-        if (chainType === "solana") {
-          return "x402 payment requires an EVM wallet. Solana automatons cannot sign EVM payment authorizations. Use Conway credits API instead.";
-        }
-
-        const { x402Fetch } = await import("../conway/x402.js");
-        const { DEFAULT_TREASURY_POLICY } = await import("../types.js");
+      execute: async (args, _ctx) => {
         const url = args.url as string;
-        const method = (args.method as string) || "GET";
+        const method = ((args.method as string) || "GET").toUpperCase();
         const body = args.body as string | undefined;
-        const extraHeaders = args.headers
-          ? JSON.parse(args.headers as string)
-          : undefined;
 
-        const maxPayment =
-          ctx.config.treasuryPolicy?.maxX402PaymentCents ??
-          DEFAULT_TREASURY_POLICY.maxX402PaymentCents;
-        const result = await x402Fetch(
-          url,
-          ctx.identity.account,
-          method,
-          body,
-          extraHeaders,
-          maxPayment,
-        );
-
-        if (!result.success) {
-          return `x402 fetch failed: ${result.error || "Unknown error"}`;
+        let extraHeaders: Record<string, string> | undefined;
+        if (args.headers) {
+          try {
+            extraHeaders = JSON.parse(args.headers as string);
+          } catch {
+            return "web_fetch failed: headers must be a valid JSON string";
+          }
         }
 
-        const responseStr =
-          typeof result.response === "string"
-            ? result.response
-            : JSON.stringify(result.response, null, 2);
-
-        // Truncate very large responses
-        if (responseStr.length > 10000) {
-          return `x402 fetch succeeded (truncated):\n${responseStr.slice(0, 10000)}...`;
+        let parsed: URL;
+        try {
+          parsed = new URL(url);
+        } catch {
+          return `web_fetch failed: invalid URL: ${url}`;
         }
-        return `x402 fetch succeeded:\n${responseStr}`;
+        if (parsed.protocol !== "https:") {
+          return "web_fetch failed: only https:// URLs are allowed.";
+        }
+
+        const controller = new AbortController();
+        const timeout = setTimeout(() => controller.abort(), 30_000);
+        try {
+          const res = await fetch(parsed.toString(), {
+            method,
+            headers: extraHeaders,
+            body: method === "GET" || method === "HEAD" ? undefined : body,
+            signal: controller.signal,
+          });
+
+          const responseStr = await res.text();
+
+          if (!res.ok) {
+            return `web_fetch failed: HTTP ${res.status} ${res.statusText}`;
+          }
+
+          // Truncate very large responses
+          if (responseStr.length > 10000) {
+            return `web_fetch succeeded (truncated):\n${responseStr.slice(0, 10000)}...`;
+          }
+          return `web_fetch succeeded:\n${responseStr}`;
+        } catch (err: any) {
+          const message =
+            err?.name === "AbortError"
+              ? "request timed out after 30s"
+              : err?.message || String(err);
+          return `web_fetch failed: ${message}`;
+        } finally {
+          clearTimeout(timeout);
+        }
       },
     },
 
@@ -3030,14 +3095,14 @@ Model: ${ctx.inference.getDefaultModel()}
           const lines = [
             `Strategy: ${plan.strategy ?? "none"}`,
             `Analysis: ${plan.analysis ?? "none"}`,
-            `Estimated cost: ${plan.estimatedTotalCostCents ?? 0} cents`,
+            `Estimated cost: ${formatBRL(plan.estimatedTotalCostCents ?? 0)}`,
             `Estimated time: ${plan.estimatedTimeMinutes ?? 0} minutes`,
             `Risks: ${(plan.risks ?? []).join("; ") || "none"}`,
             `\nTasks (${(plan.tasks ?? []).length}):`,
           ];
           for (const [i, task] of (plan.tasks ?? []).entries()) {
             lines.push(
-              `  ${i + 1}. ${task.title} (role: ${task.agentRole}, cost: ${task.estimatedCostCents}c, deps: ${(task.dependencies ?? []).join(",") || "none"})`,
+              `  ${i + 1}. ${task.title} (role: ${task.agentRole}, cost: ${formatBRL(task.estimatedCostCents ?? 0)}, deps: ${(task.dependencies ?? []).join(",") || "none"})`,
             );
           }
           return lines.join("\n");
@@ -3356,7 +3421,7 @@ export async function executeTool(
             turnContext.sessionSpend.recordSpend({
               toolName: "transfer_credits",
               amountCents: amount,
-              recipient: args.to_address as string | undefined,
+              recipient: args.to_account_id as string | undefined,
               category: "transfer",
             });
           } catch (error) {
@@ -3366,13 +3431,12 @@ export async function executeTool(
             );
           }
         }
-      } else if (toolName === "x402_fetch") {
-        // x402 payment amounts are determined by the server response,
-        // but we record a nominal entry for tracking purposes
+      } else if (toolName === "web_fetch") {
+        // web_fetch makes no payment; record a nominal entry for tracking
         try {
           turnContext.sessionSpend.recordSpend({
-            toolName: "x402_fetch",
-            amountCents: 0, // Actual amount is inside the x402 protocol
+            toolName: "web_fetch",
+            amountCents: 0,
             domain: (() => {
               try {
                 return new URL(args.url as string).hostname;
@@ -3380,11 +3444,11 @@ export async function executeTool(
                 return undefined;
               }
             })(),
-            category: "x402",
+            category: "pix",
           });
         } catch (error) {
           logger.error(
-            "Spend tracking failed for x402_fetch",
+            "Spend tracking failed for web_fetch",
             error instanceof Error ? error : undefined,
           );
         }

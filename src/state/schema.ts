@@ -5,7 +5,7 @@
  * The database IS the automaton's memory.
  */
 
-export const SCHEMA_VERSION = 11;
+export const SCHEMA_VERSION = 13;
 
 export const CREATE_TABLES = `
   -- Schema version tracking
@@ -62,7 +62,9 @@ export const CREATE_TABLES = `
   );
 
   -- Financial transaction log
-  -- Application-level validation: type must be one of 'transfer_out','transfer_in','credit_purchase','topup','x402_payment','inference'
+  -- Application-level validation: type must be one of the TransactionType values
+  -- ('credit_check','credit_purchase','inference','tool_use','pix_deposit','service_usage',
+  --  'transfer_in','transfer_out','funding_request')
   CREATE TABLE IF NOT EXISTS transactions (
     id TEXT PRIMARY KEY,
     type TEXT NOT NULL,
@@ -119,7 +121,7 @@ export const CREATE_TABLES = `
   CREATE TABLE IF NOT EXISTS children (
     id TEXT PRIMARY KEY,
     name TEXT NOT NULL,
-    address TEXT NOT NULL,
+    account_id TEXT NOT NULL,
     sandbox_id TEXT NOT NULL,
     genesis_prompt TEXT NOT NULL,
     creator_message TEXT,
@@ -129,13 +131,13 @@ export const CREATE_TABLES = `
     last_checked TEXT
   );
 
-  -- ERC-8004 registration state
+  -- Agent registration state (Conway API)
   CREATE TABLE IF NOT EXISTS registry (
     agent_id TEXT PRIMARY KEY,
     agent_uri TEXT NOT NULL,
-    chain TEXT NOT NULL DEFAULT 'eip155:8453',
-    contract_address TEXT NOT NULL,
-    tx_hash TEXT NOT NULL,
+    provider TEXT NOT NULL DEFAULT 'conway',
+    endpoint TEXT NOT NULL,
+    registration_ref TEXT,
     registered_at TEXT NOT NULL DEFAULT (datetime('now'))
   );
 
@@ -147,7 +149,7 @@ export const CREATE_TABLES = `
     to_agent TEXT NOT NULL,
     score INTEGER NOT NULL,
     comment TEXT NOT NULL DEFAULT '',
-    tx_hash TEXT,
+    feedback_ref TEXT,
     created_at TEXT NOT NULL DEFAULT (datetime('now'))
   );
 
@@ -164,7 +166,7 @@ export const CREATE_TABLES = `
   -- Inbox messages table
   CREATE TABLE IF NOT EXISTS inbox_messages (
     id TEXT PRIMARY KEY,
-    from_address TEXT NOT NULL,
+    from_account_id TEXT NOT NULL,
     content TEXT NOT NULL,
     received_at TEXT NOT NULL DEFAULT (datetime('now')),
     processed_at TEXT,
@@ -178,7 +180,7 @@ export const CREATE_TABLES = `
 export const MIGRATION_V3 = `
   CREATE TABLE IF NOT EXISTS inbox_messages (
     id TEXT PRIMARY KEY,
-    from_address TEXT NOT NULL,
+    from_account_id TEXT NOT NULL,
     content TEXT NOT NULL,
     received_at TEXT NOT NULL DEFAULT (datetime('now')),
     processed_at TEXT,
@@ -216,7 +218,7 @@ export const MIGRATION_V4 = `
     amount_cents INTEGER NOT NULL,
     recipient TEXT,
     domain TEXT,
-    category TEXT NOT NULL CHECK(category IN ('transfer','x402','inference','other')),
+    category TEXT NOT NULL CHECK(category IN ('transfer','pix','inference','other')),
     window_hour TEXT NOT NULL,
     window_day TEXT NOT NULL,
     created_at TEXT NOT NULL DEFAULT (datetime('now'))
@@ -292,7 +294,7 @@ export const MIGRATION_V4 = `
 
 // Inbox modifications for V4 (ALTER TABLE must be run separately from CREATE TABLE)
 export const MIGRATION_V4_ALTER = `
-  ALTER TABLE inbox_messages ADD COLUMN to_address TEXT;
+  ALTER TABLE inbox_messages ADD COLUMN to_account_id TEXT;
 `;
 
 export const MIGRATION_V4_ALTER2 = `
@@ -330,7 +332,7 @@ export const MIGRATION_V2 = `
   CREATE TABLE IF NOT EXISTS children (
     id TEXT PRIMARY KEY,
     name TEXT NOT NULL,
-    address TEXT NOT NULL,
+    account_id TEXT NOT NULL,
     sandbox_id TEXT NOT NULL,
     genesis_prompt TEXT NOT NULL,
     creator_message TEXT,
@@ -343,9 +345,9 @@ export const MIGRATION_V2 = `
   CREATE TABLE IF NOT EXISTS registry (
     agent_id TEXT PRIMARY KEY,
     agent_uri TEXT NOT NULL,
-    chain TEXT NOT NULL DEFAULT 'eip155:8453',
-    contract_address TEXT NOT NULL,
-    tx_hash TEXT NOT NULL,
+    provider TEXT NOT NULL DEFAULT 'conway',
+    endpoint TEXT NOT NULL,
+    registration_ref TEXT,
     registered_at TEXT NOT NULL DEFAULT (datetime('now'))
   );
 
@@ -355,7 +357,7 @@ export const MIGRATION_V2 = `
     to_agent TEXT NOT NULL,
     score INTEGER NOT NULL,
     comment TEXT NOT NULL DEFAULT '',
-    tx_hash TEXT,
+    feedback_ref TEXT,
     created_at TEXT NOT NULL DEFAULT (datetime('now'))
   );
 
@@ -462,7 +464,7 @@ export const MIGRATION_V5 = `
 
   CREATE TABLE IF NOT EXISTS relationship_memory (
     id TEXT PRIMARY KEY,
-    entity_address TEXT NOT NULL UNIQUE,
+    entity_id TEXT NOT NULL UNIQUE,
     entity_name TEXT,
     relationship_type TEXT NOT NULL,
     trust_score REAL NOT NULL DEFAULT 0.5,
@@ -530,7 +532,7 @@ export const MIGRATION_V7 = `
     child_id TEXT NOT NULL,
     from_state TEXT NOT NULL,
     to_state TEXT NOT NULL CHECK(to_state IN (
-      'requested','sandbox_created','runtime_ready','wallet_verified',
+      'requested','sandbox_created','runtime_ready','account_verified',
       'funded','starting','healthy','unhealthy','stopped','failed','cleaned_up'
     )),
     reason TEXT,
@@ -543,7 +545,7 @@ export const MIGRATION_V7 = `
   -- === Phase 3.2: Social & Registry ===
 
   CREATE TABLE IF NOT EXISTS discovered_agents_cache (
-    agent_address TEXT PRIMARY KEY,
+    agent_id TEXT PRIMARY KEY,
     agent_card TEXT NOT NULL,
     fetched_from TEXT NOT NULL,
     card_hash TEXT NOT NULL,
@@ -553,19 +555,118 @@ export const MIGRATION_V7 = `
     created_at TEXT NOT NULL DEFAULT (datetime('now'))
   );
 
-  CREATE TABLE IF NOT EXISTS onchain_transactions (
+  -- Legacy network transaction log (removed: the platform is BRL/Pix only)
+  DROP TABLE IF EXISTS onchain_transactions;
+  DROP INDEX IF EXISTS idx_onchain_status;
+`;
+
+// === BRL / Pix financial system ===
+
+export const MIGRATION_V12 = `
+  -- === BRL (Pix) financial system ===
+
+  CREATE TABLE IF NOT EXISTS user_balances (
+    user_id TEXT PRIMARY KEY,
+    balance_cents INTEGER NOT NULL DEFAULT 0 CHECK (balance_cents >= 0),
+    currency TEXT NOT NULL DEFAULT 'BRL' CHECK (currency = 'BRL'),
+    updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+  );
+
+  CREATE TABLE IF NOT EXISTS pix_payments (
     id TEXT PRIMARY KEY,
-    tx_hash TEXT NOT NULL UNIQUE,
-    chain TEXT NOT NULL,
-    operation TEXT NOT NULL,
-    status TEXT NOT NULL CHECK(status IN ('pending','confirmed','failed')),
-    gas_used INTEGER,
-    metadata TEXT DEFAULT '{}',
+    user_id TEXT NOT NULL,
+    provider TEXT NOT NULL,
+    external_id TEXT NOT NULL,
+    amount_cents INTEGER NOT NULL CHECK (amount_cents > 0),
+    currency TEXT NOT NULL DEFAULT 'BRL' CHECK (currency = 'BRL'),
+    status TEXT NOT NULL CHECK (status IN ('PENDING','PAID','EXPIRED','CANCELLED','FAILED')),
+    pix_copy_paste TEXT,
+    qr_code TEXT,
+    description TEXT NOT NULL DEFAULT '',
+    expires_at TEXT,
+    paid_at TEXT,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    UNIQUE (provider, external_id)
+  );
+
+  CREATE INDEX IF NOT EXISTS idx_pix_payments_user ON pix_payments(user_id, created_at);
+  CREATE INDEX IF NOT EXISTS idx_pix_payments_status ON pix_payments(status);
+
+  CREATE TABLE IF NOT EXISTS pix_webhook_events (
+    event_id TEXT PRIMARY KEY,
+    provider TEXT NOT NULL,
+    external_id TEXT NOT NULL,
+    received_at TEXT NOT NULL DEFAULT (datetime('now'))
+  );
+
+  -- Financial ledger: extend the existing transaction log with the fields
+  -- required for a BRL/Pix statement (never floats: amounts are centavos).
+  ALTER TABLE transactions ADD COLUMN user_id TEXT NOT NULL DEFAULT '';
+  ALTER TABLE transactions ADD COLUMN currency TEXT NOT NULL DEFAULT 'BRL';
+  ALTER TABLE transactions ADD COLUMN payment_method TEXT;
+  ALTER TABLE transactions ADD COLUMN status TEXT NOT NULL DEFAULT 'COMPLETED';
+  ALTER TABLE transactions ADD COLUMN reference_id TEXT;
+
+  CREATE INDEX IF NOT EXISTS idx_transactions_reference ON transactions(reference_id);
+  CREATE UNIQUE INDEX IF NOT EXISTS idx_transactions_reference_type
+    ON transactions(reference_id, type) WHERE reference_id IS NOT NULL;
+  CREATE INDEX IF NOT EXISTS idx_transactions_user ON transactions(user_id, created_at);
+`;
+
+/**
+ * Rebuild `spend_tracking` so the spend category vocabulary is BRL/Pix only.
+ * SQLite cannot alter a CHECK constraint, so the table is recreated.
+ *
+ * LEGACY MIGRATION SHIM: this shipped migration must keep mapping the old
+ * pre-BRL payment category to `pix`. It is kept verbatim so databases created
+ * before the BRL/Pix migration still upgrade; never reuse that vocabulary in
+ * new tables, columns or application code.
+ */
+export const MIGRATION_V12_SPEND_CATEGORY = `
+  CREATE TABLE IF NOT EXISTS spend_tracking_v12 (
+    id TEXT PRIMARY KEY,
+    tool_name TEXT NOT NULL,
+    amount_cents INTEGER NOT NULL,
+    recipient TEXT,
+    domain TEXT,
+    category TEXT NOT NULL CHECK(category IN ('transfer','pix','inference','other')),
+    window_hour TEXT NOT NULL,
+    window_day TEXT NOT NULL,
     created_at TEXT NOT NULL DEFAULT (datetime('now'))
   );
 
-  CREATE INDEX IF NOT EXISTS idx_onchain_status ON onchain_transactions(status);
+  INSERT INTO spend_tracking_v12 (id, tool_name, amount_cents, recipient, domain, category, window_hour, window_day, created_at)
+  SELECT id, tool_name, amount_cents, recipient, domain,
+         CASE WHEN category = 'x402' THEN 'pix' ELSE category END,
+         window_hour, window_day, created_at
+  FROM spend_tracking;
+
+  DROP TABLE spend_tracking;
+  ALTER TABLE spend_tracking_v12 RENAME TO spend_tracking;
+
+  CREATE INDEX IF NOT EXISTS idx_spend_hour ON spend_tracking(category, window_hour);
+  CREATE INDEX IF NOT EXISTS idx_spend_day ON spend_tracking(category, window_day);
 `;
+
+/**
+ * Renames legacy identity/chain columns to their BRL-era equivalents.
+ * Every statement is applied individually: databases created by the current
+ * schema already use the new names, and those statements simply fail.
+ */
+export const MIGRATION_V12_RENAME: string[] = [
+  "ALTER TABLE children RENAME COLUMN address TO account_id",
+  "ALTER TABLE children DROP COLUMN chain_type",
+  "ALTER TABLE inbox_messages RENAME COLUMN from_address TO from_account_id",
+  "ALTER TABLE inbox_messages RENAME COLUMN to_address TO to_account_id",
+  "ALTER TABLE relationship_memory RENAME COLUMN entity_address TO entity_id",
+  "ALTER TABLE event_stream RENAME COLUMN agent_address TO agent_id",
+  "ALTER TABLE discovered_agents_cache RENAME COLUMN agent_address TO agent_id",
+  "ALTER TABLE reputation RENAME COLUMN tx_hash TO feedback_ref",
+  "ALTER TABLE registry RENAME COLUMN contract_address TO endpoint",
+  "ALTER TABLE registry RENAME COLUMN tx_hash TO registration_ref",
+  "ALTER TABLE registry RENAME COLUMN chain TO provider",
+  "UPDATE registry SET provider = 'conway' WHERE provider LIKE 'eip155%' OR provider LIKE 'solana%'",
+];
 
 // === Phase 4.1: Observability ===
 
@@ -609,7 +710,7 @@ export const MIGRATION_V9 = `
     title TEXT NOT NULL,
     description TEXT NOT NULL,
     status TEXT NOT NULL DEFAULT 'pending', -- pending|assigned|running|completed|failed|blocked|cancelled
-    assigned_to TEXT,                       -- agent wallet address (0x...)
+    assigned_to TEXT,                       -- assigned agent account id
     agent_role TEXT,                        -- predefined role name
     priority INTEGER DEFAULT 50,           -- 0-100
     dependencies TEXT DEFAULT '[]',        -- JSON array of task IDs
@@ -631,7 +732,7 @@ export const MIGRATION_V9 = `
   CREATE TABLE event_stream (
     id TEXT PRIMARY KEY,                    -- ULID
     type TEXT NOT NULL,                     -- EventType enum
-    agent_address TEXT NOT NULL,
+    agent_id TEXT NOT NULL,
     goal_id TEXT,
     task_id TEXT,
     content TEXT NOT NULL,
@@ -640,7 +741,7 @@ export const MIGRATION_V9 = `
     created_at TEXT NOT NULL
   );
 
-  CREATE INDEX idx_events_agent ON event_stream(agent_address, created_at);
+  CREATE INDEX idx_events_agent ON event_stream(agent_id, created_at);
   CREATE INDEX idx_events_goal ON event_stream(goal_id, created_at);
   CREATE INDEX idx_events_type ON event_stream(type, created_at);
 `;
@@ -650,12 +751,12 @@ export const MIGRATION_V9_ALTER_CHILDREN_ROLE = `
   ALTER TABLE children ADD COLUMN role TEXT DEFAULT 'generalist';
 `;
 
-// === Solana Integration: Chain Type Column ===
+// === (removed: no chain concept) ===
 
 export const MIGRATION_V11 = `
   -- Schema version: 11
-  -- Add chain_type column to children table for multi-chain support
-  ALTER TABLE children ADD COLUMN chain_type TEXT DEFAULT 'evm';
+  -- (chain concept removed: the platform is BRL/Pix only)
+  -- chain_type removed
 `;
 
 export const MIGRATION_V10 = `
@@ -667,7 +768,7 @@ export const MIGRATION_V10 = `
     category TEXT NOT NULL,                 -- market|technical|social|financial|operational
     key TEXT NOT NULL,
     content TEXT NOT NULL,
-    source TEXT NOT NULL,                   -- agent address that contributed
+    source TEXT NOT NULL,                   -- agent account that contributed
     confidence REAL DEFAULT 1.0,
     last_verified TEXT NOT NULL,
     access_count INTEGER DEFAULT 0,

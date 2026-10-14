@@ -9,7 +9,7 @@
 
 import fs from "fs";
 import path from "path";
-import { getWallet, getAutomatonDir } from "./identity/wallet.js";
+import { getAccount, getAutomatonDir } from "./identity/account.js";
 import { provision, loadApiKeyFromConfig } from "./identity/provision.js";
 import { loadConfig, resolvePath } from "./config.js";
 import { createDatabase } from "./state/database.js";
@@ -34,8 +34,11 @@ import { DEFAULT_TREASURY_POLICY } from "./types.js";
 import { createLogger, setGlobalLogLevel, StructuredLogger } from "./observability/logger.js";
 import { prettySink } from "./observability/pretty-sink.js";
 import { bootstrapTopup } from "./conway/topup.js";
-import { randomUUID } from "crypto";
-import { keccak256, toHex } from "viem";
+import { randomUUID, createHash } from "crypto";
+import { createPixPaymentService, startPixWebhookServer } from "./payments/index.js";
+import { formatBRL } from "./payments/money.js";
+import type { WebhookServer } from "./payments/index.js";
+import { signRegistration } from "./registry/registration.js";
 
 const logger = createLogger("main");
 const VERSION = "0.2.1";
@@ -60,8 +63,8 @@ Usage:
   automaton --setup        Re-run the interactive setup wizard
   automaton --configure    Edit configuration (providers, model, treasury, general)
   automaton --pick-model   Interactively pick the active inference model
-  automaton --init         Initialize wallet and config directory
-  automaton --provision    Provision Conway API key via SIWE
+  automaton --init         Initialize the account identity and config directory
+  automaton --provision    Provision Conway API key via signed challenge
   automaton --status       Show current automaton status
   automaton --version      Show version
   automaton --help         Show this help
@@ -75,19 +78,10 @@ Environment:
   }
 
   if (args.includes("--init")) {
-    // Read chain type from genesis.json if written by parent during spawn
-    let initChainType: import("./identity/chain.js").ChainType | undefined;
-    try {
-      const genesisPath = path.join(getAutomatonDir(), "genesis.json");
-      if (fs.existsSync(genesisPath)) {
-        const genesis = JSON.parse(fs.readFileSync(genesisPath, "utf-8"));
-        initChainType = genesis.chainType;
-      }
-    } catch {}
-    const { chainIdentity, isNew } = await getWallet(initChainType);
+    const { identity, isNew } = await getAccount();
     logger.info(
       JSON.stringify({
-        address: chainIdentity.address,
+        accountId: identity.accountId,
         isNew,
         configDir: getAutomatonDir(),
       }),
@@ -163,8 +157,8 @@ async function showStatus(): Promise<void> {
   logger.info(`
 === AUTOMATON STATUS ===
 Name:       ${config.name}
-Address:    ${config.walletAddress}
-Creator:    ${config.creatorAddress}
+Account:    ${config.accountId}
+Creator:    ${config.creatorAccountId}
 Sandbox:    ${config.sandboxId}
 State:      ${state}
 Turns:      ${turnCount}
@@ -193,9 +187,8 @@ async function run(): Promise<void> {
     config = await runSetupWizard();
   }
 
-  // Load wallet (chain-aware)
-  const { account, chainIdentity, chainType: walletChainType } = await getWallet();
-  const resolvedChainType = config.chainType || walletChainType || "evm";
+  // Load the local account identity
+  const { identity: accountIdentity } = await getAccount();
   const apiKey = config.conwayApiKey || loadApiKeyFromConfig();
   if (!apiKey) {
     logger.error("No API key found. Run: automaton --provision");
@@ -213,29 +206,41 @@ async function run(): Promise<void> {
     db.setIdentity("createdAt", createdAt);
   }
 
-  // Build identity (chain-aware)
+  // Build identity
   const identity: AutomatonIdentity = {
     name: config.name,
-    address: chainIdentity.address,
-    account,
-    creatorAddress: config.creatorAddress,
+    accountId: accountIdentity.accountId,
+    creatorAccountId: config.creatorAccountId,
     sandboxId: config.sandboxId,
     apiKey,
     createdAt,
-    chainType: resolvedChainType,
-    chainIdentity,
   };
 
   // Store identity in DB
   db.setIdentity("name", config.name);
-  db.setIdentity("address", chainIdentity.address);
-  db.setIdentity("creator", config.creatorAddress);
-  db.setIdentity("chainType", resolvedChainType);
+  db.setIdentity("accountId", accountIdentity.accountId);
+  db.setIdentity("creator", config.creatorAccountId);
   db.setIdentity("sandbox", config.sandboxId);
   const storedAutomatonId = db.getIdentity("automatonId");
   const automatonId = storedAutomatonId || config.sandboxId || randomUUID();
   if (!storedAutomatonId) {
     db.setIdentity("automatonId", automatonId);
+  }
+
+  // Pix webhook: the only path through which confirmed payments are credited
+  // to the balance. The provider authenticates every delivery with an HMAC
+  // signature checked inside PixPaymentService.handleWebhook.
+  let pixWebhook: WebhookServer | undefined;
+  if (process.env.PIX_WEBHOOK_DISABLED !== "1") {
+    try {
+      const pixService = createPixPaymentService(db.raw);
+      pixWebhook = await startPixWebhookServer({ service: pixService });
+      logger.info(`[${new Date().toISOString()}] Pix webhook: ${pixWebhook.url}`);
+    } catch (err: any) {
+      logger.warn(
+        `[${new Date().toISOString()}] Pix webhook server not started: ${err.message}`,
+      );
+    }
   }
 
   // Create Conway client
@@ -250,18 +255,23 @@ async function run(): Promise<void> {
   if (registrationState !== "registered") {
     try {
       const genesisPromptHash = config.genesisPrompt
-        ? keccak256(toHex(config.genesisPrompt))
+        ? createHash("sha256").update(config.genesisPrompt, "utf8").digest("hex")
         : undefined;
+      const signature = await signRegistration(accountIdentity, {
+        automatonId,
+        accountId: accountIdentity.accountId,
+        creatorAccountId: config.creatorAccountId,
+        name: config.name,
+        genesisPromptHash,
+      });
       await conway.registerAutomaton({
         automatonId,
-        automatonAddress: chainIdentity.address,
-        creatorAddress: config.creatorAddress,
+        automatonAccountId: accountIdentity.accountId,
+        creatorAccountId: config.creatorAccountId,
         name: config.name,
         bio: config.creatorMessage || "",
         genesisPromptHash,
-        account,
-        chainType: resolvedChainType,
-        chainIdentity,
+        signature,
       });
       db.setIdentity("conwayRegistrationStatus", "registered");
       logger.info(`[${new Date().toISOString()}] Automaton identity registered.`);
@@ -300,10 +310,10 @@ async function run(): Promise<void> {
     logger.info(`[${new Date().toISOString()}] Ollama backend: ${ollamaBaseUrl}`);
   }
 
-  // Create social client (chain-aware: pass ChainIdentity for Solana signing)
+  // Create social client (messages are signed with the local account key)
   let social: SocialClientInterface | undefined;
   if (config.socialRelayUrl) {
-    social = createSocialClient(config.socialRelayUrl, resolvedChainType === "solana" ? chainIdentity : account);
+    social = createSocialClient(config.socialRelayUrl, accountIdentity, db.raw);
     logger.info(`[${new Date().toISOString()}] Social relay: ${config.socialRelayUrl}`);
   }
 
@@ -336,8 +346,8 @@ async function run(): Promise<void> {
     logger.warn(`[${new Date().toISOString()}] State repo init failed: ${err.message}`);
   }
 
-  // Bootstrap topup: buy minimum credits ($5) from USDC so the agent can start.
-  // The agent decides larger topups itself via the topup_credits tool.
+  // Bootstrap topup: buy the minimum credit tier from the BRL balance so the
+  // agent can start. The agent decides larger topups itself via topup_credits.
   try {
     let bootstrapTimer: ReturnType<typeof setTimeout>;
     const bootstrapTimeout = new Promise<null>((_, reject) => {
@@ -348,14 +358,14 @@ async function run(): Promise<void> {
         (async () => {
           const creditsCents = await conway.getCreditsBalance().catch(() => 0);
           const topupResult = await bootstrapTopup({
-            apiUrl: config.conwayApiUrl,
-            account,
+            db: db.raw,
+            userId: identity.accountId,
+            conway,
             creditsCents,
-            chainType: resolvedChainType,
           });
           if (topupResult?.success) {
             logger.info(
-              `[${new Date().toISOString()}] Bootstrap topup: +$${topupResult.amountUsd} credits from USDC`,
+              `[${new Date().toISOString()}] Bootstrap topup: -${formatBRL(topupResult.amountCents)} of balance for credits`,
             );
           }
         })(),
@@ -392,6 +402,7 @@ async function run(): Promise<void> {
     logger.info(`[${new Date().toISOString()}] Shutting down...`);
     heartbeat.stop();
     db.setAgentState("sleeping");
+    void pixWebhook?.close().catch(() => {});
     db.close();
     process.exit(0);
   };

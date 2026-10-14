@@ -133,12 +133,12 @@ function gatherRecentEvidence(db: BetterSqlite3.Database): RecentEvidence {
     // Get recent social interactions
     const inboxRows = db
       .prepare(
-        "SELECT from_address FROM inbox_messages ORDER BY received_at DESC LIMIT 20",
+        "SELECT from_account_id FROM inbox_messages ORDER BY received_at DESC LIMIT 20",
       )
-      .all() as { from_address: string }[];
+      .all() as { from_account_id: string }[];
     for (const row of inboxRows) {
-      if (!interactions.includes(row.from_address)) {
-        interactions.push(row.from_address);
+      if (!interactions.includes(row.from_account_id)) {
+        interactions.push(row.from_account_id);
       }
     }
 

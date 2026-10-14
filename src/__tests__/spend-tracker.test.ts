@@ -33,7 +33,7 @@ function createTestSpendDb(): Database.Database {
       amount_cents INTEGER NOT NULL,
       recipient TEXT,
       domain TEXT,
-      category TEXT NOT NULL CHECK(category IN ('transfer','x402','inference','other')),
+      category TEXT NOT NULL CHECK(category IN ('transfer','pix','inference','other')),
       window_hour TEXT NOT NULL,
       window_day TEXT NOT NULL,
       created_at TEXT NOT NULL DEFAULT (datetime('now'))
@@ -63,7 +63,7 @@ describe("SpendTracker", () => {
       tracker.recordSpend({
         toolName: "transfer_credits",
         amountCents: 500,
-        recipient: "0x1234",
+        recipient: "acct_1234",
         category: "transfer",
       });
 
@@ -73,7 +73,7 @@ describe("SpendTracker", () => {
       expect(row).toBeDefined();
       expect(row.tool_name).toBe("transfer_credits");
       expect(row.amount_cents).toBe(500);
-      expect(row.recipient).toBe("0x1234");
+      expect(row.recipient).toBe("acct_1234");
       expect(row.category).toBe("transfer");
 
       // window_hour should be ISO format like '2026-02-19T14'
@@ -94,10 +94,10 @@ describe("SpendTracker", () => {
         category: "transfer",
       });
       tracker.recordSpend({
-        toolName: "x402_fetch",
+        toolName: "web_fetch",
         amountCents: 50,
         domain: "conway.tech",
-        category: "x402",
+        category: "pix",
       });
 
       const count = db
@@ -136,13 +136,13 @@ describe("SpendTracker", () => {
         category: "transfer",
       });
       tracker.recordSpend({
-        toolName: "x402_fetch",
+        toolName: "web_fetch",
         amountCents: 50,
-        category: "x402",
+        category: "pix",
       });
 
       expect(tracker.getHourlySpend("transfer")).toBe(100);
-      expect(tracker.getHourlySpend("x402")).toBe(50);
+      expect(tracker.getHourlySpend("pix")).toBe(50);
     });
   });
 
@@ -302,7 +302,7 @@ describe("SpendTracker", () => {
 
   describe("inference limits", () => {
     it("uses a meaningful hourly cap less than the daily limit", () => {
-      // maxInferenceDailyCents is 50000 ($500/day)
+      // maxInferenceDailyCents is 50000 (R$ 500,00/day)
       // The hourly limit should be a fraction of the daily limit, NOT equal to it
       const result = tracker.checkLimit(1, "inference", DEFAULT_TREASURY_POLICY);
       expect(result.allowed).toBe(true);
@@ -326,23 +326,25 @@ describe("SpendTracker", () => {
     });
   });
 
-  describe("x402 limits", () => {
-    it("uses x402-specific limits, not transfer limits", () => {
-      // Record some x402 spend
+  describe("pix limits", () => {
+    it("uses pix-specific limits, not transfer limits", () => {
+      // Record some pix-category spend
       tracker.recordSpend({
-        toolName: "x402_fetch",
-        amountCents: 900,
+        toolName: "web_fetch",
+        amountCents: 9_000_000,
         domain: "conway.tech",
-        category: "x402",
+        category: "pix",
       });
 
-      // maxX402PaymentCents is 100, so hourly = 100*10 = 1000
-      // 900 + 200 = 1100 > 1000 should be denied
-      const result = tracker.checkLimit(200, "x402", DEFAULT_TREASURY_POLICY);
+      // maxSingleDepositCents is 1,000,000, so hourly = 1,000,000 * 10 = 10,000,000
+      // 9,000,000 + 2,000,000 = 11,000,000 > 10,000,000 should be denied
+      const result = tracker.checkLimit(2_000_000, "pix", DEFAULT_TREASURY_POLICY);
       expect(result.allowed).toBe(false);
       expect(result.reason).toContain("Hourly");
+      expect(result.limitHourly).toBe(10_000_000);
+      expect(result.limitDaily).toBe(50_000_000);
 
-      // But the same amount should be allowed for transfers (limit is 10000)
+      // A tiny amount is still allowed for transfers (hourly cap 10,000)
       const transferResult = tracker.checkLimit(200, "transfer", DEFAULT_TREASURY_POLICY);
       expect(transferResult.allowed).toBe(true);
     });

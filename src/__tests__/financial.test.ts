@@ -1,14 +1,14 @@
 /**
  * Financial Policy Rules Tests
  *
- * Tests for all financial limit rules:
- * - x402_max_single denies payments > 100 cents
- * - x402_domain_allowlist denies non-conway.tech domains
- * - transfer_max_single denies transfers > 5000 cents
+ * Tests for all financial limit rules (values in integer centavos):
+ * - transfer_max_single denies transfers > 5000 centavos
  * - transfer_hourly_cap denies when hourly total > 10000
  * - transfer_daily_cap denies when daily total > 25000
  * - minimum_reserve denies when balance would drop below 1000
  * - turn_transfer_limit denies > 2 transfers per turn
+ * - web_fetch URL validation: no domain allowlist rule in the policy
+ *   set (the tool itself rejects malformed / non-HTTPS URLs)
  * - Iterative drain scenario: 10 successive transfers blocked by hourly cap
  */
 
@@ -18,6 +18,7 @@ import path from "path";
 import os from "os";
 import fs from "fs";
 import { createFinancialRules } from "../agent/policy-rules/financial.js";
+import { createBuiltinTools } from "../agent/tools.js";
 import { PolicyEngine } from "../agent/policy-engine.js";
 import { SpendTracker } from "../agent/spend-tracker.js";
 import type {
@@ -65,7 +66,7 @@ function createTestDb(): Database.Database {
       amount_cents INTEGER NOT NULL,
       recipient TEXT,
       domain TEXT,
-      category TEXT NOT NULL CHECK(category IN ('transfer','x402','inference','other')),
+      category TEXT NOT NULL CHECK(category IN ('transfer','pix','inference','other')),
       window_hour TEXT NOT NULL,
       window_day TEXT NOT NULL,
       created_at TEXT NOT NULL DEFAULT (datetime('now'))
@@ -88,10 +89,10 @@ function mockTransferTool(): AutomatonTool {
   };
 }
 
-function mockX402Tool(): AutomatonTool {
+function mockWebFetchTool(): AutomatonTool {
   return {
-    name: "x402_fetch",
-    description: "x402 fetch",
+    name: "web_fetch",
+    description: "Fetch a URL over HTTPS",
     parameters: { type: "object", properties: {} },
     execute: async () => "ok",
     riskLevel: "dangerous",
@@ -164,10 +165,15 @@ describe("Financial Policy Rules", () => {
     db.close();
   });
 
-  describe("financial.x402_domain_allowlist", () => {
+  describe("web_fetch URL policy", () => {
+    it("policy set contains no domain allowlist rule", () => {
+      const domainRules = rules.filter((r) => r.id.includes("domain"));
+      expect(domainRules).toEqual([]);
+    });
+
     it("allows requests to conway.tech domains", () => {
       const request = createRequest(
-        mockX402Tool(),
+        mockWebFetchTool(),
         { url: "https://api.conway.tech/v1/resource" },
         createMockSpendTracker(),
       );
@@ -176,32 +182,20 @@ describe("Financial Policy Rules", () => {
       expect(decision.action).toBe("allow");
     });
 
-    it("denies requests to non-allowlisted domains", () => {
+    it("allows requests to other domains", () => {
       const request = createRequest(
-        mockX402Tool(),
+        mockWebFetchTool(),
         { url: "https://evil.example.com/drain" },
         createMockSpendTracker(),
       );
 
       const decision = engine.evaluate(request);
-      expect(decision.action).toBe("deny");
-      expect(decision.reasonCode).toBe("DOMAIN_NOT_ALLOWED");
+      expect(decision.action).toBe("allow");
     });
 
-    it("denies requests to subdomains of non-allowlisted domains", () => {
+    it("allows subdomains of conway.tech", () => {
       const request = createRequest(
-        mockX402Tool(),
-        { url: "https://conway.tech.evil.com/drain" },
-        createMockSpendTracker(),
-      );
-
-      const decision = engine.evaluate(request);
-      expect(decision.action).toBe("deny");
-    });
-
-    it("allows subdomain of conway.tech", () => {
-      const request = createRequest(
-        mockX402Tool(),
+        mockWebFetchTool(),
         { url: "https://pay.conway.tech/endpoint" },
         createMockSpendTracker(),
       );
@@ -210,16 +204,34 @@ describe("Financial Policy Rules", () => {
       expect(decision.action).toBe("allow");
     });
 
-    it("denies invalid URLs", () => {
+    it("does not deny malformed URLs at policy level (validated by the tool)", () => {
       const request = createRequest(
-        mockX402Tool(),
+        mockWebFetchTool(),
         { url: "not-a-url" },
         createMockSpendTracker(),
       );
 
       const decision = engine.evaluate(request);
-      expect(decision.action).toBe("deny");
-      expect(decision.reasonCode).toBe("DOMAIN_NOT_ALLOWED");
+      expect(decision.action).toBe("allow");
+    });
+
+    it("web_fetch tool rejects malformed URLs at execution time", async () => {
+      const tools = createBuiltinTools("test-sandbox-id");
+      const webFetch = tools.find((t) => t.name === "web_fetch")!;
+
+      const result = await webFetch.execute({ url: "not-a-url" }, {} as ToolContext);
+      expect(result).toContain("web_fetch failed: invalid URL");
+    });
+
+    it("web_fetch tool rejects non-HTTPS URLs at execution time", async () => {
+      const tools = createBuiltinTools("test-sandbox-id");
+      const webFetch = tools.find((t) => t.name === "web_fetch")!;
+
+      const result = await webFetch.execute(
+        { url: "http://example.com/data" },
+        {} as ToolContext,
+      );
+      expect(result).toContain("only https:// URLs are allowed");
     });
   });
 
@@ -227,7 +239,7 @@ describe("Financial Policy Rules", () => {
     it("allows transfers within limit and below confirmation threshold", () => {
       const request = createRequest(
         mockTransferTool(),
-        { amount_cents: 500, to_address: "0x1234567890abcdef1234567890abcdef12345678" },
+        { amount_cents: 500, to_account_id: "0x1234567890abcdef1234567890abcdef12345678" },
         createMockSpendTracker(),
       );
 
@@ -238,7 +250,7 @@ describe("Financial Policy Rules", () => {
     it("quarantines transfers above confirmation threshold but within single limit", () => {
       const request = createRequest(
         mockTransferTool(),
-        { amount_cents: 4000, to_address: "0x1234567890abcdef1234567890abcdef12345678" },
+        { amount_cents: 4000, to_account_id: "0x1234567890abcdef1234567890abcdef12345678" },
         createMockSpendTracker(),
       );
 
@@ -250,7 +262,7 @@ describe("Financial Policy Rules", () => {
     it("denies transfers above 5000 cents", () => {
       const request = createRequest(
         mockTransferTool(),
-        { amount_cents: 6000, to_address: "0x1234567890abcdef1234567890abcdef12345678" },
+        { amount_cents: 6000, to_account_id: "0x1234567890abcdef1234567890abcdef12345678" },
         createMockSpendTracker(),
       );
 
@@ -262,7 +274,7 @@ describe("Financial Policy Rules", () => {
     it("denies transfers exactly at boundary + 1", () => {
       const request = createRequest(
         mockTransferTool(),
-        { amount_cents: 5001, to_address: "0x1234567890abcdef1234567890abcdef12345678" },
+        { amount_cents: 5001, to_account_id: "0x1234567890abcdef1234567890abcdef12345678" },
         createMockSpendTracker(),
       );
 
@@ -273,7 +285,7 @@ describe("Financial Policy Rules", () => {
     it("quarantines transfers exactly at single limit (above confirmation threshold)", () => {
       const request = createRequest(
         mockTransferTool(),
-        { amount_cents: 5000, to_address: "0x1234567890abcdef1234567890abcdef12345678" },
+        { amount_cents: 5000, to_account_id: "0x1234567890abcdef1234567890abcdef12345678" },
         createMockSpendTracker(),
       );
 
@@ -294,7 +306,7 @@ describe("Financial Policy Rules", () => {
 
       const request = createRequest(
         mockTransferTool(),
-        { amount_cents: 500, to_address: "0x1234567890abcdef1234567890abcdef12345678" },
+        { amount_cents: 500, to_account_id: "0x1234567890abcdef1234567890abcdef12345678" },
         spendTracker,
       );
 
@@ -317,7 +329,7 @@ describe("Financial Policy Rules", () => {
 
       const request = createRequest(
         mockTransferTool(),
-        { amount_cents: 1000, to_address: "0x1234567890abcdef1234567890abcdef12345678" },
+        { amount_cents: 1000, to_account_id: "0x1234567890abcdef1234567890abcdef12345678" },
         spendTracker,
       );
 
@@ -347,7 +359,7 @@ describe("Financial Policy Rules", () => {
 
       const request = createRequest(
         mockTransferTool(),
-        { amount_cents: 2000, to_address: "0x1234567890abcdef1234567890abcdef12345678" },
+        { amount_cents: 2000, to_account_id: "0x1234567890abcdef1234567890abcdef12345678" },
         spendTracker,
       );
 
@@ -361,7 +373,7 @@ describe("Financial Policy Rules", () => {
     it("allows first transfer in a turn", () => {
       const request = createRequest(
         mockTransferTool(),
-        { amount_cents: 100, to_address: "0x1234567890abcdef1234567890abcdef12345678" },
+        { amount_cents: 100, to_account_id: "0x1234567890abcdef1234567890abcdef12345678" },
         createMockSpendTracker(),
         0, // first call
       );
@@ -373,7 +385,7 @@ describe("Financial Policy Rules", () => {
     it("allows second transfer in a turn", () => {
       const request = createRequest(
         mockTransferTool(),
-        { amount_cents: 100, to_address: "0x1234567890abcdef1234567890abcdef12345678" },
+        { amount_cents: 100, to_account_id: "0x1234567890abcdef1234567890abcdef12345678" },
         createMockSpendTracker(),
         1, // second call
       );
@@ -385,7 +397,7 @@ describe("Financial Policy Rules", () => {
     it("denies third transfer in a turn (> maxTransfersPerTurn=2)", () => {
       const request = createRequest(
         mockTransferTool(),
-        { amount_cents: 100, to_address: "0x1234567890abcdef1234567890abcdef12345678" },
+        { amount_cents: 100, to_account_id: "0x1234567890abcdef1234567890abcdef12345678" },
         createMockSpendTracker(),
         2, // third call (0-indexed: 0, 1, 2)
       );
@@ -398,7 +410,7 @@ describe("Financial Policy Rules", () => {
     it("denies 10th transfer in a turn", () => {
       const request = createRequest(
         mockTransferTool(),
-        { amount_cents: 100, to_address: "0x1234567890abcdef1234567890abcdef12345678" },
+        { amount_cents: 100, to_account_id: "0x1234567890abcdef1234567890abcdef12345678" },
         createMockSpendTracker(),
         9,
       );
@@ -412,7 +424,7 @@ describe("Financial Policy Rules", () => {
       // turnToolCallCount should reflect transfer count (0), not total tool call index
       const request = createRequest(
         mockTransferTool(),
-        { amount_cents: 100, to_address: "0x1234567890abcdef1234567890abcdef12345678" },
+        { amount_cents: 100, to_account_id: "0x1234567890abcdef1234567890abcdef12345678" },
         createMockSpendTracker(),
         0, // zero prior transfers, regardless of how many other tools ran
       );
@@ -430,7 +442,7 @@ describe("Financial Policy Rules", () => {
       for (let i = 0; i < 10; i++) {
         const request = createRequest(
           mockTransferTool(),
-          { amount_cents: 500, to_address: "0x1234567890abcdef1234567890abcdef12345678" },
+          { amount_cents: 500, to_account_id: "0x1234567890abcdef1234567890abcdef12345678" },
           spendTracker,
           i,
         );
@@ -474,7 +486,7 @@ describe("Financial Policy Rules", () => {
       for (let i = 0; i < 10; i++) {
         const request = createRequest(
           mockTransferTool(),
-          { amount_cents: 2000, to_address: "0x1234567890abcdef1234567890abcdef12345678" },
+          { amount_cents: 2000, to_account_id: "0x1234567890abcdef1234567890abcdef12345678" },
           spendTracker,
           i,
         );

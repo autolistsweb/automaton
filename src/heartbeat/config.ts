@@ -8,14 +8,15 @@ import fs from "fs";
 import path from "path";
 import YAML from "yaml";
 import type { HeartbeatEntry, HeartbeatConfig, AutomatonDatabase } from "../types.js";
-import { getAutomatonDir } from "../identity/wallet.js";
+import { getAutomatonDir } from "../identity/account.js";
 import { createLogger } from "../observability/logger.js";
 
 const logger = createLogger("heartbeat.config");
 
-const USDC_TOPUP_ENTRY_NAME = "check_usdc_balance";
-const USDC_TOPUP_FAST_SCHEDULE = "*/5 * * * *";
-const USDC_TOPUP_OLD_SCHEDULE = "0 */12 * * *";
+const BALANCE_ENTRY_NAME = "check_balance";
+const LEGACY_BALANCE_ENTRY_NAME = "check_usdc_balance";
+const BALANCE_FAST_SCHEDULE = "*/5 * * * *";
+const BALANCE_OLD_SCHEDULE = "0 */12 * * *";
 
 const DEFAULT_HEARTBEAT_CONFIG: HeartbeatConfig = {
   entries: [
@@ -32,9 +33,9 @@ const DEFAULT_HEARTBEAT_CONFIG: HeartbeatConfig = {
       enabled: true,
     },
     {
-      name: "check_usdc_balance",
-      schedule: USDC_TOPUP_FAST_SCHEDULE,
-      task: "check_usdc_balance",
+      name: BALANCE_ENTRY_NAME,
+      schedule: BALANCE_FAST_SCHEDULE,
+      task: BALANCE_ENTRY_NAME,
       enabled: true,
     },
     {
@@ -141,7 +142,24 @@ function mergeWithDefaults(entries: HeartbeatEntry[]): HeartbeatEntry[] {
   const defaultsByName = new Map(defaults.map((entry) => [entry.name, entry]));
   const mergedByName = new Map(defaultsByName);
 
-  for (const entry of entries) {
+  for (const parsedEntry of entries) {
+    // Configs written before the BRL migration still carry the old task name.
+    const entry =
+      parsedEntry.name === LEGACY_BALANCE_ENTRY_NAME ||
+      parsedEntry.task === LEGACY_BALANCE_ENTRY_NAME
+        ? {
+            ...parsedEntry,
+            name:
+              parsedEntry.name === LEGACY_BALANCE_ENTRY_NAME
+                ? BALANCE_ENTRY_NAME
+                : parsedEntry.name,
+            task:
+              parsedEntry.task === LEGACY_BALANCE_ENTRY_NAME
+                ? BALANCE_ENTRY_NAME
+                : parsedEntry.task,
+          }
+        : parsedEntry;
+
     if (!entry?.name) continue;
     const fallback = defaultsByName.get(entry.name);
     mergedByName.set(entry.name, {
@@ -153,17 +171,17 @@ function mergeWithDefaults(entries: HeartbeatEntry[]): HeartbeatEntry[] {
     });
   }
 
-  const fallbackTopup = defaultsByName.get(USDC_TOPUP_ENTRY_NAME);
-  if (fallbackTopup) {
-    const current = mergedByName.get(USDC_TOPUP_ENTRY_NAME) || fallbackTopup;
-    const migratedSchedule = current.schedule?.trim() === USDC_TOPUP_OLD_SCHEDULE
-      ? USDC_TOPUP_FAST_SCHEDULE
-      : current.schedule || fallbackTopup.schedule;
+  const fallbackBalance = defaultsByName.get(BALANCE_ENTRY_NAME);
+  if (fallbackBalance) {
+    const current = mergedByName.get(BALANCE_ENTRY_NAME) || fallbackBalance;
+    const migratedSchedule = current.schedule?.trim() === BALANCE_OLD_SCHEDULE
+      ? BALANCE_FAST_SCHEDULE
+      : current.schedule || fallbackBalance.schedule;
 
-    mergedByName.set(USDC_TOPUP_ENTRY_NAME, {
-      ...fallbackTopup,
+    mergedByName.set(BALANCE_ENTRY_NAME, {
+      ...fallbackBalance,
       ...current,
-      task: current.task || fallbackTopup.task,
+      task: current.task || fallbackBalance.task,
       schedule: migratedSchedule,
     });
   }

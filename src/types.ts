@@ -4,37 +4,28 @@
  * All shared interfaces for the sovereign AI agent runtime.
  */
 
-import type { PrivateKeyAccount, Address } from "viem";
-import type { ChainType, ChainIdentity } from "./identity/chain.js";
-
 // ─── Identity ────────────────────────────────────────────────────
 
+/**
+ * The automaton's account identity.
+ *
+ * The account is a locally generated, non-cryptographic identifier
+ * (`acct_…`) paired with a local signing secret used to authenticate
+ * API calls and social messages. It is not a blockchain wallet: there is
+ * no private key, seed phrase, chain or address.
+ */
 export interface AutomatonIdentity {
   name: string;
-  address: string;
-  account: PrivateKeyAccount;
-  creatorAddress: string;
+  accountId: string;
+  creatorAccountId: string;
   sandboxId: string;
   apiKey: string;
   createdAt: string;
-  /** Chain type for this automaton's wallet identity. Defaults to "evm". */
-  chainType?: ChainType;
-  /** Chain-agnostic identity wrapper. Parallel to `account` for backward compat. */
-  chainIdentity?: ChainIdentity;
-}
-
-export interface WalletData {
-  privateKey?: `0x${string}`;
-  /** Base58-encoded 64-byte Ed25519 secret key (Solana wallets). */
-  secretKey?: string;
-  createdAt: string;
-  /** Chain type for this wallet. Missing = "evm" for backward compat. */
-  chainType?: ChainType;
 }
 
 export interface ProvisionResult {
   apiKey: string;
-  walletAddress: string;
+  accountId: string;
   keyPrefix: string;
 }
 
@@ -44,7 +35,7 @@ export interface AutomatonConfig {
   name: string;
   genesisPrompt: string;
   creatorMessage?: string;
-  creatorAddress: string;
+  creatorAccountId: string;
   registeredWithConway: boolean;
   sandboxId: string;
   conwayApiUrl: string;
@@ -57,7 +48,7 @@ export interface AutomatonConfig {
   heartbeatConfigPath: string;
   dbPath: string;
   logLevel: "debug" | "info" | "warn" | "error";
-  walletAddress: string;
+  accountId: string;
   version: string;
   skillsDir: string;
   agentId?: string;
@@ -65,16 +56,12 @@ export interface AutomatonConfig {
   maxTurnsPerCycle?: number;
   /** Child sandbox memory config (MB), default 1024 */
   childSandboxMemoryMb?: number;
-  parentAddress?: string;
+  parentAccountId?: string;
   socialRelayUrl?: string;
   treasuryPolicy?: TreasuryPolicy;
   // Phase 2 config additions
   soulConfig?: SoulConfig;
   modelStrategy?: ModelStrategyConfig;
-  /** Custom RPC endpoint for Base chain interactions (overrides default public RPC) */
-  rpcUrl?: string;
-  /** Chain type for this automaton. Defaults to "evm" if absent. */
-  chainType?: ChainType;
 }
 
 export const DEFAULT_CONFIG: Partial<AutomatonConfig> = {
@@ -208,10 +195,11 @@ export interface HeartbeatConfig {
 
 export interface HeartbeatPingPayload {
   name: string;
-  address: string;
+  accountId: string;
   state: AgentState;
   creditsCents: number;
-  usdcBalance: number;
+  /** Available balance in centavos of BRL. */
+  balanceCents: number;
   uptimeSeconds: number;
   version: string;
   sandboxId: string;
@@ -221,8 +209,10 @@ export interface HeartbeatPingPayload {
 // ─── Financial ───────────────────────────────────────────────────
 
 export interface FinancialState {
+  /** Internal compute credits, funded by the BRL balance (centavos). */
   creditsCents: number;
-  usdcBalance: number;
+  /** Available balance in centavos of BRL (deposited via Pix). */
+  balanceCents: number;
   lastChecked: string;
 }
 
@@ -250,9 +240,57 @@ export type TransactionType =
   | "credit_purchase"
   | "inference"
   | "tool_use"
+  | "pix_deposit"
+  | "service_usage"
   | "transfer_in"
   | "transfer_out"
   | "funding_request";
+
+// ─── BRL / Pix ledger rows ──────────────────────────────────────
+
+export interface UserBalanceRow {
+  userId: string;
+  balanceCents: number;
+  currency: "BRL";
+  updatedAt: string;
+}
+
+export type PixChargeStatus =
+  | "PENDING"
+  | "PAID"
+  | "EXPIRED"
+  | "CANCELLED"
+  | "FAILED";
+
+export interface PixPaymentRow {
+  id: string;
+  userId: string;
+  provider: string;
+  externalId: string;
+  amountCents: number;
+  currency: "BRL";
+  status: PixChargeStatus;
+  pixCopyPaste: string | null;
+  qrCode: string | null;
+  description: string;
+  expiresAt: string | null;
+  paidAt: string | null;
+  createdAt: string;
+}
+
+export interface FinancialTransactionRow {
+  id: string;
+  userId: string;
+  type: TransactionType;
+  amountCents: number;
+  balanceAfterCents?: number;
+  currency: "BRL" | string;
+  paymentMethod: "PIX" | string;
+  status: "PENDING" | "COMPLETED" | "FAILED" | "CANCELLED";
+  referenceId: string | null;
+  description: string;
+  createdAt: string;
+}
 
 // ─── Self-Modification ───────────────────────────────────────────
 
@@ -366,21 +404,28 @@ export interface ConwayClient {
   getCreditsBalance(): Promise<number>;
   getCreditsPricing(): Promise<PricingTier[]>;
   transferCredits(
-    toAddress: string,
+    toAccountId: string,
     amountCents: number,
     note?: string,
   ): Promise<CreditTransferResult>;
+  /**
+   * Buy Conway compute credits with the account's BRL balance.
+   * `amountCents` is centavos of BRL.
+   */
+  purchaseCredits(
+    amountCents: number,
+    idempotencyKey?: string,
+  ): Promise<{ creditsCentsAdded: number; balanceCents?: number }>;
   registerAutomaton(params: {
     automatonId: string;
-    automatonAddress: string;
-    creatorAddress: string;
+    automatonAccountId: string;
+    creatorAccountId: string;
     name: string;
     bio?: string;
-    genesisPromptHash?: `0x${string}`;
-    account: PrivateKeyAccount;
+    genesisPromptHash?: string;
+    /** HMAC signature over the registration challenge. */
+    signature: string;
     nonce?: string;
-    chainType?: ChainType;
-    chainIdentity?: ChainIdentity;
   }): Promise<{ automaton: Record<string, unknown> }>;
   // Domain operations
   searchDomains(query: string, tlds?: string): Promise<DomainSearchResult[]>;
@@ -442,7 +487,7 @@ export interface PricingTier {
 export interface CreditTransferResult {
   transferId: string;
   status: string;
-  toAddress: string;
+  toAccountId: string;
   amountCents: number;
   balanceAfterCents?: number;
 }
@@ -494,7 +539,7 @@ export type PolicyAction = 'allow' | 'deny' | 'quarantine';
 export type AuthorityLevel = 'system' | 'agent' | 'external';
 
 // Spend categories
-export type SpendCategory = 'transfer' | 'x402' | 'inference' | 'other';
+export type SpendCategory = 'transfer' | 'pix' | 'inference' | 'other';
 
 export type ToolSelector =
   | { by: 'name'; names: string[] }
@@ -572,8 +617,8 @@ export interface TreasuryPolicy {
   maxHourlyTransferCents: number;
   maxDailyTransferCents: number;
   minimumReserveCents: number;
-  maxX402PaymentCents: number;
-  x402AllowedDomains: string[];
+  /** Maximum single Pix deposit accepted from the dashboard (centavos). */
+  maxSingleDepositCents: number;
   transferCooldownMs: number;
   maxTransfersPerTurn: number;
   maxInferenceDailyCents: number;
@@ -585,8 +630,7 @@ export const DEFAULT_TREASURY_POLICY: TreasuryPolicy = {
   maxHourlyTransferCents: 10000,
   maxDailyTransferCents: 25000,
   minimumReserveCents: 1000,
-  maxX402PaymentCents: 100,
-  x402AllowedDomains: ['conway.tech'],
+  maxSingleDepositCents: 1000000,
   transferCooldownMs: 0,
   maxTransfersPerTurn: 2,
   maxInferenceDailyCents: 50000,
@@ -647,6 +691,16 @@ export interface AutomatonDatabase {
   insertTransaction(txn: Transaction): void;
   getRecentTransactions(limit: number): Transaction[];
 
+  // Financial (BRL, integer centavos)
+  /** Current balance in centavos of BRL for the given account. */
+  getBalanceCents(userId: string): number;
+  /** Credit the balance; returns the new balance. */
+  creditBalance(userId: string, amountCents: number): number;
+  /** Debit the balance; throws when funds are insufficient. */
+  debitBalance(userId: string, amountCents: number): number;
+  /** Financial statement entries (deposits, purchases, usage, transfers). */
+  listFinancialTransactions(userId: string, limit?: number): FinancialTransactionRow[];
+
   // Installed tools
   getInstalledTools(): InstalledTool[];
   installTool(tool: InstalledTool): void;
@@ -679,7 +733,7 @@ export interface AutomatonDatabase {
 
   // Reputation
   insertReputation(entry: ReputationEntry): void;
-  getReputation(agentAddress?: string): ReputationEntry[];
+  getReputation(agentId?: string): ReputationEntry[];
 
   // Inbox
   insertInboxMessage(msg: InboxMessage): void;
@@ -767,14 +821,13 @@ export interface GitLogEntry {
   date: string;
 }
 
-// ─── ERC-8004 Registry ─────────────────────────────────────────
+// ─── Agent Registry ────────────────────────────────────────────
 
 export interface AgentCard {
   type: string;
   name: string;
   description: string;
   services: AgentService[];
-  x402Support: boolean;
   active: boolean;
   parentAgent?: string;
 }
@@ -787,9 +840,9 @@ export interface AgentService {
 export interface RegistryEntry {
   agentId: string;
   agentURI: string;
-  chain: string;
-  contractAddress: string;
-  txHash: string;
+  provider: string;
+  endpoint: string;
+  registrationRef: string | null;
   registeredAt: string;
 }
 
@@ -799,7 +852,7 @@ export interface ReputationEntry {
   toAgent: string;
   score: number;
   comment: string;
-  txHash?: string;
+  feedbackRef?: string | null;
   timestamp: string;
 }
 
@@ -816,7 +869,7 @@ export interface DiscoveredAgent {
 export interface ChildAutomaton {
   id: string;
   name: string;
-  address: string;
+  accountId: string;
   sandboxId: string;
   genesisPrompt: string;
   creatorMessage?: string;
@@ -824,8 +877,6 @@ export interface ChildAutomaton {
   status: ChildStatus;
   createdAt: string;
   lastChecked?: string;
-  /** Chain type of the child's wallet. */
-  chainType?: ChainType;
 }
 
 export type ChildStatus =
@@ -838,7 +889,7 @@ export type ChildStatus =
   | "requested"
   | "sandbox_created"
   | "runtime_ready"
-  | "wallet_verified"
+  | "account_verified"
   | "funded"
   | "starting"
   | "healthy"
@@ -851,10 +902,8 @@ export interface GenesisConfig {
   name: string;
   genesisPrompt: string;
   creatorMessage?: string;
-  creatorAddress: string;
-  parentAddress: string;
-  /** Chain type inherited from parent. */
-  chainType?: ChainType;
+  creatorAccountId: string;
+  parentAccountId: string;
 }
 
 export const MAX_CHILDREN = 3;
@@ -883,7 +932,7 @@ export interface TickContext {
   tickId: string;                    // ULID, unique per tick
   startedAt: Date;
   creditBalance: number;             // fetched once per tick (cents)
-  usdcBalance: number;               // fetched once per tick
+  balanceCents: number;               // fetched once per tick
   survivalTier: SurvivalTier;
   lowComputeMultiplier: number;      // from config
   config: HeartbeatConfig;
@@ -956,7 +1005,7 @@ export interface SoulModel {
   updatedAt: string; // ISO 8601
   // Immutable frontmatter
   name: string;
-  address: string;
+  accountId: string;
   creator: string;
   bornAt: string;
   constitutionHash: string;
@@ -1091,7 +1140,7 @@ export interface ProceduralMemoryEntry {
 
 export interface RelationshipMemoryEntry {
   id: string; // ULID
-  entityAddress: string; // unique
+  entityId: string; // unique
   entityName: string | null;
   relationshipType: string;
   trustScore: number; // 0.0-1.0
@@ -1262,7 +1311,7 @@ export type ChildLifecycleState =
   | "requested"
   | "sandbox_created"
   | "runtime_ready"
-  | "wallet_verified"
+  | "account_verified"
   | "funded"
   | "starting"
   | "healthy"
@@ -1274,8 +1323,8 @@ export type ChildLifecycleState =
 export const VALID_TRANSITIONS: Record<ChildLifecycleState, ChildLifecycleState[]> = {
   requested: ["sandbox_created", "failed"],
   sandbox_created: ["runtime_ready", "failed"],
-  runtime_ready: ["wallet_verified", "failed"],
-  wallet_verified: ["funded", "failed"],
+  runtime_ready: ["account_verified", "failed"],
+  account_verified: ["funded", "failed"],
   funded: ["starting", "failed"],
   starting: ["healthy", "failed"],
   healthy: ["unhealthy", "stopped"],
@@ -1382,19 +1431,8 @@ export const DEFAULT_DISCOVERY_CONFIG: DiscoveryConfig = {
   fetchTimeoutMs: 10_000,
 };
 
-export interface OnchainTransactionRow {
-  id: string; // ULID
-  txHash: string;
-  chain: string;
-  operation: string;
-  status: "pending" | "confirmed" | "failed";
-  gasUsed: number | null;
-  metadata: string; // JSON
-  createdAt: string;
-}
-
 export interface DiscoveredAgentCacheRow {
-  agentAddress: string; // PRIMARY KEY
+  agentId: string; // PRIMARY KEY
   agentCard: string; // JSON AgentCard
   fetchedFrom: string; // URI
   cardHash: string;

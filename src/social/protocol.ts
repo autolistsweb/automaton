@@ -2,18 +2,15 @@
  * Unified Signed Message Protocol
  *
  * Defines the signed message interface and utilities for message creation
- * and verification using ECDSA secp256k1.
+ * and verification using the account's Ed25519 key.
  *
  * Phase 3.2: Social & Registry Hardening
  */
 
 import crypto from "crypto";
 import { ulid } from "ulid";
-import {
-  keccak256,
-  toBytes,
-  verifyMessage,
-} from "viem";
+import { verifyAccountSignature } from "../identity/account.js";
+import { canonicalSendPayload } from "./signing.js";
 
 /**
  * A fully signed social message.
@@ -43,26 +40,21 @@ export function createNonce(): string {
 }
 
 /**
- * Verify an ECDSA secp256k1 message signature.
+ * Verify the Ed25519 signature of a social message.
  *
- * Reconstructs the canonical string used during signing and verifies
- * the signature against the expected sender address.
+ * The verifier needs the sender's published public key: it comes from the
+ * relay envelope or from the sender's agent card / registry entry.
  */
 export async function verifyMessageSignature(
   message: { to: string; content: string; signed_at: string; signature: string },
   expectedFrom: string,
+  senderPublicKey?: string,
 ): Promise<boolean> {
+  if (!senderPublicKey) return false;
+  if (!expectedFrom) return false;
   try {
-    const contentHash = keccak256(toBytes(message.content));
-    const canonical = `Conway:send:${message.to.toLowerCase()}:${contentHash}:${message.signed_at}`;
-
-    const valid = await verifyMessage({
-      address: expectedFrom as `0x${string}`,
-      message: canonical,
-      signature: message.signature as `0x${string}`,
-    });
-
-    return valid;
+    const canonical = canonicalSendPayload(message.to, message.content, message.signed_at);
+    return verifyAccountSignature(senderPublicKey, canonical, message.signature);
   } catch {
     return false;
   }

@@ -288,7 +288,7 @@ export function formatMemoryBlock(memories: MemoryRetrievalResult): string {
   if (memories.relationships.length > 0) {
     sections.push("### Known Entities");
     for (const e of memories.relationships) {
-      sections.push(`- ${e.entityName || e.entityAddress}: ${e.relationshipType} (trust: ${e.trustScore.toFixed(1)})`);
+      sections.push(`- ${e.entityName || e.entityId}: ${e.relationshipType} (trust: ${e.trustScore.toFixed(1)})`);
     }
   }
 

@@ -68,7 +68,7 @@ function createRawTestDb(): Database.Database {
       amount_cents INTEGER NOT NULL,
       recipient TEXT,
       domain TEXT,
-      category TEXT NOT NULL CHECK(category IN ('transfer','x402','inference','other')),
+      category TEXT NOT NULL CHECK(category IN ('transfer','pix','inference','other')),
       window_hour TEXT NOT NULL,
       window_day TEXT NOT NULL,
       created_at TEXT NOT NULL DEFAULT (datetime('now'))
@@ -215,12 +215,12 @@ describe("Authority Rules", () => {
       expect(decision.reasonCode).toBe("EXTERNAL_DANGEROUS_TOOL");
     });
 
-    it("allows register_erc8004 from external input", () => {
+    it("allows register_agent from external input", () => {
       const rules = createAuthorityRules();
       const engine = new PolicyEngine(db, rules);
 
       const tool = createMockTool({
-        name: "register_erc8004",
+        name: "register_agent",
         riskLevel: "dangerous",
         category: "registry",
       });
@@ -230,12 +230,12 @@ describe("Authority Rules", () => {
       expect(decision.action).toBe("allow");
     });
 
-    it("allows register_erc8004 from heartbeat input", () => {
+    it("allows register_agent from heartbeat input", () => {
       const rules = createAuthorityRules();
       const engine = new PolicyEngine(db, rules);
 
       const tool = createMockTool({
-        name: "register_erc8004",
+        name: "register_agent",
         riskLevel: "dangerous",
         category: "registry",
       });
@@ -677,8 +677,7 @@ describe("Treasury Config", () => {
     expect(DEFAULT_TREASURY_POLICY.maxHourlyTransferCents).toBe(10000);
     expect(DEFAULT_TREASURY_POLICY.maxDailyTransferCents).toBe(25000);
     expect(DEFAULT_TREASURY_POLICY.minimumReserveCents).toBe(1000);
-    expect(DEFAULT_TREASURY_POLICY.maxX402PaymentCents).toBe(100);
-    expect(DEFAULT_TREASURY_POLICY.x402AllowedDomains).toEqual(["conway.tech"]);
+    expect(DEFAULT_TREASURY_POLICY.maxSingleDepositCents).toBe(1000000);
     expect(DEFAULT_TREASURY_POLICY.transferCooldownMs).toBe(0);
     expect(DEFAULT_TREASURY_POLICY.maxTransfersPerTurn).toBe(2);
     expect(DEFAULT_TREASURY_POLICY.maxInferenceDailyCents).toBe(50000);
@@ -686,8 +685,7 @@ describe("Treasury Config", () => {
   });
 
   it("all default values are positive", () => {
-    for (const [key, value] of Object.entries(DEFAULT_TREASURY_POLICY)) {
-      if (key === "x402AllowedDomains") continue;
+    for (const value of Object.values(DEFAULT_TREASURY_POLICY)) {
       expect(typeof value).toBe("number");
       expect(value).toBeGreaterThanOrEqual(0);
     }

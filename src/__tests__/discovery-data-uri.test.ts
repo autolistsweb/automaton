@@ -8,15 +8,6 @@
 
 import { describe, it, expect, vi } from "vitest";
 
-// Mock erc8004.js to avoid ABI parse error at import time
-vi.mock("../registry/erc8004.js", () => ({
-  queryAgent: vi.fn(),
-  getTotalAgents: vi.fn().mockResolvedValue(0),
-  registerAgent: vi.fn(),
-  leaveFeedback: vi.fn(),
-  getRegisteredAgentsByEvents: vi.fn().mockResolvedValue([]),
-}));
-
 // Mock injection-defense.js to avoid import chain issues
 vi.mock("../agent/injection-defense.js", () => ({
   sanitizeToolResult: vi.fn((s: string) => s),

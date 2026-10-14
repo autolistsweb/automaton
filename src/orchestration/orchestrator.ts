@@ -102,7 +102,7 @@ export class Orchestrator {
     identity: AutomatonIdentity;
     config: any;
     /** Check if a worker agent is still alive. Used to recover stale tasks. */
-    isWorkerAlive?: (address: string) => boolean;
+    isWorkerAlive?: (agentId: string) => boolean;
   }) {}
 
   async tick(): Promise<OrchestratorTickResult> {
@@ -199,7 +199,7 @@ export class Orchestrator {
     const directRoleMatch = idleAgents.find((agent) => agent.role === requestedRole);
     if (directRoleMatch) {
       return {
-        agentAddress: directRoleMatch.address,
+        agentId: directRoleMatch.address,
         agentName: directRoleMatch.name,
         spawned: false,
       };
@@ -208,7 +208,7 @@ export class Orchestrator {
     const bestIdle = this.params.agentTracker.getBestForTask(requestedRole);
     if (bestIdle) {
       return {
-        agentAddress: bestIdle.address,
+        agentId: bestIdle.address,
         agentName: bestIdle.name,
         spawned: false,
       };
@@ -222,7 +222,7 @@ export class Orchestrator {
     const reassigned = this.findBusyAgentForReassign();
     if (reassigned) {
       return {
-        agentAddress: reassigned.address,
+        agentId: reassigned.address,
         agentName: reassigned.name,
         spawned: false,
       };
@@ -231,13 +231,13 @@ export class Orchestrator {
     // Fallback: assign to the parent agent itself (self-execution mode).
     // This handles local dev environments where spawning child sandboxes
     // is not available, and ensures goals still make progress.
-    if (this.params.identity?.address) {
+    if (this.params.identity?.accountId) {
       logger.warn("No child agents available, self-assigning task to parent", {
         taskId: task.id,
         role: requestedRole,
       });
       return {
-        agentAddress: this.params.identity.address,
+        agentId: this.params.identity.accountId,
         agentName: this.params.identity.name ?? "parent",
         spawned: false,
       };
@@ -246,7 +246,7 @@ export class Orchestrator {
     throw new Error(`No available agent for task ${task.id}`);
   }
 
-  async fundAgentForTask(addr: string, task: TaskNode): Promise<void> {
+  async fundAgentForTask(agentId: string, task: TaskNode): Promise<void> {
     const estimated = Math.max(0, task.metadata.estimatedCostCents);
     const configuredDefault = Number(this.params.config?.defaultTaskFundingCents ?? DEFAULT_TASK_FUNDING_CENTS);
     const amountCents = Math.max(estimated, Number.isFinite(configuredDefault) ? configuredDefault : 0);
@@ -255,9 +255,9 @@ export class Orchestrator {
       return;
     }
 
-    const result = await this.params.funding.fundChild(addr, amountCents);
+    const result = await this.params.funding.fundChild(agentId, amountCents);
     if (!result.success) {
-      throw new Error(`Funding transfer failed for ${addr}`);
+      throw new Error(`Funding transfer failed for ${agentId}`);
     }
   }
 
@@ -404,8 +404,8 @@ export class Orchestrator {
           db: this.params.db,
           workspace: new AgentWorkspace(goal.id),
           funding: this.params.funding,
-          identityAddress: this.params.identity.address,
-          usdcBalance: Number(this.params.config?.usdcBalance ?? 0),
+          identityId: this.params.identity.accountId,
+          balanceCents: Number(this.params.config?.balanceCents ?? 0),
           idleAgents: this.params.agentTracker.getIdle().length,
           busyAgents: Math.max(0, this.getActiveAgentCount() - this.params.agentTracker.getIdle().length),
           maxAgents: Number(this.params.config?.maxChildren ?? 3),
@@ -553,20 +553,20 @@ export class Orchestrator {
     for (const task of ready) {
       try {
         const assignment = await this.matchTaskToAgent(task);
-        assignTask(this.params.db, task.id, assignment.agentAddress);
+        assignTask(this.params.db, task.id, assignment.agentId);
 
-        const isLocalWorker = assignment.agentAddress.startsWith("local://");
-        const isSelfAssigned = assignment.agentAddress === this.params.identity?.address;
+        const isLocalWorker = assignment.agentId.startsWith("local://");
+        const isSelfAssigned = assignment.agentId === this.params.identity?.accountId;
 
         // Local workers receive their task directly at spawn time and run
         // their own inference loop. Self-assigned tasks are handled by the
         // parent agent via its normal turn. Neither needs funding or messaging.
         if (!isLocalWorker && !isSelfAssigned) {
-          await this.fundAgentForTask(assignment.agentAddress, task);
+          await this.fundAgentForTask(assignment.agentId, task);
 
           const message = this.params.messaging.createMessage({
             type: "task_assignment",
-            to: assignment.agentAddress,
+            to: assignment.agentId,
             goalId: task.goalId,
             taskId: task.id,
             priority: "high",
@@ -584,7 +584,7 @@ export class Orchestrator {
           await this.params.messaging.send(message);
         }
 
-        this.params.agentTracker.updateStatus(assignment.agentAddress, "running");
+        this.params.agentTracker.updateStatus(assignment.agentId, "running");
         counters.tasksAssigned += 1;
       } catch (error) {
         const err = normalizeError(error);
@@ -705,8 +705,8 @@ export class Orchestrator {
           db: this.params.db,
           workspace: new AgentWorkspace(goal.id),
           funding: this.params.funding,
-          identityAddress: this.params.identity.address,
-          usdcBalance: Number(this.params.config?.usdcBalance ?? 0),
+          identityId: this.params.identity.accountId,
+          balanceCents: Number(this.params.config?.balanceCents ?? 0),
           idleAgents: this.params.agentTracker.getIdle().length,
           busyAgents: Math.max(0, this.getActiveAgentCount() - this.params.agentTracker.getIdle().length),
           maxAgents: Number(this.params.config?.maxChildren ?? 3),
@@ -849,19 +849,19 @@ export class Orchestrator {
     const idleAddresses = new Set(this.params.agentTracker.getIdle().map((agent) => agent.address));
 
     const rows = this.params.db.prepare(
-      `SELECT name, address, status
+      `SELECT name, account_id, status
        FROM children
        WHERE status IN ('running', 'healthy')
        ORDER BY created_at ASC`,
-    ).all() as { name: string; address: string; status: string }[];
+    ).all() as { name: string; account_id: string; status: string }[];
 
-    const candidate = rows.find((row) => !idleAddresses.has(row.address));
+    const candidate = rows.find((row) => !idleAddresses.has(row.account_id));
     if (!candidate) {
       return null;
     }
 
     return {
-      address: candidate.address,
+      address: candidate.account_id,
       name: candidate.name,
     };
   }
@@ -891,7 +891,7 @@ export class Orchestrator {
     this.params.agentTracker.updateStatus(spawned.address, "running");
 
     return {
-      agentAddress: spawned.address,
+      agentId: spawned.address,
       agentName: spawned.name,
       spawned: true,
     };
@@ -899,16 +899,16 @@ export class Orchestrator {
 
   private async recallAgentCredits(): Promise<void> {
     const children = this.params.db.prepare(
-      `SELECT address FROM children WHERE status IN ('running', 'healthy')`,
-    ).all() as { address: string }[];
+      `SELECT account_id FROM children WHERE status IN ('running', 'healthy')`,
+    ).all() as { account_id: string }[];
 
     for (const child of children) {
       try {
-        await this.params.funding.recallCredits(child.address);
+        await this.params.funding.recallCredits(child.account_id);
       } catch (error) {
         const err = normalizeError(error);
         logger.warn("Failed to recall credits", {
-          address: child.address,
+          accountId: child.account_id,
           error: err.message,
         });
       }

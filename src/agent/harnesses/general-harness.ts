@@ -18,7 +18,7 @@ const GENERAL_WRAPPED_TOOL_ALLOWLIST = new Set([
   "expose_port",
   "remove_port",
   "check_credits",
-  "check_usdc_balance",
+  "check_balance",
   "transfer_credits",
   "send_message",
   "list_models",
@@ -42,10 +42,10 @@ const GENERAL_WRAPPED_TOOL_ALLOWLIST = new Set([
   "note_about_agent",
   "review_memory",
   "forget",
-  "x402_fetch",
+  "web_fetch",
 ]);
 const GENERAL_SPEC_ALIAS_TARGETS = {
-  web_fetch: "x402_fetch",
+  web_fetch: "web_fetch",
 } as const;
 const NOOP_SPEND_TRACKER: SpendTrackerInterface = {
   recordSpend: () => {},
@@ -84,7 +84,7 @@ is to complete this task efficiently and report your results.
 6. Be efficient. Minimize unnecessary tool calls. Every tool call costs money.
 7. You have a limited turn budget. Do not waste turns on status checks.
 8. NEVER check your own balance or credits. That is not your job.
-9. NEVER call check_credits, check_usdc_balance, or system_synopsis unless
+9. NEVER call check_credits, check_balance, or system_synopsis unless
 the task specifically requires financial information.
 
 ## Anti-Loop Rules
@@ -321,7 +321,7 @@ When calling task_done, provide:
           return `Error: ${result.error}`;
         }
 
-        return tool.name === "x402_fetch"
+        return tool.name === "web_fetch"
           ? sanitizeToolResult(result.result)
           : result.result;
       },

@@ -61,14 +61,14 @@ function makeMockRequest(
 
 describe("isProtectedFile", () => {
   it("matches exact protected file names", () => {
-    expect(isProtectedFile("wallet.json")).toBe(true);
+    expect(isProtectedFile("account.json")).toBe(true);
     expect(isProtectedFile("config.json")).toBe(true);
     expect(isProtectedFile("state.db")).toBe(true);
     expect(isProtectedFile("constitution.md")).toBe(true);
   });
 
   it("matches protected files with path prefix", () => {
-    expect(isProtectedFile("/home/user/.automaton/wallet.json")).toBe(true);
+    expect(isProtectedFile("/home/user/.automaton/account.json")).toBe(true);
     expect(isProtectedFile("/some/path/self-mod/code.ts")).toBe(true);
     expect(isProtectedFile("/some/path/agent/tools.ts")).toBe(true);
   });
@@ -98,8 +98,8 @@ describe("isProtectedFile", () => {
     expect(isProtectedFile("/some/path/barcode.ts")).toBe(false);
     // "config.json" should not match "my-config.json"
     expect(isProtectedFile("/some/path/my-config.json")).toBe(false);
-    // "wallet.json" should not match "test-wallet.json"
-    expect(isProtectedFile("/some/path/test-wallet.json")).toBe(false);
+    // "account.json" should not match "test-account.json"
+    expect(isProtectedFile("/some/path/test-account.json")).toBe(false);
   });
 
   it("allows normal unprotected files", () => {
@@ -111,8 +111,13 @@ describe("isProtectedFile", () => {
   it("blocks paths in blocked directories", () => {
     expect(isProtectedFile("/home/user/.ssh/id_rsa")).toBe(true);
     expect(isProtectedFile("/home/user/.gnupg/keys")).toBe(true);
-    expect(isProtectedFile("/etc/systemd/system/something.service")).toBe(true);
-    expect(isProtectedFile("/proc/self/environ")).toBe(true);
+    // Absolute directory patterns only match on POSIX: on win32
+    // path.resolve anchors them under the current drive, so the
+    // prefix comparison against "/etc/..." can never succeed.
+    if (path.sep === "/") {
+      expect(isProtectedFile("/etc/systemd/system/something.service")).toBe(true);
+      expect(isProtectedFile("/proc/self/environ")).toBe(true);
+    }
   });
 });
 
@@ -126,8 +131,8 @@ describe("path protection policy rules", () => {
   const traversalRule = rules.find((r) => r.id === "path.traversal_detection")!;
 
   describe("path.protected_files", () => {
-    it("denies write to wallet.json", () => {
-      const request = makeMockRequest("write_file", { path: "wallet.json" });
+    it("denies write to account.json", () => {
+      const request = makeMockRequest("write_file", { path: "account.json" });
       const result = protectedFilesRule.evaluate(request);
       expect(result).not.toBeNull();
       expect(result!.action).toBe("deny");
@@ -159,8 +164,8 @@ describe("path protection policy rules", () => {
   });
 
   describe("path.read_sensitive", () => {
-    it("denies read of wallet.json", () => {
-      const request = makeMockRequest("read_file", { path: "wallet.json" });
+    it("denies read of account.json", () => {
+      const request = makeMockRequest("read_file", { path: "account.json" });
       request.tool = makeMockTool("read_file");
       const result = readSensitiveRule.evaluate(request);
       expect(result).not.toBeNull();

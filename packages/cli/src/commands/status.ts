@@ -39,8 +39,8 @@ const divider = chalk.dim("─".repeat(52));
 const label = (s: string) => chalk.dim(s.padEnd(12));
 
 console.log("\n" + accent.bold(`  ◈ ${config.name}`) + "\n" + divider);
-console.log(label("Address")  + chalk.white(config.walletAddress));
-console.log(label("Creator")  + chalk.white(config.creatorAddress));
+console.log(label("Address")  + chalk.white(config.accountId));
+console.log(label("Creator")  + chalk.white(config.creatorAccountId));
 console.log(label("Sandbox")  + chalk.white(config.sandboxId));
 console.log(label("State")    + stateColor(state));
 console.log(label("Turns")    + chalk.yellow(String(turnCount)));

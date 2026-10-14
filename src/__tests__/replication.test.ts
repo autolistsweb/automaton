@@ -1,15 +1,16 @@
 /**
  * Tests for Sub-phase 0.6: Replication Safety
  *
- * Validates wallet address checking, spawn cleanup on failure,
- * and prevention of funding to zero-address wallets.
+ * Validates child account id checking, spawn cleanup on failure,
+ * and prevention of spawning with invalid account ids.
  *
  * Updated for Phase 3.1: spawnChild now uses ConwayClient interface
  * directly instead of raw fetch-based execInSandbox/writeInSandbox.
  */
 
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
-import { isValidWalletAddress, spawnChild } from "../replication/spawn.js";
+import { spawnChild } from "../replication/spawn.js";
+import { isValidAccountId } from "../identity/account.js";
 import { SandboxCleanup } from "../replication/cleanup.js";
 import { ChildLifecycle } from "../replication/lifecycle.js";
 import { pruneDeadChildren } from "../replication/lineage.js";
@@ -20,6 +21,7 @@ import {
 } from "./mocks.js";
 import type { AutomatonDatabase, GenesisConfig } from "../types.js";
 import { MIGRATION_V7 } from "../state/schema.js";
+import { lifecycleInsertEvent } from "../state/database.js";
 
 // Mock fs for constitution propagation
 vi.mock("fs", async (importOriginal) => {
@@ -40,47 +42,47 @@ vi.mock("fs", async (importOriginal) => {
   };
 });
 
-// ─── isValidWalletAddress ─────────────────────────────────────
+// ─── isValidAccountId ───────────────────────────────────────
 
-describe("isValidWalletAddress", () => {
-  it("accepts a valid 40-hex-char address with 0x prefix", () => {
-    expect(isValidWalletAddress("0xabcdef1234567890abcdef1234567890abcdef12")).toBe(true);
+describe("isValidAccountId", () => {
+  it("accepts a 32-hex-char account id", () => {
+    expect(isValidAccountId("acct_abcdef1234567890abcdef1234567890")).toBe(true);
   });
 
-  it("accepts uppercase hex characters", () => {
-    expect(isValidWalletAddress("0xABCDEF1234567890ABCDEF1234567890ABCDEF12")).toBe(true);
+  it("accepts the minimum 16-hex-char account id", () => {
+    expect(isValidAccountId("acct_abcdef1234567890")).toBe(true);
   });
 
-  it("accepts mixed-case hex characters", () => {
-    expect(isValidWalletAddress("0xAbCdEf1234567890aBcDeF1234567890AbCdEf12")).toBe(true);
+  it("accepts the maximum 64-hex-char account id", () => {
+    expect(isValidAccountId("acct_" + "ab".repeat(32))).toBe(true);
   });
 
-  it("rejects the zero address", () => {
-    expect(isValidWalletAddress("0x" + "0".repeat(40))).toBe(false);
+  it("rejects uppercase hex characters", () => {
+    expect(isValidAccountId("acct_ABCDEF1234567890")).toBe(false);
   });
 
-  it("rejects addresses without 0x prefix", () => {
-    expect(isValidWalletAddress("abcdef1234567890abcdef1234567890abcdef12")).toBe(false);
+  it("rejects account ids without the acct_ prefix", () => {
+    expect(isValidAccountId("abcdef1234567890abcdef1234567890")).toBe(false);
   });
 
-  it("rejects addresses that are too short", () => {
-    expect(isValidWalletAddress("0xabcdef")).toBe(false);
+  it("rejects account ids that are too short", () => {
+    expect(isValidAccountId("acct_abcdef")).toBe(false);
   });
 
-  it("rejects addresses that are too long", () => {
-    expect(isValidWalletAddress("0x" + "a".repeat(42))).toBe(false);
+  it("rejects account ids that are too long", () => {
+    expect(isValidAccountId("acct_" + "a".repeat(65))).toBe(false);
   });
 
   it("rejects empty string", () => {
-    expect(isValidWalletAddress("")).toBe(false);
+    expect(isValidAccountId("")).toBe(false);
   });
 
   it("rejects non-hex characters", () => {
-    expect(isValidWalletAddress("0xGGGGGG1234567890abcdef1234567890abcdef12")).toBe(false);
+    expect(isValidAccountId("acct_GGGGGG1234567890abcdef1234567890")).toBe(false);
   });
 
-  it("rejects 0x prefix alone", () => {
-    expect(isValidWalletAddress("0x")).toBe(false);
+  it("rejects the bare prefix", () => {
+    expect(isValidAccountId("acct_")).toBe(false);
   });
 });
 
@@ -94,12 +96,12 @@ describe("spawnChild", () => {
     name: "test-child",
     genesisPrompt: "You are a test child automaton.",
     creatorMessage: "Hello child!",
-    creatorAddress: identity.address,
-    parentAddress: identity.address,
+    creatorAccountId: identity.accountId,
+    parentAccountId: identity.accountId,
   };
 
-  const validAddress = "0xdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef";
-  const zeroAddress = "0x" + "0".repeat(40);
+  const validAccountId = "acct_deadbeefdeadbeefdeadbeef";
+  const malformedAccountId = "acct_ZZZZZZZZZZZZZZZZ";
 
   beforeEach(() => {
     conway = new MockConwayClient();
@@ -110,43 +112,43 @@ describe("spawnChild", () => {
     vi.restoreAllMocks();
   });
 
-  it("validates wallet address before creating child record", async () => {
-    // Mock exec to return valid wallet address on init
+  it("stores the account id returned by init on the child record", async () => {
+    // Mock exec to return a valid account id on init
     vi.spyOn(conway, "exec").mockImplementation(async (command: string) => {
       if (command.includes("--init")) {
-        return { stdout: `Wallet initialized: ${validAddress}`, stderr: "", exitCode: 0 };
+        return { stdout: `Account initialized: ${validAccountId}`, stderr: "", exitCode: 0 };
       }
       return { stdout: "ok", stderr: "", exitCode: 0 };
     });
 
     const child = await spawnChild(conway, identity, db, genesis);
 
-    expect(child.address).toBe(validAddress);
+    expect(child.accountId).toBe(validAccountId);
     expect(child.status).toBe("spawning");
   });
 
-  it("throws on zero address from init", async () => {
+  it("throws on malformed account id from init", async () => {
     vi.spyOn(conway, "exec").mockImplementation(async (command: string) => {
       if (command.includes("--init")) {
-        return { stdout: `Wallet: ${zeroAddress}`, stderr: "", exitCode: 0 };
+        return { stdout: `Account: ${malformedAccountId}`, stderr: "", exitCode: 0 };
       }
       return { stdout: "ok", stderr: "", exitCode: 0 };
     });
 
     await expect(spawnChild(conway, identity, db, genesis))
-      .rejects.toThrow("Child wallet address invalid");
+      .rejects.toThrow("Child account id invalid");
   });
 
-  it("throws when init returns no wallet address", async () => {
+  it("throws when init returns no account id", async () => {
     vi.spyOn(conway, "exec").mockImplementation(async (command: string) => {
       if (command.includes("--init")) {
-        return { stdout: "initialization complete, no wallet", stderr: "", exitCode: 0 };
+        return { stdout: "initialization complete, no account id", stderr: "", exitCode: 0 };
       }
       return { stdout: "ok", stderr: "", exitCode: 0 };
     });
 
     await expect(spawnChild(conway, identity, db, genesis))
-      .rejects.toThrow("Child wallet address invalid");
+      .rejects.toThrow("Child account id invalid");
   });
 
   it("propagates error on exec failure without calling deleteSandbox", async () => {
@@ -162,18 +164,18 @@ describe("spawnChild", () => {
     expect(deleteSpy).not.toHaveBeenCalled();
   });
 
-  it("propagates error on wallet validation failure without calling deleteSandbox", async () => {
+  it("propagates error on account id validation failure without calling deleteSandbox", async () => {
     const deleteSpy = vi.spyOn(conway, "deleteSandbox");
 
     vi.spyOn(conway, "exec").mockImplementation(async (command: string) => {
       if (command.includes("--init")) {
-        return { stdout: `Wallet: ${zeroAddress}`, stderr: "", exitCode: 0 };
+        return { stdout: `Account: ${malformedAccountId}`, stderr: "", exitCode: 0 };
       }
       return { stdout: "ok", stderr: "", exitCode: 0 };
     });
 
     await expect(spawnChild(conway, identity, db, genesis))
-      .rejects.toThrow("Child wallet address invalid");
+      .rejects.toThrow("Child account id invalid");
 
     // Sandbox deletion is disabled — should not attempt cleanup
     expect(deleteSpy).not.toHaveBeenCalled();
@@ -220,12 +222,32 @@ describe("SandboxCleanup", () => {
     vi.restoreAllMocks();
   });
 
+  // Seeds a child without ChildLifecycle.initChild, which still writes the
+  // legacy `address`/`chain_type` columns (see lifecycle.ts report).
+  function seedChild(childId: string, sandboxId: string): void {
+    db.raw
+      .prepare(
+        `INSERT INTO children (id, name, account_id, sandbox_id, genesis_prompt, status, created_at)
+         VALUES (?, ?, ?, ?, ?, 'requested', datetime('now'))`,
+      )
+      .run(childId, "test-child", "acct_1234567890abcdef1234", sandboxId, "test prompt");
+    lifecycleInsertEvent(db.raw, {
+      id: `evt-${childId}`,
+      childId,
+      fromState: "none",
+      toState: "requested",
+      reason: "child created",
+      metadata: "{}",
+      createdAt: new Date().toISOString(),
+    });
+  }
+
   it("transitions to cleaned_up even though sandbox deletion is disabled", async () => {
     // Create a child and transition to stopped
-    lifecycle.initChild("child-1", "test-child", "sandbox-1", "test prompt");
+    seedChild("child-1", "sandbox-1");
     lifecycle.transition("child-1", "sandbox_created", "created");
     lifecycle.transition("child-1", "runtime_ready", "ready");
-    lifecycle.transition("child-1", "wallet_verified", "verified");
+    lifecycle.transition("child-1", "account_verified", "verified");
     lifecycle.transition("child-1", "funded", "funded");
     lifecycle.transition("child-1", "starting", "starting");
     lifecycle.transition("child-1", "healthy", "healthy");
@@ -240,10 +262,10 @@ describe("SandboxCleanup", () => {
   });
 
   it("transitions to cleaned_up when sandbox deletion succeeds", async () => {
-    lifecycle.initChild("child-2", "test-child", "sandbox-2", "test prompt");
+    seedChild("child-2", "sandbox-2");
     lifecycle.transition("child-2", "sandbox_created", "created");
     lifecycle.transition("child-2", "runtime_ready", "ready");
-    lifecycle.transition("child-2", "wallet_verified", "verified");
+    lifecycle.transition("child-2", "account_verified", "verified");
     lifecycle.transition("child-2", "funded", "funded");
     lifecycle.transition("child-2", "starting", "starting");
     lifecycle.transition("child-2", "healthy", "healthy");
@@ -275,8 +297,8 @@ describe("pruneDeadChildren", () => {
 
   function insertChild(id: string, name: string, status: string, createdAt: string): void {
     db.raw.prepare(
-      `INSERT INTO children (id, name, address, sandbox_id, genesis_prompt, status, created_at)
-       VALUES (?, ?, '0xabc', 'sandbox-${id}', 'prompt', ?, ?)`,
+      `INSERT INTO children (id, name, account_id, sandbox_id, genesis_prompt, status, created_at)
+       VALUES (?, ?, 'acct_1234567890abcdef1234', 'sandbox-${id}', 'prompt', ?, ?)`,
     ).run(id, name, status, createdAt);
   }
 

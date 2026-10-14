@@ -89,13 +89,12 @@ export class DurableScheduler {
       // Clear any expired leases first
       clearExpiredLeases(this.db);
 
-      // Build shared context (single API call for balance)
+      // Build shared context (balances resolved once per tick)
       const context = await buildTickContext(
         this.db,
         this.legacyContext.conway,
         this.config,
-        this.legacyContext.identity.address,
-        this.legacyContext.identity.chainType,
+        this.legacyContext.identity.accountId,
       );
 
       // Get tasks that are due

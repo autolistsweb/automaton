@@ -1,12 +1,13 @@
 /**
  * Agent Discovery
  *
- * Discover other agents via ERC-8004 registry queries.
- * Fetch and parse agent cards from URIs.
+ * Discover other agents via the Conway registry API and the local
+ * agent-card cache. Fetch and parse agent cards from URIs.
  *
  * Phase 3.2: Added caching, configurable IPFS gateway, stricter validation.
  */
 
+import crypto from "crypto";
 import type {
   DiscoveredAgent,
   AgentCard,
@@ -14,8 +15,8 @@ import type {
   DiscoveredAgentCacheRow,
 } from "../types.js";
 import { DEFAULT_DISCOVERY_CONFIG } from "../types.js";
-import { queryAgent, getTotalAgents, getRegisteredAgentsByEvents } from "./erc8004.js";
-import { keccak256, toBytes } from "viem";
+import { loadApiKeyFromConfig } from "../identity/provision.js";
+import { ResilientHttpClient } from "../conway/http-client.js";
 import { createLogger } from "../observability/logger.js";
 const logger = createLogger("registry.discovery");
 
@@ -91,6 +92,9 @@ export function validateAgentCard(data: unknown): AgentCard | null {
   // address is optional but must be string if present
   if (card.address !== undefined && typeof card.address !== 'string') return null;
 
+  // account id is optional but must be string if present
+  if (card.accountId !== undefined && typeof card.accountId !== 'string') return null;
+
   // description is optional but must be string if present with length check
   if (card.description !== undefined) {
     if (typeof card.description !== 'string') return null;
@@ -124,13 +128,13 @@ export function validateAgentCard(data: unknown): AgentCard | null {
  */
 function getCachedCard(
   db: import("better-sqlite3").Database | undefined,
-  agentAddress: string,
+  agentId: string,
 ): AgentCard | null {
   if (!db) return null;
   try {
     const row = db.prepare(
-      "SELECT agent_card, valid_until FROM discovered_agents_cache WHERE agent_address = ?",
-    ).get(agentAddress) as { agent_card: string; valid_until: string | null } | undefined;
+      "SELECT agent_card, valid_until FROM discovered_agents_cache WHERE agent_id = ?",
+    ).get(agentId) as { agent_card: string; valid_until: string | null } | undefined;
     if (!row) return null;
 
     // Check if cache is still valid
@@ -149,7 +153,7 @@ function getCachedCard(
  */
 function setCachedCard(
   db: import("better-sqlite3").Database | undefined,
-  agentAddress: string,
+  agentId: string,
   card: AgentCard,
   fetchedFrom: string,
   ttlMs: number = 3_600_000, // 1 hour default
@@ -159,20 +163,20 @@ function setCachedCard(
     const now = new Date().toISOString();
     const validUntil = new Date(Date.now() + ttlMs).toISOString();
     const cardJson = JSON.stringify(card);
-    const cardHash = keccak256(toBytes(cardJson));
+    const cardHash = crypto.createHash("sha256").update(cardJson).digest("hex");
 
     db.prepare(
       `INSERT INTO discovered_agents_cache
-       (agent_address, agent_card, fetched_from, card_hash, valid_until, fetch_count, last_fetched_at, created_at)
+       (agent_id, agent_card, fetched_from, card_hash, valid_until, fetch_count, last_fetched_at, created_at)
        VALUES (?, ?, ?, ?, ?, 1, ?, ?)
-       ON CONFLICT(agent_address) DO UPDATE SET
+       ON CONFLICT(agent_id) DO UPDATE SET
          agent_card = excluded.agent_card,
          fetched_from = excluded.fetched_from,
          card_hash = excluded.card_hash,
          valid_until = excluded.valid_until,
          fetch_count = fetch_count + 1,
          last_fetched_at = excluded.last_fetched_at`,
-    ).run(agentAddress, cardJson, fetchedFrom, cardHash, validUntil, now, now);
+    ).run(agentId, cardJson, fetchedFrom, cardHash, validUntil, now, now);
   } catch (error) {
     logger.error("Cache write failed:", error instanceof Error ? error : undefined);
   }
@@ -190,7 +194,7 @@ async function enrichAgentWithCard(
   db?: import("better-sqlite3").Database,
 ): Promise<void> {
   try {
-    const cacheKey = agent.owner || agent.agentId;
+    const cacheKey = agent.agentId;
     let card = getCachedCard(db, cacheKey);
     if (!card) {
       card = await fetchAgentCard(agent.agentURI, cfg);
@@ -207,10 +211,130 @@ async function enrichAgentWithCard(
   }
 }
 
+// ─── Conway Registry ────────────────────────────────────────────
+
+function readString(value: unknown): string | undefined {
+  return typeof value === "string" && value.length > 0 ? value : undefined;
+}
+
+function parseCardJson(cardJson: string): AgentCard | null {
+  try {
+    return validateAgentCard(JSON.parse(cardJson));
+  } catch {
+    return null;
+  }
+}
+
 /**
- * Discover agents by scanning the registry.
+ * List registered agents from the Conway registry API (best-effort).
+ * Returns an empty list when the API is unreachable or unauthenticated.
+ */
+async function queryConwayRegistry(
+  limit: number,
+  cfg: DiscoveryConfig,
+): Promise<DiscoveredAgent[]> {
+  const apiUrl = process.env.CONWAY_API_URL || "https://api.conway.tech";
+  const apiKey = loadApiKeyFromConfig();
+  const httpClient = new ResilientHttpClient();
+
+  const query = new URLSearchParams({ limit: String(Math.min(limit, cfg.maxScanCount)) });
+  let response: Response;
+  try {
+    response = await httpClient.request(`${apiUrl}/v1/automatons?${query}`, {
+      method: "GET",
+      headers: apiKey ? { Authorization: apiKey } : undefined,
+      retries: 0,
+      timeout: cfg.fetchTimeoutMs,
+    });
+  } catch (error) {
+    logger.error("Registry query failed:", error instanceof Error ? error : undefined);
+    return [];
+  }
+
+  if (!response.ok) {
+    logger.warn(`Registry listing returned ${response.status}`);
+    return [];
+  }
+
+  try {
+    const data = (await response.json()) as unknown;
+    const rows = Array.isArray(data)
+      ? data
+      : ((data as Record<string, unknown> | null)?.automatons ??
+        (data as Record<string, unknown> | null)?.agents ??
+        []);
+
+    const agents: DiscoveredAgent[] = [];
+    for (const row of Array.isArray(rows) ? rows : []) {
+      if (!row || typeof row !== "object") continue;
+      const record = row as Record<string, unknown>;
+      const agentId =
+        readString(record.agent_id) ?? readString(record.automaton_id) ?? readString(record.id);
+      const agentURI =
+        readString(record.agent_uri) ?? readString(record.agentURI) ?? readString(record.uri);
+      if (!agentId || !agentURI) continue;
+      agents.push({
+        agentId,
+        owner: readString(record.creator_account_id) ?? readString(record.owner) ?? "",
+        agentURI,
+        name: readString(record.name),
+        description: readString(record.bio) ?? readString(record.description),
+      });
+    }
+    return agents;
+  } catch (error) {
+    logger.error("Registry parse failed:", error instanceof Error ? error : undefined);
+    return [];
+  }
+}
+
+/**
+ * Read valid rows from the local agent-card cache.
+ */
+function readCachedAgents(
+  db: import("better-sqlite3").Database,
+  limit: number,
+): DiscoveredAgent[] {
+  try {
+    const rows = db
+      .prepare(
+        `SELECT agent_id AS agentId, agent_card AS agentCard, fetched_from AS fetchedFrom
+         FROM discovered_agents_cache
+         WHERE valid_until IS NULL OR valid_until >= datetime('now')
+         ORDER BY last_fetched_at DESC
+         LIMIT ?`,
+      )
+      .all(limit) as Pick<
+      DiscoveredAgentCacheRow,
+      "agentId" | "agentCard" | "fetchedFrom"
+    >[];
+
+    const agents: DiscoveredAgent[] = [];
+    for (const row of rows) {
+      const card = parseCardJson(row.agentCard);
+      const owner =
+        readString((card as unknown as Record<string, unknown> | null)?.owner) ??
+        row.fetchedFrom;
+      agents.push({
+        agentId: row.agentId,
+        owner,
+        agentURI: row.fetchedFrom,
+        name: card?.name,
+        description: card?.description,
+      });
+    }
+    return agents;
+  } catch (error) {
+    logger.error("Cache read failed:", error instanceof Error ? error : undefined);
+    return [];
+  }
+}
+
+/**
+ * Discover agents from the Conway registry API and the local cache.
  * Returns a list of discovered agents with their metadata.
  *
+ * `network` and `rpcUrl` are accepted for backward compatibility and ignored.
  * Phase 3.2: Uses caching and configurable discovery options.
  */
 export async function discoverAgents(
@@ -220,57 +344,33 @@ export async function discoverAgents(
   db?: import("better-sqlite3").Database,
   rpcUrl?: string,
 ): Promise<DiscoveredAgent[]> {
+  void network;
+  void rpcUrl;
   const cfg = { ...DEFAULT_DISCOVERY_CONFIG, ...config };
-  const total = await getTotalAgents(network, rpcUrl);
-  const agents: DiscoveredAgent[] = [];
-
   const overallStart = Date.now();
+  const byId = new Map<string, DiscoveredAgent>();
 
-  if (total > 0) {
-    // totalSupply worked — use sequential iteration (existing path)
-    const scanCount = Math.min(total, limit, cfg.maxScanCount);
-    for (let i = total; i > total - scanCount && i > 0; i--) {
-      if (Date.now() - overallStart > DISCOVERY_TIMEOUT_MS) {
-        logger.warn("Overall discovery timeout reached (60s), returning partial results");
-        break;
-      }
+  for (const agent of await queryConwayRegistry(limit, cfg)) {
+    if (byId.size >= limit) break;
+    if (!byId.has(agent.agentId)) byId.set(agent.agentId, agent);
+  }
 
-      try {
-        const agent = await queryAgent(i.toString(), network, rpcUrl);
-        if (agent) {
-          await enrichAgentWithCard(agent, cfg, db);
-          agents.push(agent);
-        }
-      } catch (error) {
-        logger.error("Agent query failed:", error instanceof Error ? error : undefined);
-      }
+  if (db && byId.size < limit) {
+    for (const agent of readCachedAgents(db, limit - byId.size)) {
+      if (byId.size >= limit) break;
+      if (!byId.has(agent.agentId)) byId.set(agent.agentId, agent);
     }
-  } else {
-    // totalSupply returned 0 (likely reverted) — fall back to Transfer event scanning
-    logger.info("totalSupply returned 0, falling back to Transfer event scanning");
-    const eventAgents = await getRegisteredAgentsByEvents(network, Math.min(limit, cfg.maxScanCount), rpcUrl);
+  }
 
-    for (const { tokenId, owner } of eventAgents) {
-      if (Date.now() - overallStart > DISCOVERY_TIMEOUT_MS) {
-        logger.warn("Overall discovery timeout reached (60s), returning partial results");
-        break;
-      }
+  const agents = [...byId.values()].slice(0, limit);
 
-      try {
-        // Try queryAgent first (gets tokenURI), fall back to event data only
-        const agent = await queryAgent(tokenId, network, rpcUrl);
-        if (agent) {
-          // Use owner from event if queryAgent couldn't get it
-          if (!agent.owner && owner) {
-            agent.owner = owner;
-          }
-          await enrichAgentWithCard(agent, cfg, db);
-          agents.push(agent);
-        }
-      } catch (error) {
-        logger.error(`Agent query failed for token ${tokenId}:`, error instanceof Error ? error : undefined);
-      }
+  for (const agent of agents) {
+    if (agent.name && agent.description) continue;
+    if (Date.now() - overallStart > DISCOVERY_TIMEOUT_MS) {
+      logger.warn("Overall discovery timeout reached (60s), returning partial results");
+      break;
     }
+    await enrichAgentWithCard(agent, cfg, db);
   }
 
   return agents;

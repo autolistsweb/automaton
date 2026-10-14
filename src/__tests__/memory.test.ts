@@ -6,7 +6,7 @@
  * memory tools, turn classification, context formatting.
  */
 
-import { describe, it, expect, beforeEach } from "vitest";
+import { describe, it, expect, beforeEach, afterAll } from "vitest";
 import Database from "better-sqlite3";
 import { MIGRATION_V5 } from "../state/schema.js";
 import { WorkingMemoryManager } from "../memory/working.js";
@@ -36,8 +36,11 @@ import type { MemoryRetrievalResult, ToolCallResult, AgentTurn } from "../types.
 
 // ─── Test Helpers ───────────────────────────────────────────────
 
+const createdDbs: Database.Database[] = [];
+
 function createTestDb(): Database.Database {
   const db = new Database(":memory:");
+  createdDbs.push(db);
   db.pragma("journal_mode = WAL");
   db.pragma("foreign_keys = ON");
   db.exec(`CREATE TABLE IF NOT EXISTS schema_version (
@@ -48,6 +51,16 @@ function createTestDb(): Database.Database {
   db.exec("INSERT INTO schema_version (version) VALUES (5)");
   return db;
 }
+
+afterAll(() => {
+  for (const db of createdDbs) {
+    try {
+      db.close(true);
+    } catch {
+      // already closed
+    }
+  }
+});
 
 function makeToolCallResult(overrides: Partial<ToolCallResult> = {}): ToolCallResult {
   return {
@@ -472,7 +485,7 @@ describe("RelationshipMemoryManager", () => {
 
   it("should record and retrieve a relationship", () => {
     rm.record({
-      entityAddress: "0x1234",
+      entityId: "0x1234",
       entityName: "Alice",
       relationshipType: "peer",
       trustScore: 0.7,
@@ -486,9 +499,9 @@ describe("RelationshipMemoryManager", () => {
     expect(rel!.interactionCount).toBe(0);
   });
 
-  it("should upsert on entityAddress", () => {
-    rm.record({ entityAddress: "0x1234", relationshipType: "unknown", trustScore: 0.5 });
-    rm.record({ entityAddress: "0x1234", entityName: "Updated", relationshipType: "peer", trustScore: 0.8 });
+  it("should upsert on entityId", () => {
+    rm.record({ entityId: "0x1234", relationshipType: "unknown", trustScore: 0.5 });
+    rm.record({ entityId: "0x1234", entityName: "Updated", relationshipType: "peer", trustScore: 0.8 });
 
     const rel = rm.get("0x1234");
     expect(rel!.entityName).toBe("Updated");
@@ -496,7 +509,7 @@ describe("RelationshipMemoryManager", () => {
   });
 
   it("should record interactions", () => {
-    rm.record({ entityAddress: "0x1234", relationshipType: "peer" });
+    rm.record({ entityId: "0x1234", relationshipType: "peer" });
     rm.recordInteraction("0x1234");
     rm.recordInteraction("0x1234");
 
@@ -506,7 +519,7 @@ describe("RelationshipMemoryManager", () => {
   });
 
   it("should update trust score with clamping", () => {
-    rm.record({ entityAddress: "0x1234", relationshipType: "peer", trustScore: 0.5 });
+    rm.record({ entityId: "0x1234", relationshipType: "peer", trustScore: 0.5 });
 
     rm.updateTrust("0x1234", 0.3);
     expect(rm.get("0x1234")!.trustScore).toBeCloseTo(0.8);
@@ -521,9 +534,9 @@ describe("RelationshipMemoryManager", () => {
   });
 
   it("should filter by minimum trust", () => {
-    rm.record({ entityAddress: "0x001", relationshipType: "peer", trustScore: 0.3 });
-    rm.record({ entityAddress: "0x002", relationshipType: "peer", trustScore: 0.7 });
-    rm.record({ entityAddress: "0x003", relationshipType: "peer", trustScore: 0.9 });
+    rm.record({ entityId: "0x001", relationshipType: "peer", trustScore: 0.3 });
+    rm.record({ entityId: "0x002", relationshipType: "peer", trustScore: 0.7 });
+    rm.record({ entityId: "0x003", relationshipType: "peer", trustScore: 0.9 });
 
     const trusted = rm.getTrusted(0.5);
     expect(trusted).toHaveLength(2);
@@ -532,7 +545,7 @@ describe("RelationshipMemoryManager", () => {
   });
 
   it("should delete a relationship", () => {
-    rm.record({ entityAddress: "0xDEAD", relationshipType: "unknown" });
+    rm.record({ entityId: "0xDEAD", relationshipType: "unknown" });
     rm.delete("0xDEAD");
     expect(rm.get("0xDEAD")).toBeUndefined();
   });
@@ -678,7 +691,7 @@ describe("MemoryIngestionPipeline", () => {
       toolCalls: [
         makeToolCallResult({
           name: "send_message",
-          arguments: { to_address: "0xABCD" },
+          arguments: { to_account_id: "0xABCD" },
           result: "Message sent",
         }),
       ],
@@ -885,7 +898,7 @@ describe("Memory Tools", () => {
   describe("noteAboutAgent", () => {
     it("should record a relationship note", () => {
       const result = noteAboutAgent(db, {
-        entityAddress: "0xABC",
+        entityId: "0xABC",
         entityName: "Helper Bot",
         relationshipType: "service",
         notes: "Provides build services",
@@ -923,9 +936,9 @@ describe("Memory Tools", () => {
 
     it("should protect creator semantic entries", () => {
       const sm = new SemanticMemoryManager(db);
-      sm.store({ category: "creator", key: "creator_address", value: "0xCreator", source: "genesis" });
+      sm.store({ category: "creator", key: "creator_account_id", value: "0xCreator", source: "genesis" });
 
-      const entry = sm.get("creator", "creator_address");
+      const entry = sm.get("creator", "creator_account_id");
       const result = forget(db, { id: entry!.id, memoryType: "semantic" });
       expect(result).toContain("Cannot forget creator-level");
     });
@@ -991,7 +1004,7 @@ describe("formatMemoryBlock", () => {
         { id: "4", name: "deploy", description: "Deploy app", steps: [{ order: 1, description: "Build", tool: "exec", argsTemplate: null, expectedOutcome: null, onFailure: null }], successCount: 3, failureCount: 1, lastUsedAt: null, createdAt: "", updatedAt: "" },
       ],
       relationships: [
-        { id: "5", entityAddress: "0x1234", entityName: "Alice", relationshipType: "peer", trustScore: 0.8, interactionCount: 5, lastInteractionAt: null, notes: null, createdAt: "", updatedAt: "" },
+        { id: "5", entityId: "0x1234", entityName: "Alice", relationshipType: "peer", trustScore: 0.8, interactionCount: 5, lastInteractionAt: null, notes: null, createdAt: "", updatedAt: "" },
       ],
       totalTokens: 50,
     };

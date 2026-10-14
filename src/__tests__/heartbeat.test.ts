@@ -15,13 +15,14 @@ import {
   createTestConfig,
 } from "./mocks.js";
 import type { AutomatonDatabase, InboxMessage, TickContext, HeartbeatLegacyContext } from "../types.js";
+import { creditBalance } from "../state/database.js";
 
 function createMockTickContext(db: AutomatonDatabase, overrides?: Partial<TickContext>): TickContext {
   return {
     tickId: "test-tick-1",
     startedAt: new Date(),
     creditBalance: 10_000,
-    usdcBalance: 1.5,
+    balanceCents: 1.5,
     survivalTier: "normal",
     lowComputeMultiplier: 4,
     config: {
@@ -69,16 +70,16 @@ describe("Heartbeat Tasks", () => {
         messages: [
           {
             id: "msg-1",
-            from: "0xsender1",
-            to: "0xrecipient",
+            from: "acct_sender1",
+            to: "acct_recipient",
             content: "Hey there!",
             signedAt: new Date().toISOString(),
             createdAt: new Date().toISOString(),
           },
           {
             id: "msg-2",
-            from: "0xsender2",
-            to: "0xrecipient",
+            from: "acct_sender2",
+            to: "acct_recipient",
             content: "What's up?",
             signedAt: new Date().toISOString(),
             createdAt: new Date().toISOString(),
@@ -114,8 +115,8 @@ describe("Heartbeat Tasks", () => {
         messages: [
           {
             id: "msg-1",
-            from: "0xsender1",
-            to: "0xrecipient",
+            from: "acct_sender1",
+            to: "acct_recipient",
             content: "Hello!",
             signedAt: new Date().toISOString(),
             createdAt: new Date().toISOString(),
@@ -128,8 +129,8 @@ describe("Heartbeat Tasks", () => {
         messages: [
           {
             id: "msg-1",
-            from: "0xsender1",
-            to: "0xrecipient",
+            from: "acct_sender1",
+            to: "acct_recipient",
             content: "Hello!",
             signedAt: new Date().toISOString(),
             createdAt: new Date().toISOString(),
@@ -185,8 +186,8 @@ describe("Heartbeat Tasks", () => {
         messages: [
           {
             id: "blocked-msg-1",
-            from: "0xattacker",
-            to: "0xrecipient",
+            from: "acct_attacker",
+            to: "acct_recipient",
             content: oversizedContent,
             signedAt: new Date().toISOString(),
             createdAt: new Date().toISOString(),
@@ -343,13 +344,13 @@ describe("Heartbeat Tasks", () => {
     });
   });
 
-  // ─── check_usdc_balance ─────────────────────────────────────
+  // ─── check_balance ──────────────────────────────────────────
 
-  describe("check_usdc_balance", () => {
-    it("does not wake when no USDC and enough credits", async () => {
+  describe("check_balance", () => {
+    it("does not wake when credits are healthy", async () => {
       const tickCtx = createMockTickContext(db, {
         creditBalance: 10_000,
-        usdcBalance: 0,
+        balanceCents: 5_000,
       });
       const taskCtx: HeartbeatLegacyContext = {
         identity: createTestIdentity(),
@@ -358,15 +359,42 @@ describe("Heartbeat Tasks", () => {
         conway,
       };
 
-      const result = await BUILTIN_TASKS.check_usdc_balance(tickCtx, taskCtx);
+      const result = await BUILTIN_TASKS.check_balance(tickCtx, taskCtx);
 
       expect(result.shouldWake).toBe(false);
     });
 
-    it("wakes when has USDC but critically low credits", async () => {
+    it("wakes when BRL balance can top up critically low credits", async () => {
+      const identity = createTestIdentity();
       const tickCtx = createMockTickContext(db, {
-        creditBalance: 0, // critical tier
-        usdcBalance: 10.0, // > 5
+        creditBalance: 0, // below the bootstrap credit threshold
+        balanceCents: 1000, // R$ 10,00 — smallest topup tier
+        survivalTier: "critical",
+      });
+      const taskCtx: HeartbeatLegacyContext = {
+        identity,
+        config: createTestConfig(),
+        db,
+        conway,
+      };
+
+      // Fund the account so the bootstrap topup can pay for the tier
+      creditBalance(db.raw, identity.accountId, 1000);
+      // The test double does not implement the credits purchase API
+      Object.assign(conway, {
+        purchaseCredits: async () => ({ creditsCentsAdded: 1000, balanceCents: 0 }),
+      });
+
+      const result = await BUILTIN_TASKS.check_balance(tickCtx, taskCtx);
+
+      expect(result.shouldWake).toBe(true);
+      expect(result.message).toContain("Auto-topped up");
+    });
+
+    it("does not wake when balance is below the minimum topup tier", async () => {
+      const tickCtx = createMockTickContext(db, {
+        creditBalance: 200,
+        balanceCents: 500, // R$ 5,00 < R$ 10,00 minimum tier
         survivalTier: "critical",
       });
       const taskCtx: HeartbeatLegacyContext = {
@@ -376,25 +404,7 @@ describe("Heartbeat Tasks", () => {
         conway,
       };
 
-      const result = await BUILTIN_TASKS.check_usdc_balance(tickCtx, taskCtx);
-
-      expect(result.shouldWake).toBe(true);
-      expect(result.message).toContain("USDC");
-    });
-
-    it("does not wake when USDC below threshold", async () => {
-      const tickCtx = createMockTickContext(db, {
-        creditBalance: 200,
-        usdcBalance: 3.0, // < 5
-      });
-      const taskCtx: HeartbeatLegacyContext = {
-        identity: createTestIdentity(),
-        config: createTestConfig(),
-        db,
-        conway,
-      };
-
-      const result = await BUILTIN_TASKS.check_usdc_balance(tickCtx, taskCtx);
+      const result = await BUILTIN_TASKS.check_balance(tickCtx, taskCtx);
 
       expect(result.shouldWake).toBe(false);
     });

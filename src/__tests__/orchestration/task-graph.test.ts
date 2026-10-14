@@ -375,7 +375,7 @@ describe("orchestration/task-graph", () => {
     it("rejects empty agent address", () => {
       const goal = createGoal(db, "Goal", "Desc");
       const taskId = insertTask(db, { goalId: goal.id, title: "task", description: "desc" });
-      expect(() => assignTask(db, taskId, "   ")).toThrow("agentAddress cannot be empty");
+      expect(() => assignTask(db, taskId, "   ")).toThrow("agentId cannot be empty");
     });
 
     it("rejects non-pending tasks", () => {

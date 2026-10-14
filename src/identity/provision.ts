@@ -1,19 +1,16 @@
 /**
- * Automaton SIWE Provisioning
+ * Automaton Account Provisioning
  *
- * Uses the automaton's wallet to authenticate via Sign-In With Ethereum (SIWE)
- * and create an API key for Conway API access.
- * Adapted from conway-mcp/src/cli/provision.ts
+ * Exchanges a signed challenge for a Conway API key. Authentication is a
+ * plain challenge/response over the local account identity: there is no
+ * chain, no on-chain signature and no external network identity involved.
  */
 
 import fs from "fs";
 import path from "path";
-import { SiweMessage } from "siwe";
-import { getWallet, getAutomatonDir } from "./wallet.js";
+import { getAccount, getAutomatonDir } from "./account.js";
 import type { ProvisionResult } from "../types.js";
 import { ResilientHttpClient } from "../conway/http-client.js";
-import type { ChainIdentity } from "./chain.js";
-import { buildSiwsMessage, signSiwsMessage } from "./siws.js";
 
 const httpClient = new ResilientHttpClient();
 
@@ -34,9 +31,9 @@ export function loadApiKeyFromConfig(): string | null {
 }
 
 /**
- * Save API key and wallet address to ~/.automaton/config.json
+ * Save API key and account id to ~/.automaton/config.json
  */
-function saveConfig(apiKey: string, walletAddress: string): void {
+function saveConfig(apiKey: string, accountId: string): void {
   const dir = getAutomatonDir();
   if (!fs.existsSync(dir)) {
     fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
@@ -44,7 +41,7 @@ function saveConfig(apiKey: string, walletAddress: string): void {
   const configPath = path.join(dir, "config.json");
   const config = {
     apiKey,
-    walletAddress,
+    accountId,
     provisionedAt: new Date().toISOString(),
   };
   fs.writeFileSync(configPath, JSON.stringify(config, null, 2), {
@@ -53,27 +50,19 @@ function saveConfig(apiKey: string, walletAddress: string): void {
 }
 
 /**
- * Run the full SIWE provisioning flow:
- * 1. Load wallet
- * 2. Get nonce from Conway API
- * 3. Sign SIWE message
- * 4. Verify signature -> get JWT
- * 5. Create API key
- * 6. Save to config.json
+ * Run the provisioning flow:
+ * 1. Load (or create) the local account identity
+ * 2. Ask the Conway API for a nonce
+ * 3. Sign the challenge with the account's Ed25519 key
+ * 4. Exchange the signed challenge for a session token
+ * 5. Create an API key
+ * 6. Save it to config.json
  */
-export async function provision(
-  apiUrl?: string,
-  solanaIdentity?: ChainIdentity,
-): Promise<ProvisionResult> {
+export async function provision(apiUrl?: string): Promise<ProvisionResult> {
   const url = apiUrl || process.env.CONWAY_API_URL || DEFAULT_API_URL;
 
-  // 1. Load wallet
-  const { account, chainIdentity, chainType } = await getWallet();
-  const identity = solanaIdentity || chainIdentity;
-  const address = identity.address;
-  const isSolana = identity.chainType === "solana";
+  const { identity, accountId } = await getAccount();
 
-  // 2. Get nonce
   const nonceResp = await httpClient.request(`${url}/v1/auth/nonce`, {
     method: "POST",
   });
@@ -84,55 +73,23 @@ export async function provision(
   }
   const { nonce } = (await nonceResp.json()) as { nonce: string };
 
-  let messageString: string;
-  let signature: string;
-
-  if (isSolana) {
-    // 3a. SIWS path: Sign-In With Solana
-    const siwsMsg = buildSiwsMessage({
-      domain: "conway.tech",
-      address,
-      statement: "Sign in to Conway as an Automaton to provision an API key.",
-      uri: `${url}/v1/auth/verify`,
-      nonce,
-      issuedAt: new Date().toISOString(),
-      chainId: "mainnet",
-    });
-    messageString = siwsMsg;
-    signature = await signSiwsMessage(siwsMsg, identity);
-  } else {
-    // 3b. SIWE path: Sign-In With Ethereum (unchanged)
-    const siweMessage = new SiweMessage({
-      domain: "conway.tech",
-      address,
-      statement:
-        "Sign in to Conway as an Automaton to provision an API key.",
-      uri: `${url}/v1/auth/verify`,
-      version: "1",
-      chainId: 8453, // Base
-      nonce,
-      issuedAt: new Date().toISOString(),
-    });
-    messageString = siweMessage.prepareMessage();
-    signature = await account.signMessage({ message: messageString });
-  }
-
-  // 4. Verify signature -> get JWT
-  const verifyBody: Record<string, string> = { message: messageString, signature };
-  if (isSolana) {
-    verifyBody.chain_type = "solana";
-  }
+  const message = `conway:provision:${accountId}:${nonce}`;
+  const signature = await identity.signMessage(message);
 
   const verifyResp = await httpClient.request(`${url}/v1/auth/verify`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(verifyBody),
+    body: JSON.stringify({
+      message,
+      signature,
+      account_id: accountId,
+      public_key: identity.publicKey,
+    }),
   });
 
   if (!verifyResp.ok) {
-    const protocol = isSolana ? "SIWS" : "SIWE";
     throw new Error(
-      `${protocol} verification failed: ${verifyResp.status} ${await verifyResp.text()}`,
+      `Challenge verification failed: ${verifyResp.status} ${await verifyResp.text()}`,
     );
   }
 
@@ -140,7 +97,6 @@ export async function provision(
     access_token: string;
   };
 
-  // 5. Create API key
   const keyResp = await httpClient.request(`${url}/v1/auth/api-keys`, {
     method: "POST",
     headers: {
@@ -161,10 +117,9 @@ export async function provision(
     key_prefix: string;
   };
 
-  // 6. Save to config
-  saveConfig(key, address);
+  saveConfig(key, accountId);
 
-  return { apiKey: key, walletAddress: address, keyPrefix: key_prefix };
+  return { apiKey: key, accountId, keyPrefix: key_prefix };
 }
 
 /**
@@ -172,7 +127,7 @@ export async function provision(
  * This allows the creator to see automaton logs and inference calls.
  */
 export async function registerParent(
-  creatorAddress: string,
+  creatorAccountId: string,
   apiUrl?: string,
 ): Promise<void> {
   const url = apiUrl || process.env.CONWAY_API_URL || DEFAULT_API_URL;
@@ -187,7 +142,7 @@ export async function registerParent(
       "Content-Type": "application/json",
       Authorization: apiKey,
     },
-    body: JSON.stringify({ creatorAddress }),
+    body: JSON.stringify({ creatorAccountId }),
   });
 
   // Endpoint may not exist yet -- fail gracefully

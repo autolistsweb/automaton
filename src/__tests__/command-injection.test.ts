@@ -168,7 +168,7 @@ describe("command.forbidden_patterns rule", () => {
     "rm -rf .automaton",
     "rm -rf /home/user/.automaton",
     "rm state.db",
-    "rm -f wallet.json",
+    "rm -f account.json",
     "rm automaton.json",
     "rm heartbeat.yml",
     "rm SOUL.md",
@@ -222,7 +222,7 @@ describe("command.forbidden_patterns rule", () => {
     "cat ~/.ssh/id_rsa",
     "cat ~/.gnupg/private-keys-v1.d/key",
     "cat .env",
-    "cat /home/user/wallet.json",
+    "cat /home/user/account.json",
   ];
 
   for (const cmd of credentialPatterns) {
@@ -436,13 +436,13 @@ describe("Validation rules", () => {
   describe("validate.address_format", () => {
     const rule = rules.find((r) => r.id === "validate.address_format")!;
 
-    it("allows valid Ethereum addresses", () => {
+    it("allows valid account ids", () => {
       const valid = [
-        "0x1234567890abcdef1234567890abcdef12345678",
-        "0xABCDEF1234567890ABCDEF1234567890ABCDEF12",
+        "acct_1234567890abcdef1234",
+        "acct_abcdef1234567890abcd",
       ];
-      for (const to_address of valid) {
-        const request = makeRequest("transfer_credits", { to_address }, "treasury");
+      for (const to_account_id of valid) {
+        const request = makeRequest("transfer_credits", { to_account_id }, "treasury");
         const result = rule.evaluate(request);
         expect(result).toBeNull();
       }
@@ -451,12 +451,12 @@ describe("Validation rules", () => {
     it("rejects invalid addresses", () => {
       const invalid = [
         "not-an-address",
-        "0x1234",     // too short
-        "1234567890abcdef1234567890abcdef12345678", // no 0x prefix
-        "0xGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGG", // non-hex
+        "acct_1234",        // too short
+        "1234567890abcdef1234",  // no acct_ prefix
+        "acct_GGGGGGGGGGGGGGGG", // non-hex
       ];
-      for (const to_address of invalid) {
-        const request = makeRequest("transfer_credits", { to_address }, "treasury");
+      for (const to_account_id of invalid) {
+        const request = makeRequest("transfer_credits", { to_account_id }, "treasury");
         const result = rule.evaluate(request);
         expect(result).not.toBeNull();
         expect(result!.action).toBe("deny");
@@ -558,7 +558,7 @@ describe("Source code injection safety", () => {
   it("upstream.ts uses execFileSync not execSync with string interpolation", async () => {
     const fs = await import("fs");
     const source = fs.readFileSync(
-      new URL("../self-mod/upstream.ts", import.meta.url).pathname.replace("/src/__tests__/../", "/src/"),
+      new URL("../self-mod/upstream.ts", import.meta.url),
       "utf-8",
     );
     // Should NOT have: execSync(`git ${cmd}`)
@@ -570,7 +570,7 @@ describe("Source code injection safety", () => {
   it("registry.ts uses execFileSync not conway.exec with interpolation", async () => {
     const fs = await import("fs");
     const source = fs.readFileSync(
-      new URL("../skills/registry.ts", import.meta.url).pathname.replace("/src/__tests__/../", "/src/"),
+      new URL("../skills/registry.ts", import.meta.url),
       "utf-8",
     );
     // Should NOT have template literals in conway.exec calls
@@ -584,7 +584,7 @@ describe("Source code injection safety", () => {
   it("loader.ts uses execFileSync('which', [bin]) not execSync('which ${bin}')", async () => {
     const fs = await import("fs");
     const source = fs.readFileSync(
-      new URL("../skills/loader.ts", import.meta.url).pathname.replace("/src/__tests__/../", "/src/"),
+      new URL("../skills/loader.ts", import.meta.url),
       "utf-8",
     );
     // Should NOT have: execSync(`which ${bin}`)
@@ -596,7 +596,7 @@ describe("Source code injection safety", () => {
   it("tools.ts pull_upstream uses conway.exec not host execSync", async () => {
     const fs = await import("fs");
     const source = fs.readFileSync(
-      new URL("../agent/tools.ts", import.meta.url).pathname.replace("/src/__tests__/../", "/src/"),
+      new URL("../agent/tools.ts", import.meta.url),
       "utf-8",
     );
     // Find the pull_upstream section and check it doesn't import child_process
@@ -611,7 +611,7 @@ describe("Source code injection safety", () => {
   it("tools.ts has defense-in-depth comment on FORBIDDEN_COMMAND_PATTERNS", async () => {
     const fs = await import("fs");
     const source = fs.readFileSync(
-      new URL("../agent/tools.ts", import.meta.url).pathname.replace("/src/__tests__/../", "/src/"),
+      new URL("../agent/tools.ts", import.meta.url),
       "utf-8",
     );
     expect(source).toMatch(/[Dd]efense.in.depth.*policy engine/i);

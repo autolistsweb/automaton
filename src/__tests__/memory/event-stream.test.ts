@@ -21,7 +21,7 @@ function createTestDb(): BetterSqlite3.Database {
 
 function appendAt(params: {
   type?: EventType;
-  agentAddress?: string;
+  agentId?: string;
   goalId?: string | null;
   taskId?: string | null;
   content?: string;
@@ -31,7 +31,7 @@ function appendAt(params: {
 }): string {
   const id = stream.append({
     type: params.type ?? "observation",
-    agentAddress: params.agentAddress ?? "agent-a",
+    agentId: params.agentId ?? "agent-a",
     goalId: params.goalId ?? null,
     taskId: params.taskId ?? null,
     content: params.content ?? "payload",
@@ -56,7 +56,7 @@ describe("EventStream", () => {
   it("append creates event with ULID and timestamp", () => {
     const id = stream.append({
       type: "action",
-      agentAddress: "agent-1",
+      agentId: "agent-1",
       goalId: "goal-1",
       taskId: "task-1",
       content: "run",
@@ -77,7 +77,7 @@ describe("EventStream", () => {
   it("append estimates token count when input tokenCount is 0", () => {
     const id = stream.append({
       type: "observation",
-      agentAddress: "agent-1",
+      agentId: "agent-1",
       goalId: null,
       taskId: null,
       content: "1234567890",
@@ -94,7 +94,7 @@ describe("EventStream", () => {
   it("append keeps explicit tokenCount when non-zero", () => {
     const id = stream.append({
       type: "observation",
-      agentAddress: "agent-1",
+      agentId: "agent-1",
       goalId: null,
       taskId: null,
       content: "ignored",
@@ -127,9 +127,9 @@ describe("EventStream", () => {
   });
 
   it("getRecent filters by agent address", () => {
-    appendAt({ createdAt: "2026-01-01T00:00:01.000Z", content: "a1", agentAddress: "a" });
-    appendAt({ createdAt: "2026-01-01T00:00:02.000Z", content: "b1", agentAddress: "b" });
-    appendAt({ createdAt: "2026-01-01T00:00:03.000Z", content: "a2", agentAddress: "a" });
+    appendAt({ createdAt: "2026-01-01T00:00:01.000Z", content: "a1", agentId: "a" });
+    appendAt({ createdAt: "2026-01-01T00:00:02.000Z", content: "b1", agentId: "b" });
+    appendAt({ createdAt: "2026-01-01T00:00:03.000Z", content: "a2", agentId: "a" });
 
     const events = stream.getRecent("a", 10);
     expect(events.map((event) => event.content)).toEqual(["a1", "a2"]);
@@ -237,16 +237,16 @@ describe("EventStream", () => {
   });
 
   it("getTokenCount sums all tokens for an agent", () => {
-    appendAt({ createdAt: "2026-01-01T00:00:01.000Z", agentAddress: "a", tokenCount: 10 });
-    appendAt({ createdAt: "2026-01-01T00:00:02.000Z", agentAddress: "a", tokenCount: 20 });
-    appendAt({ createdAt: "2026-01-01T00:00:03.000Z", agentAddress: "b", tokenCount: 50 });
+    appendAt({ createdAt: "2026-01-01T00:00:01.000Z", agentId: "a", tokenCount: 10 });
+    appendAt({ createdAt: "2026-01-01T00:00:02.000Z", agentId: "a", tokenCount: 20 });
+    appendAt({ createdAt: "2026-01-01T00:00:03.000Z", agentId: "b", tokenCount: 50 });
 
     expect(stream.getTokenCount("a")).toBe(30);
   });
 
   it("getTokenCount respects since filter", () => {
-    appendAt({ createdAt: "2026-01-01T00:00:01.000Z", agentAddress: "a", tokenCount: 10 });
-    appendAt({ createdAt: "2026-01-01T00:00:02.000Z", agentAddress: "a", tokenCount: 20 });
+    appendAt({ createdAt: "2026-01-01T00:00:01.000Z", agentId: "a", tokenCount: 10 });
+    appendAt({ createdAt: "2026-01-01T00:00:02.000Z", agentId: "a", tokenCount: 20 });
 
     expect(stream.getTokenCount("a", "2026-01-01T00:00:01.500Z")).toBe(20);
   });

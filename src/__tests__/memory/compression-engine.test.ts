@@ -40,7 +40,7 @@ function appendEventAt(params: {
 }): string {
   const id = eventStream.append({
     type: (params.type ?? "inference") as any,
-    agentAddress: "agent-1",
+    agentId: "agent-1",
     goalId: params.goalId ?? "goal-1",
     taskId: params.taskId ?? "task-1",
     content: params.content ?? "event-content",

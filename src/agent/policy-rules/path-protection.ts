@@ -12,7 +12,7 @@ import { isProtectedFile } from "../../self-mod/code.js";
 
 /** Sensitive files that must not be read by the agent */
 const SENSITIVE_READ_PATTERNS: string[] = [
-  "wallet.json",
+  "account.json",
   "config.json",
   ".env",
   "automaton.json",
@@ -88,13 +88,13 @@ function createProtectedFilesRule(): PolicyRule {
 }
 
 /**
- * Deny reads of sensitive files (wallet, env, config secrets).
+ * Deny reads of sensitive files (signing key, env, config secrets).
  * Applies to: read_file
  */
 function createReadSensitiveRule(): PolicyRule {
   return {
     id: "path.read_sensitive",
-    description: "Deny reads of sensitive files (wallet, env, config, keys)",
+    description: "Deny reads of sensitive files (signing key, env, config, keys)",
     priority: 200,
     appliesTo: {
       by: "name",

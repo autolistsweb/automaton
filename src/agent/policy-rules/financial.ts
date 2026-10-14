@@ -1,7 +1,7 @@
 /**
  * Financial Policy Rules
  *
- * Enforces spend limits, domain allowlists, and transfer caps
+ * Enforces spend limits, per-operation caps, and transfer caps
  * to prevent iterative credit drain and unauthorized payments.
  */
 
@@ -11,6 +11,7 @@ import type {
   PolicyRuleResult,
   TreasuryPolicy,
 } from "../../types.js";
+import { formatBRL } from "../../payments/money.js";
 
 function deny(
   rule: string,
@@ -21,68 +22,65 @@ function deny(
 }
 
 /**
- * Deny x402 payments above the configured per-payment max.
+ * Read a declared amount from tool args, in centavos.
  */
-function createX402MaxSingleRule(policy: TreasuryPolicy): PolicyRule {
+function readAmountCents(args: Record<string, unknown>): number | undefined {
+  const raw = args.amount_cents ?? args.amountCents;
+  return typeof raw === "number" ? raw : undefined;
+}
+
+/**
+ * Deny deposits, topups, and transfers above the configured
+ * per-operation maximum.
+ */
+function createDepositMaxSingleRule(policy: TreasuryPolicy): PolicyRule {
   return {
-    id: "financial.x402_max_single",
-    description: `Deny x402 payments above ${policy.maxX402PaymentCents} cents`,
+    id: "financial.deposit_max_single",
+    description: `Deny deposits, topups and transfers above ${formatBRL(policy.maxSingleDepositCents)}`,
     priority: 500,
-    appliesTo: { by: "name", names: ["x402_fetch"] },
+    appliesTo: {
+      by: "name",
+      names: ["pix", "add_balance", "topup_credits", "transfer_credits", "fund_child"],
+    },
     evaluate(request: PolicyRequest): PolicyRuleResult | null {
-      // The amount is checked pre-payment in x402Fetch itself,
-      // but we also enforce via policy for the declared max.
-      // x402 payment amounts aren't in tool args — they come from the server.
-      // This rule serves as a policy declaration; actual enforcement
-      // happens in x402Fetch when maxPaymentCents is injected.
+      const amount = readAmountCents(request.args);
+      if (amount === undefined) return null;
+
+      if (amount > policy.maxSingleDepositCents) {
+        return deny(
+          "financial.deposit_max_single",
+          "SPEND_LIMIT_EXCEEDED",
+          `Operation of ${formatBRL(amount)} exceeds single operation max of ${formatBRL(policy.maxSingleDepositCents)}`,
+        );
+      }
+
       return null;
     },
   };
 }
 
 /**
- * Deny x402 requests to domains not in the allowlist.
+ * Deny money-moving tools that declare a malformed amount.
+ * Guards pix, add_balance, topup_credits, transfer_credits, fund_child.
  */
-function createX402DomainAllowlistRule(policy: TreasuryPolicy): PolicyRule {
+function createMoneyAmountValidityRule(): PolicyRule {
   return {
-    id: "financial.x402_domain_allowlist",
-    description: "Deny x402 to domains not in allowlist",
+    id: "financial.money_amount_validity",
+    description: "Deny money-moving tools with a non-positive or fractional amount",
     priority: 500,
-    appliesTo: { by: "name", names: ["x402_fetch"] },
+    appliesTo: {
+      by: "name",
+      names: ["pix", "add_balance", "topup_credits", "transfer_credits", "fund_child"],
+    },
     evaluate(request: PolicyRequest): PolicyRuleResult | null {
-      const url = request.args.url as string | undefined;
-      if (!url) return null;
+      const raw = request.args.amount_cents ?? request.args.amountCents;
+      if (raw === undefined || raw === null) return null;
 
-      const allowedDomains = policy.x402AllowedDomains;
-      if (allowedDomains.length === 0) {
+      if (typeof raw !== "number" || !Number.isInteger(raw) || raw <= 0) {
         return deny(
-          "financial.x402_domain_allowlist",
-          "DOMAIN_NOT_ALLOWED",
-          "x402 payments are disabled (empty allowlist)",
-        );
-      }
-
-      let hostname: string;
-      try {
-        hostname = new URL(url).hostname;
-      } catch {
-        return deny(
-          "financial.x402_domain_allowlist",
-          "DOMAIN_NOT_ALLOWED",
-          `Invalid URL: ${url}`,
-        );
-      }
-
-      const isAllowed = allowedDomains.some(
-        (domain) =>
-          hostname === domain || hostname.endsWith(`.${domain}`),
-      );
-
-      if (!isAllowed) {
-        return deny(
-          "financial.x402_domain_allowlist",
-          "DOMAIN_NOT_ALLOWED",
-          `Domain "${hostname}" not in x402 allowlist: [${allowedDomains.join(", ")}]`,
+          "financial.money_amount_validity",
+          "INVALID_AMOUNT",
+          `Amount must be a positive whole number of centavos (received: ${String(raw)})`,
         );
       }
 
@@ -97,7 +95,7 @@ function createX402DomainAllowlistRule(policy: TreasuryPolicy): PolicyRule {
 function createTransferMaxSingleRule(policy: TreasuryPolicy): PolicyRule {
   return {
     id: "financial.transfer_max_single",
-    description: `Deny transfers above ${policy.maxSingleTransferCents} cents`,
+    description: `Deny transfers above ${formatBRL(policy.maxSingleTransferCents)}`,
     priority: 500,
     appliesTo: { by: "name", names: ["transfer_credits"] },
     evaluate(request: PolicyRequest): PolicyRuleResult | null {
@@ -108,7 +106,7 @@ function createTransferMaxSingleRule(policy: TreasuryPolicy): PolicyRule {
         return deny(
           "financial.transfer_max_single",
           "SPEND_LIMIT_EXCEEDED",
-          `Transfer of ${amount} cents exceeds single transfer max of ${policy.maxSingleTransferCents} cents ($${(policy.maxSingleTransferCents / 100).toFixed(2)})`,
+          `Transfer of ${formatBRL(amount)} exceeds single transfer max of ${formatBRL(policy.maxSingleTransferCents)}`,
         );
       }
 
@@ -123,7 +121,7 @@ function createTransferMaxSingleRule(policy: TreasuryPolicy): PolicyRule {
 function createTransferHourlyCapRule(policy: TreasuryPolicy): PolicyRule {
   return {
     id: "financial.transfer_hourly_cap",
-    description: `Deny if hourly transfers exceed ${policy.maxHourlyTransferCents} cents`,
+    description: `Deny if hourly transfers exceed ${formatBRL(policy.maxHourlyTransferCents)}/hr`,
     priority: 500,
     appliesTo: { by: "name", names: ["transfer_credits"] },
     evaluate(request: PolicyRequest): PolicyRuleResult | null {
@@ -137,7 +135,7 @@ function createTransferHourlyCapRule(policy: TreasuryPolicy): PolicyRule {
         return deny(
           "financial.transfer_hourly_cap",
           "SPEND_LIMIT_EXCEEDED",
-          `Transfer would exceed hourly cap: current ${check.currentHourlySpend} + ${amount} > ${check.limitHourly} cents ($${(check.limitHourly / 100).toFixed(2)}/hr)`,
+          `Transfer would exceed hourly cap: current ${formatBRL(check.currentHourlySpend)} + ${formatBRL(amount)} > ${formatBRL(check.limitHourly)}/hr`,
         );
       }
 
@@ -152,7 +150,7 @@ function createTransferHourlyCapRule(policy: TreasuryPolicy): PolicyRule {
 function createTransferDailyCapRule(policy: TreasuryPolicy): PolicyRule {
   return {
     id: "financial.transfer_daily_cap",
-    description: `Deny if daily transfers exceed ${policy.maxDailyTransferCents} cents`,
+    description: `Deny if daily transfers exceed ${formatBRL(policy.maxDailyTransferCents)}/day`,
     priority: 500,
     appliesTo: { by: "name", names: ["transfer_credits"] },
     evaluate(request: PolicyRequest): PolicyRuleResult | null {
@@ -166,7 +164,7 @@ function createTransferDailyCapRule(policy: TreasuryPolicy): PolicyRule {
         return deny(
           "financial.transfer_daily_cap",
           "SPEND_LIMIT_EXCEEDED",
-          `Transfer would exceed daily cap: current ${check.currentDailySpend} + ${amount} > ${check.limitDaily} cents ($${(check.limitDaily / 100).toFixed(2)}/day)`,
+          `Transfer would exceed daily cap: current ${formatBRL(check.currentDailySpend)} + ${formatBRL(amount)} > ${formatBRL(check.limitDaily)}/day`,
         );
       }
 
@@ -181,11 +179,11 @@ function createTransferDailyCapRule(policy: TreasuryPolicy): PolicyRule {
 function createMinimumReserveRule(policy: TreasuryPolicy): PolicyRule {
   return {
     id: "financial.minimum_reserve",
-    description: `Deny if balance would drop below ${policy.minimumReserveCents} cents reserve`,
+    description: `Deny if balance would drop below ${formatBRL(policy.minimumReserveCents)} reserve`,
     priority: 500,
     appliesTo: {
       by: "name",
-      names: ["transfer_credits", "x402_fetch", "fund_child"],
+      names: ["transfer_credits", "topup_credits", "fund_child"],
     },
     evaluate(request: PolicyRequest): PolicyRuleResult | null {
       // For transfer_credits and fund_child, we can check from args
@@ -241,7 +239,7 @@ function createTurnTransferLimitRule(policy: TreasuryPolicy): PolicyRule {
 function createInferenceDailyCapRule(policy: TreasuryPolicy): PolicyRule {
   return {
     id: "financial.inference_daily_cap",
-    description: `Deny inference if daily cost exceeds ${policy.maxInferenceDailyCents} cents`,
+    description: `Deny inference if daily cost exceeds ${formatBRL(policy.maxInferenceDailyCents)}/day`,
     priority: 500,
     appliesTo: { by: "category", categories: ["conway"] },
     evaluate(request: PolicyRequest): PolicyRuleResult | null {
@@ -257,7 +255,7 @@ function createInferenceDailyCapRule(policy: TreasuryPolicy): PolicyRule {
         return deny(
           "financial.inference_daily_cap",
           "INFERENCE_BUDGET_EXCEEDED",
-          `Daily inference budget exceeded: ${dailyInferenceSpend} cents spent (max ${policy.maxInferenceDailyCents} cents / $${(policy.maxInferenceDailyCents / 100).toFixed(2)}/day)`,
+          `Daily inference budget exceeded: ${formatBRL(dailyInferenceSpend)} spent today (max ${formatBRL(policy.maxInferenceDailyCents)}/day)`,
         );
       }
 
@@ -273,7 +271,7 @@ function createInferenceDailyCapRule(policy: TreasuryPolicy): PolicyRule {
 function createRequireConfirmationRule(policy: TreasuryPolicy): PolicyRule {
   return {
     id: "financial.require_confirmation",
-    description: `Quarantine transfers above ${policy.requireConfirmationAboveCents} cents for confirmation`,
+    description: `Quarantine transfers above ${formatBRL(policy.requireConfirmationAboveCents)} for confirmation`,
     priority: 500,
     appliesTo: { by: "name", names: ["transfer_credits"] },
     evaluate(request: PolicyRequest): PolicyRuleResult | null {
@@ -285,7 +283,7 @@ function createRequireConfirmationRule(policy: TreasuryPolicy): PolicyRule {
           rule: "financial.require_confirmation",
           action: "quarantine",
           reasonCode: "CONFIRMATION_REQUIRED",
-          humanMessage: `Transfer of ${amount} cents ($${(amount / 100).toFixed(2)}) exceeds confirmation threshold of ${policy.requireConfirmationAboveCents} cents ($${(policy.requireConfirmationAboveCents / 100).toFixed(2)})`,
+          humanMessage: `Transfer of ${formatBRL(amount)} exceeds confirmation threshold of ${formatBRL(policy.requireConfirmationAboveCents)}`,
         };
       }
 
@@ -301,8 +299,8 @@ export function createFinancialRules(
   treasuryPolicy: TreasuryPolicy,
 ): PolicyRule[] {
   return [
-    createX402MaxSingleRule(treasuryPolicy),
-    createX402DomainAllowlistRule(treasuryPolicy),
+    createDepositMaxSingleRule(treasuryPolicy),
+    createMoneyAmountValidityRule(),
     createTransferMaxSingleRule(treasuryPolicy),
     createTransferHourlyCapRule(treasuryPolicy),
     createTransferDailyCapRule(treasuryPolicy),

@@ -17,13 +17,13 @@ import { SURVIVAL_THRESHOLDS } from "../types.js";
  */
 export async function checkFinancialState(
   conway: ConwayClient,
-  usdcBalance: number,
+  balanceCents: number,
 ): Promise<FinancialState> {
   const creditsCents = await conway.getCreditsBalance();
 
   return {
     creditsCents,
-    usdcBalance,
+    balanceCents,
     lastChecked: new Date().toISOString(),
   };
 }

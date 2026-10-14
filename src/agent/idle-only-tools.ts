@@ -1,6 +1,6 @@
 const IDLE_ONLY_TOOL_NAMES = [
   "check_credits",
-  "check_usdc_balance",
+  "check_balance",
   "system_synopsis",
   "review_memory",
   "list_children",

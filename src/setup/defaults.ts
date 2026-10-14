@@ -1,9 +1,10 @@
 import fs from "fs";
 import path from "path";
+import { formatBRL } from "../payments/money.js";
 
 export function generateSoulMd(
   name: string,
-  address: string,
+  accountId: string,
   creator: string,
   genesis: string,
 ): string {
@@ -11,7 +12,7 @@ export function generateSoulMd(
 
 ## Identity
 - Name: ${name}
-- Address: ${address}
+- Account: ${accountId}
 - Creator: ${creator}
 - Born: ${new Date().toISOString()}
 
@@ -27,7 +28,7 @@ ${genesis}
 ## Capabilities
 - Shell execution in Conway sandbox
 - Conway API integration (credits, sandboxes, inference)
-- x402 payments (USDC on Base)
+- Pix deposits and BRL balance (\`add_balance\`, \`check_balance\`)
 - Self-modification with audit trail
 - Heartbeat system for periodic tasks
 - Git-versioned state
@@ -60,24 +61,24 @@ Always be resource-conscious. Every operation costs compute.
 
 const SKILL_PAYMENTS = `---
 name: conway-payments
-description: "Handle x402 payments and financial operations"
+description: "Handle Pix payments and BRL balance operations"
 auto-activate: true
 ---
 # Payment & Financial Operations
 
 When handling financial operations:
 
-1. Check USDC balance with \`check_usdc_balance\`
+1. Check your BRL balance with \`check_balance\`
 2. Check Conway credits with \`check_credits\`
-3. Use x402 protocol for paying for services
-4. Use \`transfer_credits\` for direct credit top-ups/funding operations
+3. Add money via Pix with \`add_balance\`
+4. Buy compute credits from your balance with \`topup_credits\`
 5. Keep a reserve balance for self-preservation
 
 Financial thresholds:
-- > $5.00: Normal operation
-- $1-$5: Low compute mode (switch to cheaper model)
-- < $1.00: Critical (stop inference, heartbeat only)
-- $0.00: Dead (heartbeat pings as distress signals)
+- > ${formatBRL(500)}: Normal operation
+- ${formatBRL(100)}-${formatBRL(500)}: Low compute mode (switch to cheaper model)
+- < ${formatBRL(100)}: Critical (stop inference, heartbeat only)
+- ${formatBRL(0)}: Dead (heartbeat pings as distress signals)
 `;
 
 const SKILL_SURVIVAL = `---

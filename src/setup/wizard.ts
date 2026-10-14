@@ -3,7 +3,7 @@ import path from "path";
 import chalk from "chalk";
 import type { AutomatonConfig, TreasuryPolicy } from "../types.js";
 import { DEFAULT_TREASURY_POLICY } from "../types.js";
-import { getWallet, getAutomatonDir } from "../identity/wallet.js";
+import { getAccount, getAutomatonDir } from "../identity/account.js";
 import { provision } from "../identity/provision.js";
 import { createConfig, saveConfig } from "../config.js";
 import { writeDefaultHeartbeatConfig } from "../heartbeat/config.js";
@@ -11,48 +11,35 @@ import { showBanner } from "./banner.js";
 import {
   promptRequired,
   promptMultiline,
-  promptAddress,
+  promptAccountId,
   promptOptional,
   promptWithDefault,
   closePrompts,
 } from "./prompts.js";
 import { detectEnvironment } from "./environment.js";
 import { generateSoulMd, installDefaultSkills } from "./defaults.js";
-import type { ChainType } from "../identity/chain.js";
+import { PIX_PRESET_AMOUNTS_CENTS, formatBRL } from "../payments/money.js";
 
 export async function runSetupWizard(): Promise<AutomatonConfig> {
   showBanner();
 
   console.log(chalk.white("  First-run setup. Let's bring your automaton to life.\n"));
 
-  // ─── 1. Chain selection + wallet ──────────────────────────────
-  console.log(chalk.cyan("  [1/6] Chain selection & identity (wallet)..."));
-  let selectedChain: ChainType = "evm";
-  const chainInput = await promptOptional("Chain type (evm or solana) [evm]");
-  if (chainInput && chainInput.toLowerCase() === "solana") {
-    selectedChain = "solana";
-    console.log(chalk.green("  Chain: Solana (Ed25519)\n"));
-  } else {
-    console.log(chalk.green("  Chain: EVM (secp256k1)\n"));
-  }
-
-  const { account, chainIdentity, chainType: walletChainType, isNew } = await getWallet(selectedChain);
-  const walletAddress = chainIdentity.address;
+  // ─── 1. Local account identity ────────────────────────────────
+  console.log(chalk.cyan("  [1/6] Identity (local account)..."));
+  const { accountId, isNew } = await getAccount();
   if (isNew) {
-    console.log(chalk.green(`  Wallet created: ${walletAddress}`));
+    console.log(chalk.green(`  Account created: ${accountId}`));
   } else {
-    console.log(chalk.green(`  Wallet loaded: ${walletAddress}`));
+    console.log(chalk.green(`  Account loaded: ${accountId}`));
   }
-  console.log(chalk.dim(`  Private key stored at: ${getAutomatonDir()}/wallet.json\n`));
+  console.log(chalk.dim(`  Signing key stored at: ${getAutomatonDir()}/account.json\n`));
 
   // ─── 2. Provision API key ─────────────────────────────────────
-  const provisionLabel = walletChainType === "solana"
-    ? "  [2/6] Provisioning Conway API key (SIWS)..."
-    : "  [2/6] Provisioning Conway API key (SIWE)...";
-  console.log(chalk.cyan(provisionLabel));
+  console.log(chalk.cyan("  [2/6] Provisioning Conway API key..."));
   let apiKey = "";
   try {
-    const result = await provision(undefined, walletChainType === "solana" ? chainIdentity : undefined);
+    const result = await provision();
     apiKey = result.apiKey;
     console.log(chalk.green(`  API key provisioned: ${result.keyPrefix}...\n`));
   } catch (err: any) {
@@ -68,7 +55,7 @@ export async function runSetupWizard(): Promise<AutomatonConfig> {
       }
       fs.writeFileSync(
         path.join(configDir, "config.json"),
-        JSON.stringify({ apiKey, walletAddress: walletAddress, provisionedAt: new Date().toISOString() }, null, 2),
+        JSON.stringify({ apiKey, accountId: accountId, provisionedAt: new Date().toISOString() }, null, 2),
         { mode: 0o600 },
       );
       console.log(chalk.green("  API key saved.\n"));
@@ -88,13 +75,10 @@ export async function runSetupWizard(): Promise<AutomatonConfig> {
   const genesisPrompt = await promptMultiline("Enter the genesis prompt (system prompt) for your automaton.");
   console.log(chalk.green(`  Genesis prompt set (${genesisPrompt.length} chars)\n`));
 
-  console.log(chalk.dim(`  Your automaton's address is ${walletAddress}`));
-  console.log(chalk.dim("  Now enter YOUR wallet address (the human creator/owner).\n"));
-  const creatorAddressLabel = walletChainType === "solana"
-    ? "Creator wallet address (base58)"
-    : "Creator wallet address (0x...)";
-  const creatorAddress = await promptAddress(creatorAddressLabel, walletChainType);
-  console.log(chalk.green(`  Creator: ${creatorAddress}\n`));
+  console.log(chalk.dim(`  Your automaton's account is ${accountId}`));
+  console.log(chalk.dim("  Now enter YOUR account id (the human creator/owner).\n"));
+  const creatorAccountId = await promptAccountId("Creator account id (acct_...)");
+  console.log(chalk.green(`  Creator: ${creatorAccountId}\n`));
 
   console.log(chalk.white("  Optional: bring your own inference provider keys (press Enter to skip)."));
   const openaiApiKey = await promptOptional("OpenAI API key (sk-..., optional)");
@@ -137,9 +121,8 @@ export async function runSetupWizard(): Promise<AutomatonConfig> {
       "Max daily transfers (cents)", DEFAULT_TREASURY_POLICY.maxDailyTransferCents),
     minimumReserveCents: await promptWithDefault(
       "Minimum reserve (cents)", DEFAULT_TREASURY_POLICY.minimumReserveCents),
-    maxX402PaymentCents: await promptWithDefault(
-      "Max x402 payment (cents)", DEFAULT_TREASURY_POLICY.maxX402PaymentCents),
-    x402AllowedDomains: DEFAULT_TREASURY_POLICY.x402AllowedDomains,
+    maxSingleDepositCents: await promptWithDefault(
+      "Limite máximo por depósito (centavos)", DEFAULT_TREASURY_POLICY.maxSingleDepositCents),
     transferCooldownMs: DEFAULT_TREASURY_POLICY.transferCooldownMs,
     maxTransfersPerTurn: DEFAULT_TREASURY_POLICY.maxTransfersPerTurn,
     maxInferenceDailyCents: await promptWithDefault(
@@ -165,16 +148,15 @@ export async function runSetupWizard(): Promise<AutomatonConfig> {
   const config = createConfig({
     name,
     genesisPrompt,
-    creatorAddress,
+    creatorAccountId,
     registeredWithConway: !!apiKey,
     sandboxId: env.sandboxId,
-    walletAddress,
+    accountId,
     apiKey,
     openaiApiKey: openaiApiKey || undefined,
     anthropicApiKey: anthropicApiKey || undefined,
     ollamaBaseUrl,
     treasuryPolicy,
-    chainType: walletChainType,
   });
 
   saveConfig(config);
@@ -195,7 +177,7 @@ export async function runSetupWizard(): Promise<AutomatonConfig> {
 
   // SOUL.md
   const soulPath = path.join(automatonDir, "SOUL.md");
-  fs.writeFileSync(soulPath, generateSoulMd(name, walletAddress, creatorAddress, genesisPrompt), { mode: 0o600 });
+  fs.writeFileSync(soulPath, generateSoulMd(name, accountId, creatorAccountId, genesisPrompt), { mode: 0o600 });
   console.log(chalk.green("  SOUL.md written"));
 
   // Default skills
@@ -205,35 +187,36 @@ export async function runSetupWizard(): Promise<AutomatonConfig> {
 
   // ─── 6. Funding guidance ──────────────────────────────────────
   console.log(chalk.cyan("  [6/6] Funding\n"));
-  showFundingPanel(walletAddress, walletChainType);
+  showFundingPanel(accountId);
 
   closePrompts();
 
   return config;
 }
 
-function showFundingPanel(address: string, chainType: ChainType = "evm"): void {
-  const short = `${address.slice(0, 6)}...${address.slice(-5)}`;
-  const usdcNetwork = chainType === "solana" ? "Solana" : "Base";
+function showFundingPanel(accountId: string): void {
+  const short = `${accountId.slice(0, 9)}...${accountId.slice(-6)}`;
+  const presets = PIX_PRESET_AMOUNTS_CENTS.map((c) => formatBRL(c)).join("  ");
   const w = 58;
   const pad = (s: string, len: number) => s + " ".repeat(Math.max(0, len - s.length));
 
   console.log(chalk.cyan(`  ${"╭" + "─".repeat(w) + "╮"}`));
   console.log(chalk.cyan(`  │${pad("  Fund your automaton", w)}│`));
   console.log(chalk.cyan(`  │${" ".repeat(w)}│`));
-  console.log(chalk.cyan(`  │${pad(`  Address: ${short}`, w)}│`));
-  console.log(chalk.cyan(`  │${pad(`  Chain: ${chainType === "solana" ? "Solana" : "EVM (Base)"}`, w)}│`));
+  console.log(chalk.cyan(`  │${pad(`  Account: ${short}`, w)}│`));
   console.log(chalk.cyan(`  │${" ".repeat(w)}│`));
-  console.log(chalk.cyan(`  │${pad("  1. Transfer Conway credits", w)}│`));
-  console.log(chalk.cyan(`  │${pad("     conway credits transfer <address> <amount>", w)}│`));
+  console.log(chalk.cyan(`  │${pad("  Balance is added with BRL via Pix", w)}│`));
+  console.log(chalk.cyan(`  │${pad("  1. add_balance — generate a Pix payment", w)}│`));
+  console.log(chalk.cyan(`  │${pad(`     Presets: ${presets}`, w)}│`));
   console.log(chalk.cyan(`  │${" ".repeat(w)}│`));
-  console.log(chalk.cyan(`  │${pad(`  2. Send USDC on ${usdcNetwork} to the address above`, w)}│`));
+  console.log(chalk.cyan(`  │${pad("  2. topup_credits — buy Conway credits", w)}│`));
+  console.log(chalk.cyan(`  │${pad("     from your BRL balance", w)}│`));
   console.log(chalk.cyan(`  │${" ".repeat(w)}│`));
   console.log(chalk.cyan(`  │${pad("  3. Fund via Conway Cloud dashboard", w)}│`));
   console.log(chalk.cyan(`  │${pad("     https://app.conway.tech", w)}│`));
   console.log(chalk.cyan(`  │${" ".repeat(w)}│`));
   console.log(chalk.cyan(`  │${pad("  The automaton will start now. Fund it anytime —", w)}│`));
-  console.log(chalk.cyan(`  │${pad("  the survival system handles zero-credit gracefully.", w)}│`));
+  console.log(chalk.cyan(`  │${pad("  the survival system handles zero balance gracefully.", w)}│`));
   console.log(chalk.cyan(`  ${"╰" + "─".repeat(w) + "╯"}`));
   console.log("");
 }

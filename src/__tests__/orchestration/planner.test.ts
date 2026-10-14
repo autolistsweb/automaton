@@ -7,6 +7,7 @@ import {
   type PlannerContext,
 } from "../../orchestration/planner.js";
 import type { Goal, TaskNode } from "../../orchestration/task-graph.js";
+import { formatBRL } from "../../payments/money.js";
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -50,7 +51,7 @@ const goal: Goal = {
 
 const context: PlannerContext = {
   creditsCents: 10000,
-  usdcBalance: 0,
+  balanceCents: 0,
   survivalTier: "stable",
   availableRoles: ["generalist"],
   customRoles: [],
@@ -263,7 +264,7 @@ describe("validatePlannerOutput", () => {
 describe("buildPlannerPrompt", () => {
   it("includes credit balance", () => {
     const prompt = buildPlannerPrompt(context);
-    expect(prompt).toContain("10000 cents");
+    expect(prompt).toContain(`Créditos: ${formatBRL(context.creditsCents)}`);
   });
 
   it("includes survival tier", () => {
@@ -364,22 +365,22 @@ describe("custom role validation", () => {
     const output = validOutput({
       customRoles: [
         {
-          name: "blockchain-indexer",
-          description: "Indexes blockchain events",
-          systemPrompt: "You are a blockchain indexer agent with deep expertise.",
+          name: "report-indexer",
+          description: "Indexes operational events",
+          systemPrompt: "You are a reporting agent with deep expertise.",
           allowedTools: ["bash", "web_search"],
           deniedTools: ["file_write"],
           model: "tier:fast",
           maxTokensPerTurn: 4096,
           maxTurnsPerTask: 10,
           treasuryLimits: { maxSingleTransfer: 100, maxDailySpend: 500 },
-          rationale: "No predefined role handles on-chain event indexing",
+          rationale: "No predefined role handles operational event indexing",
         },
       ],
     });
     const result = validatePlannerOutput(output);
     expect(result.customRoles).toHaveLength(1);
-    expect(result.customRoles[0].name).toBe("blockchain-indexer");
+    expect(result.customRoles[0].name).toBe("report-indexer");
     expect(result.customRoles[0].deniedTools).toEqual(["file_write"]);
     expect(result.customRoles[0].treasuryLimits?.maxSingleTransfer).toBe(100);
   });
