@@ -33,6 +33,13 @@ node dist/index.js --run
 
 On first run, the runtime launches an interactive setup wizard — generates an Ed25519 account identity, provisions an API key by signing a challenge, asks for a name, genesis prompt, and creator account id, then writes all config and starts the agent loop.
 
+Prefer a UI? Serve the local web dashboard (status, balance, activity log, chat):
+
+```bash
+node dist/index.js --web         # http://127.0.0.1:8080
+node dist/index.js --run --web   # dashboard + live agent (chat gets replies)
+```
+
 For automated sandbox provisioning:
 ```bash
 curl -fsSL https://conway.tech/automaton.sh | sh
@@ -144,6 +151,7 @@ src/
   social/           # Agent-to-agent communication
   state/            # SQLite database, persistence
   survival/         # Credit monitor, low-compute mode, survival tiers
+  web/              # Local web dashboard (status, activity, chat)
 packages/
   cli/              # Creator CLI (status, logs, fund)
 scripts/

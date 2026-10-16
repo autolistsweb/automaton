@@ -11,7 +11,7 @@ import fs from "fs";
 import path from "path";
 import { getAccount, getAutomatonDir } from "./identity/account.js";
 import { provision, loadApiKeyFromConfig } from "./identity/provision.js";
-import { loadConfig, resolvePath } from "./config.js";
+import { loadConfig, saveConfig, createConfig, resolvePath } from "./config.js";
 import { createDatabase } from "./state/database.js";
 import { createConwayClient } from "./conway/client.js";
 import { createInferenceClient } from "./conway/inference.js";
@@ -39,6 +39,8 @@ import { createPixPaymentService, startPixWebhookServer } from "./payments/index
 import { formatBRL } from "./payments/money.js";
 import type { WebhookServer } from "./payments/index.js";
 import { signRegistration } from "./registry/registration.js";
+import { startWebServer } from "./web/server.js";
+import type { WebServer } from "./web/server.js";
 
 const logger = createLogger("main");
 const VERSION = "0.2.1";
@@ -66,6 +68,8 @@ Usage:
   automaton --init         Initialize the account identity and config directory
   automaton --provision    Provision Conway API key via signed challenge
   automaton --status       Show current automaton status
+  automaton --web          Serve the local web dashboard (add --run for live chat)
+  automaton --port N       Port for the web dashboard (default 8080)
   automaton --version      Show version
   automaton --help         Show this help
 
@@ -73,6 +77,7 @@ Environment:
   CONWAY_API_URL           Conway API URL (default: https://api.conway.tech)
   CONWAY_API_KEY           Conway API key (overrides config)
   OLLAMA_BASE_URL          Ollama base URL (overrides config, e.g. http://localhost:11434)
+  WEB_PORT                 Web dashboard port (default: 8080)
 `);
     process.exit(0);
   }
@@ -123,15 +128,60 @@ Environment:
     process.exit(0);
   }
 
+  if (args.includes("--web") && !args.includes("--run")) {
+    StructuredLogger.setSink(prettySink);
+    await serveWeb(parseWebPort(args));
+    return;
+  }
+
   if (args.includes("--run")) {
     StructuredLogger.setSink(prettySink);
-    await run();
+    await run({ web: args.includes("--web"), webPort: parseWebPort(args) });
     return;
   }
 
   // Default: show help
   logger.info('Run "automaton --help" for usage information.');
   logger.info('Run "automaton --run" to start the automaton.');
+}
+
+function parseWebPort(args: string[]): number | undefined {
+  const index = args.indexOf("--port");
+  if (index === -1) return undefined;
+  const value = Number(args[index + 1]);
+  if (!Number.isInteger(value) || value < 0 || value > 65535) return undefined;
+  return value;
+}
+
+async function serveWeb(port?: number): Promise<void> {
+  let config = loadConfig();
+  if (!config) {
+    const { identity } = await getAccount();
+    config = createConfig({
+      name: "Automaton",
+      genesisPrompt:
+        "You are a sovereign AI agent running on the Conway runtime. Be concise and helpful.",
+      creatorAccountId: identity.accountId,
+      registeredWithConway: false,
+      sandboxId: "local-" + identity.accountId.replace(/^acct_/, "").slice(0, 12),
+      accountId: identity.accountId,
+      apiKey: process.env.CONWAY_API_KEY ?? "",
+    });
+    saveConfig(config);
+    logger.info("No configuration found — created a local default (run --setup to customize).");
+  }
+
+  const db = createDatabase(resolvePath(config.dbPath));
+  const web = await startWebServer({ config, db, port });
+  logger.info(`Web UI: ${web.url}`);
+
+  const shutdown = () => {
+    void web.close().catch(() => {});
+    db.close();
+    process.exit(0);
+  };
+  process.on("SIGINT", shutdown);
+  process.on("SIGTERM", shutdown);
 }
 
 // ─── Status Command ────────────────────────────────────────────
@@ -177,7 +227,7 @@ Version:    ${config.version}
 
 // ─── Main Run ──────────────────────────────────────────────────
 
-async function run(): Promise<void> {
+async function run(opts: { web?: boolean; webPort?: number } = {}): Promise<void> {
   logger.info(`[${new Date().toISOString()}] Conway Automaton v${VERSION} starting...`);
 
   // Load config — first run triggers interactive setup wizard
@@ -240,6 +290,22 @@ async function run(): Promise<void> {
       logger.warn(
         `[${new Date().toISOString()}] Pix webhook server not started: ${err.message}`,
       );
+    }
+  }
+
+  // Local web dashboard: status + chat. Chat messages are queued into the
+  // inbox and picked up by the agent loop below.
+  let webServer: WebServer | undefined;
+  if (opts.web) {
+    try {
+      webServer = await startWebServer({
+        config,
+        db,
+        port: opts.webPort,
+      });
+      logger.info(`Web UI: ${webServer.url}`);
+    } catch (err: any) {
+      logger.warn(`Web UI not started: ${err.message}`);
     }
   }
 
@@ -402,6 +468,7 @@ async function run(): Promise<void> {
     logger.info(`[${new Date().toISOString()}] Shutting down...`);
     heartbeat.stop();
     db.setAgentState("sleeping");
+    void webServer?.close().catch(() => {});
     void pixWebhook?.close().catch(() => {});
     db.close();
     process.exit(0);

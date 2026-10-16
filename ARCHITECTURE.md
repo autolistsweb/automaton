@@ -178,6 +178,9 @@ src/
     qr-code.ts             QR data URI rendering
     index.ts               Public exports
 
+  web/                     Local web dashboard
+    server.ts              HTTP server: dashboard page, /api/status, /api/turns, /api/chat
+
   heartbeat/               Background daemon
     daemon.ts              Daemon lifecycle (start/stop/forceRun)
     scheduler.ts           DurableScheduler (DB-backed, leased, cron)
@@ -905,6 +908,7 @@ index.ts
   |     +-> state/database
   +-> social/client
   +-> payments/{pix-payment-service, webhook-server}
+  +-> web/server
   +-> registry/registration
   +-> skills/loader
   +-> git/state-versioning

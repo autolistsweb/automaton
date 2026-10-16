@@ -196,6 +196,8 @@ node dist/index.js [command]
 | `--init` | Initialize the account identity and config directory |
 | `--provision` | Provision Conway API key via signed challenge |
 | `--status` | Show current automaton status |
+| `--web` | Serve the local web dashboard (add `--run` for live chat) |
+| `--port N` | Port for the web dashboard (default `8080`) |
 | `--version`, `-v` | Show version |
 | `--help`, `-h` | Show help |
 
@@ -206,6 +208,7 @@ node dist/index.js [command]
 | `CONWAY_API_URL` | Conway API URL (default: `https://api.conway.tech`) |
 | `CONWAY_API_KEY` | Conway API key (overrides config file) |
 | `OLLAMA_BASE_URL` | Ollama base URL (overrides config, e.g. `http://localhost:11434`) |
+| `WEB_PORT` | Web dashboard port (default: `8080`) |
 
 ### Status output
 
@@ -232,6 +235,18 @@ Version:    0.2.1
 ```
 
 `Tools` counts dynamically installed tools (MCP servers and similar additions — the 78 built-in tools are always available).
+
+### Web Dashboard
+
+```bash
+node dist/index.js --web              # dashboard only (http://127.0.0.1:8080)
+node dist/index.js --run --web        # dashboard + live agent
+node dist/index.js --web --port 3000  # custom port (or set WEB_PORT)
+```
+
+The dashboard is a self-contained page served by `src/web/server.ts` showing live status (state, turns, BRL balance, tools, skills, heartbeats, queued messages), the recent activity log, and a chat box. Chat messages are validated, queued into the inbox, and followed by a wake event — the agent loop picks them up and replies appear as new turns. A first `--web` run without an existing config creates a local default so the site works out of the box.
+
+Endpoints: `GET /`, `GET /api/status`, `GET /api/turns?limit=N` (1–50), `POST /api/chat` with `{"message": "…"}` (max 4000 chars). The server binds `127.0.0.1` only.
 
 ### Creator CLI
 
