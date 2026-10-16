@@ -10,19 +10,19 @@ import {
 import type { AutomatonDatabase, ChildAutomaton, InboxMessage } from "../../types.js";
 import { createInMemoryDb } from "./test-db.js";
 
-function createTestDb(options?: { address?: string; recipients?: string[] }): {
+function createTestDb(options?: { accountId?: string; recipients?: string[] }): {
   raw: BetterSqlite3.Database;
   db: AutomatonDatabase;
 } {
   const raw = createInMemoryDb();
 
-  raw.exec("ALTER TABLE inbox_messages ADD COLUMN to_address TEXT;");
+  raw.exec("ALTER TABLE inbox_messages ADD COLUMN to_account_id TEXT;");
   raw.exec("ALTER TABLE inbox_messages ADD COLUMN raw_content TEXT;");
   raw.exec("ALTER TABLE inbox_messages ADD COLUMN status TEXT DEFAULT 'received';");
   raw.exec("ALTER TABLE inbox_messages ADD COLUMN retry_count INTEGER DEFAULT 0;");
   raw.exec("ALTER TABLE inbox_messages ADD COLUMN max_retries INTEGER DEFAULT 3;");
 
-  const address = options?.address ?? "0xself";
+  const accountId = options?.accountId ?? "acct_0000000000000000";
   const recipients = options?.recipients ?? [];
 
   const getUnprocessedInboxMessages = (limit: number): InboxMessage[] => {
@@ -30,8 +30,8 @@ function createTestDb(options?: { address?: string; recipients?: string[] }): {
       "SELECT * FROM inbox_messages WHERE processed_at IS NULL ORDER BY received_at ASC LIMIT ?",
     ).all(limit) as Array<{
       id: string;
-      from_address: string;
-      to_address: string | null;
+      from_account_id: string;
+      to_account_id: string | null;
       content: string;
       received_at: string;
       reply_to: string | null;
@@ -39,8 +39,8 @@ function createTestDb(options?: { address?: string; recipients?: string[] }): {
 
     return rows.map((row) => ({
       id: row.id,
-      from: row.from_address,
-      to: row.to_address ?? "",
+      from: row.from_account_id,
+      to: row.to_account_id ?? "",
       content: row.content,
       signedAt: row.received_at,
       createdAt: row.received_at,
@@ -51,7 +51,7 @@ function createTestDb(options?: { address?: string; recipients?: string[] }): {
   const children: ChildAutomaton[] = recipients.map((entry, index) => ({
     id: `child-${index}`,
     name: `Child ${index}`,
-    address: entry as `0x${string}`,
+    accountId: entry,
     sandboxId: `sandbox-${index}`,
     genesisPrompt: "test",
     creatorMessage: "test",
@@ -62,7 +62,7 @@ function createTestDb(options?: { address?: string; recipients?: string[] }): {
 
   const db = {
     raw,
-    getIdentity: (key: string) => (key === "address" ? address : undefined),
+    getIdentity: (key: string) => (key === "accountId" ? accountId : undefined),
     getChildren: () => children,
     getUnprocessedInboxMessages,
     markInboxMessageProcessed: (id: string) => {
@@ -82,12 +82,12 @@ function insertInbox(raw: BetterSqlite3.Database, params: {
 }): void {
   raw.prepare(
     `INSERT INTO inbox_messages
-     (id, from_address, to_address, content, received_at, status, retry_count, max_retries)
+     (id, from_account_id, to_account_id, content, received_at, status, retry_count, max_retries)
      VALUES (?, ?, ?, ?, ?, 'received', 0, 3)`,
   ).run(
     params.id,
     params.from,
-    params.to ?? "0xself",
+    params.to ?? "acct_0000000000000000",
     params.content,
     params.receivedAt ?? new Date().toISOString(),
   );
@@ -97,8 +97,8 @@ function makeMessage(overrides: Partial<AgentMessage> = {}): AgentMessage {
   return {
     id: overrides.id ?? "msg-1",
     type: overrides.type ?? "alert",
-    from: overrides.from ?? "0xsender",
-    to: overrides.to ?? "0xreceiver",
+    from: overrides.from ?? "acct_5555555555555555",
+    to: overrides.to ?? "acct_6666666666666666",
     goalId: overrides.goalId ?? null,
     taskId: overrides.taskId ?? null,
     content: overrides.content ?? "payload",
@@ -121,29 +121,29 @@ describe("orchestration/messaging", () => {
 
   describe("LocalDBTransport", () => {
     it("deliver writes to inbox_messages", async () => {
-      const ctx = createTestDb({ address: "0xorigin" });
+      const ctx = createTestDb({ accountId: "acct_8888888888888888" });
       raw = ctx.raw;
       const transport = new LocalDBTransport(ctx.db);
 
-      await transport.deliver("0xtarget", "{\"hello\":\"world\"}");
+      await transport.deliver("acct_9999999999999999", "{\"hello\":\"world\"}");
 
       const row = raw.prepare(
-        "SELECT from_address, to_address, content, status FROM inbox_messages LIMIT 1",
-      ).get() as { from_address: string; to_address: string; content: string; status: string } | undefined;
+        "SELECT from_account_id, to_account_id, content, status FROM inbox_messages LIMIT 1",
+      ).get() as { from_account_id: string; to_account_id: string; content: string; status: string } | undefined;
 
       expect(row).toBeDefined();
-      expect(row?.from_address).toBe("0xorigin");
-      expect(row?.to_address).toBe("0xtarget");
+      expect(row?.from_account_id).toBe("acct_8888888888888888");
+      expect(row?.to_account_id).toBe("acct_9999999999999999");
       expect(row?.content).toBe('{"hello":"world"}');
       expect(row?.status).toBe("received");
     });
 
-    it("getRecipients returns known child addresses", () => {
-      const ctx = createTestDb({ recipients: ["0x1", "0x2"] });
+    it("getRecipients returns known child account ids", () => {
+      const ctx = createTestDb({ recipients: ["acct_0000000000000001", "acct_0000000000000002"] });
       raw = ctx.raw;
       const transport = new LocalDBTransport(ctx.db);
 
-      expect(transport.getRecipients()).toEqual(["0x1", "0x2"]);
+      expect(transport.getRecipients()).toEqual(["acct_0000000000000001", "acct_0000000000000002"]);
     });
   });
 
@@ -244,7 +244,7 @@ describe("orchestration/messaging", () => {
 
       insertInbox(raw, {
         id: `inbox-${type}`,
-        from: "0xfrom",
+        from: "acct_7777777777777777",
         content: JSON.stringify(makeMessage({ id: `m-${type}`, type })),
       });
 
@@ -262,7 +262,7 @@ describe("orchestration/messaging", () => {
       const message = makeMessage({ id: "enveloped", type: "alert", priority: "high" });
       insertInbox(raw, {
         id: "inbox-envelope",
-        from: "0xfrom",
+        from: "acct_7777777777777777",
         content: JSON.stringify({
           protocol: "colony_message_v1",
           sentAt: "2026-01-01T00:00:00.000Z",
@@ -282,12 +282,12 @@ describe("orchestration/messaging", () => {
 
       insertInbox(raw, {
         id: "inbox-low",
-        from: "0xfrom",
+        from: "acct_7777777777777777",
         content: JSON.stringify(makeMessage({ id: "low", priority: "low", createdAt: "2026-01-01T00:00:00.000Z" })),
       });
       insertInbox(raw, {
         id: "inbox-critical",
-        from: "0xfrom",
+        from: "acct_7777777777777777",
         content: JSON.stringify(makeMessage({ id: "critical", priority: "critical", createdAt: "2026-01-01T01:00:00.000Z" })),
       });
 
@@ -302,12 +302,12 @@ describe("orchestration/messaging", () => {
 
       insertInbox(raw, {
         id: "inbox-late",
-        from: "0xfrom",
+        from: "acct_7777777777777777",
         content: JSON.stringify(makeMessage({ id: "late", priority: "high", createdAt: "2026-01-01T02:00:00.000Z" })),
       });
       insertInbox(raw, {
         id: "inbox-early",
-        from: "0xfrom",
+        from: "acct_7777777777777777",
         content: JSON.stringify(makeMessage({ id: "early", priority: "high", createdAt: "2026-01-01T01:00:00.000Z" })),
       });
 
@@ -320,7 +320,7 @@ describe("orchestration/messaging", () => {
       raw = ctx.raw;
       const messaging = new ColonyMessaging({ deliver: vi.fn(), getRecipients: () => [] }, ctx.db);
 
-      insertInbox(raw, { id: "bad-json", from: "0xfrom", content: "{not-json}" });
+      insertInbox(raw, { id: "bad-json", from: "acct_7777777777777777", content: "{not-json}" });
       const processed = await messaging.processInbox();
 
       expect(processed).toHaveLength(1);
@@ -336,7 +336,7 @@ describe("orchestration/messaging", () => {
 
       insertInbox(raw, {
         id: "bad-shape",
-        from: "0xfrom",
+        from: "acct_7777777777777777",
         content: JSON.stringify({ id: "x", type: "alert", from: "a", to: "b", content: "x", priority: "urgent" }),
       });
 
@@ -352,7 +352,7 @@ describe("orchestration/messaging", () => {
 
       insertInbox(raw, {
         id: "expired",
-        from: "0xfrom",
+        from: "acct_7777777777777777",
         content: JSON.stringify(makeMessage({
           id: "expired-msg",
           expiresAt: "2000-01-01T00:00:00.000Z",
@@ -369,7 +369,7 @@ describe("orchestration/messaging", () => {
       raw = ctx.raw;
       const messaging = new ColonyMessaging({ deliver: vi.fn(), getRecipients: () => [] }, ctx.db);
 
-      insertInbox(raw, { id: "m1", from: "0xfrom", content: "not-json" });
+      insertInbox(raw, { id: "m1", from: "acct_7777777777777777", content: "not-json" });
       await messaging.processInbox();
 
       const row = raw.prepare("SELECT processed_at FROM inbox_messages WHERE id = 'm1'").get() as {
@@ -388,7 +388,7 @@ describe("orchestration/messaging", () => {
 
       insertInbox(raw, {
         id: "m-alert",
-        from: "0xfrom",
+        from: "acct_7777777777777777",
         content: JSON.stringify(makeMessage({ id: "msg-alert", type: "alert" })),
       });
 
@@ -405,12 +405,12 @@ describe("orchestration/messaging", () => {
 
   describe("broadcast and message construction", () => {
     it("broadcast sends to all recipients", async () => {
-      const ctx = createTestDb({ recipients: ["0xa", "0xb", "0xc"], address: "0xself" });
+      const ctx = createTestDb({ recipients: ["acct_000000000000000a", "acct_000000000000000b", "acct_000000000000000c"], accountId: "acct_0000000000000000" });
       raw = ctx.raw;
 
       const transport: MessageTransport = {
         deliver: vi.fn().mockResolvedValue(undefined),
-        getRecipients: () => ["0xa", "0xb", "0xc"],
+        getRecipients: () => ["acct_000000000000000a", "acct_000000000000000b", "acct_000000000000000c"],
       };
 
       const messaging = new ColonyMessaging(transport, ctx.db);
@@ -420,7 +420,7 @@ describe("orchestration/messaging", () => {
       const envelopes = (transport.deliver as ReturnType<typeof vi.fn>).mock.calls
         .map((call) => JSON.parse(call[1]) as { message: AgentMessage });
 
-      expect(envelopes.map((entry) => entry.message.to).sort()).toEqual(["0xa", "0xb", "0xc"]);
+      expect(envelopes.map((entry) => entry.message.to).sort()).toEqual(["acct_000000000000000a", "acct_000000000000000b", "acct_000000000000000c"]);
       expect(envelopes.every((entry) => entry.message.type === "alert")).toBe(true);
       expect(envelopes.every((entry) => entry.message.priority === "critical")).toBe(true);
     });
@@ -439,17 +439,17 @@ describe("orchestration/messaging", () => {
     });
 
     it("createMessage fills defaults", () => {
-      const ctx = createTestDb({ address: "0xcreator" });
+      const ctx = createTestDb({ accountId: "acct_aaaaaaaaaaaaaaaa" });
       raw = ctx.raw;
       const messaging = new ColonyMessaging({ deliver: vi.fn(), getRecipients: () => [] }, ctx.db);
 
       const msg = messaging.createMessage({
         type: "peer_query",
-        to: "0xtarget",
+        to: "acct_9999999999999999",
         content: "question",
       });
 
-      expect(msg.from).toBe("0xcreator");
+      expect(msg.from).toBe("acct_aaaaaaaaaaaaaaaa");
       expect(msg.goalId).toBeNull();
       expect(msg.taskId).toBeNull();
       expect(msg.priority).toBe("normal");
@@ -458,13 +458,13 @@ describe("orchestration/messaging", () => {
     });
 
     it("createMessage respects explicit overrides", () => {
-      const ctx = createTestDb({ address: "0xcreator" });
+      const ctx = createTestDb({ accountId: "acct_aaaaaaaaaaaaaaaa" });
       raw = ctx.raw;
       const messaging = new ColonyMessaging({ deliver: vi.fn(), getRecipients: () => [] }, ctx.db);
 
       const msg = messaging.createMessage({
         type: "resource_request",
-        to: "0xtarget",
+        to: "acct_9999999999999999",
         content: "need resource",
         goalId: "goal-1",
         taskId: "task-1",

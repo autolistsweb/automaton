@@ -1,4 +1,5 @@
 import path from "node:path";
+import { formatBRL } from "../../payments/money.js";
 import type { TaskGraphRow } from "../../state/database.js";
 import { getTaskById, getTasksByGoal } from "../../state/database.js";
 import { loadPlan } from "../../orchestration/plan-mode.js";
@@ -400,7 +401,7 @@ You follow a strict planner-backed plan → execute → verify → fix cycle:
     const plannerContext = await buildPlannerContext({
       db: this.context.db,
       workspace: this.context.workspace,
-      usdcBalance: Number((this.context.config as { usdcBalance?: number } | undefined)?.usdcBalance ?? 0),
+      balanceCents: Number((this.context.config as { balanceCents?: number } | undefined)?.balanceCents ?? 0),
       availableRoles: ["executor", "researcher", "tester", "generalist", "orchestrator", "critic"],
       idleAgents: 0,
       busyAgents: Math.max(1, this.getManagedTasks().filter((task) => task.status === "assigned" || task.status === "running").length),
@@ -549,7 +550,7 @@ function formatPlanSummary(plan: PlannerOutput): string {
   const lines = [
     `Strategy: ${plan.strategy}`,
     `Analysis: ${plan.analysis}`,
-    `Estimated cost: ${plan.estimatedTotalCostCents} cents`,
+    `Estimated cost: ${formatBRL(plan.estimatedTotalCostCents)}`,
     `Estimated time: ${plan.estimatedTimeMinutes} minutes`,
     `Risks: ${plan.risks.length > 0 ? plan.risks.join("; ") : "none"}`,
     "",

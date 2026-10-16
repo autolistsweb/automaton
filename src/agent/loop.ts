@@ -36,7 +36,7 @@ import {
 } from "./tools.js";
 import { sanitizeInput } from "./injection-defense.js";
 import { getSurvivalTier } from "../conway/credits.js";
-import { getUsdcBalance } from "../conway/x402.js";
+import { formatBRL } from "../payments/money.js";
 import {
   claimInboxMessages,
   markInboxProcessed,
@@ -207,14 +207,14 @@ export async function runAgentLoop(
         messaging,
         inference: unifiedInference,
         identity,
-        isWorkerAlive: (address: string) => {
-          if (address.startsWith("local://")) {
-            return initializedWorkerPool.hasWorker(address);
+        isWorkerAlive: (agentId: string) => {
+          if (agentId.startsWith("local://")) {
+            return initializedWorkerPool.hasWorker(agentId);
           }
           // Remote workers: check children table
           const child = db.raw.prepare(
-            "SELECT status FROM children WHERE sandbox_id = ? OR address = ?",
-          ).get(address, address) as { status: string } | undefined;
+            "SELECT status FROM children WHERE sandbox_id = ? OR account_id = ?",
+          ).get(agentId, agentId) as { status: string } | undefined;
           if (!child) return false;
           return !["failed", "dead", "cleaned_up"].includes(child.status);
         },
@@ -237,7 +237,8 @@ export async function runAgentLoop(
               const child = await spawnChild(conway, identity, db, genesis, lifecycle);
 
               return {
-                address: child.address,
+                accountId: child.accountId,
+                address: child.accountId,
                 name: child.name,
                 sandboxId: child.sandboxId,
               };
@@ -257,14 +258,14 @@ export async function runAgentLoop(
                   try {
                     const { topupForSandbox } = await import("../conway/topup.js");
                     const topupResult = await topupForSandbox({
-                      apiUrl: config.conwayApiUrl,
-                      account: identity.account,
+                      db: db.raw,
+                      userId: identity.accountId,
+                      conway,
                       error: sandboxError,
-                      chainType: config.chainType || identity.chainType || "evm",
                     });
 
                     if (topupResult?.success) {
-                      logger.info(`Sandbox topup succeeded ($${topupResult.amountUsd}), retrying spawn`, {
+                      logger.info(`Sandbox topup succeeded (${formatBRL(topupResult.amountCents)}), retrying spawn`, {
                         taskId: task.id,
                       });
                       // Retry spawn once after successful topup
@@ -281,7 +282,8 @@ export async function runAgentLoop(
                         const retryLifecycle = new RetryLifecycle(db.raw);
                         const child = await retrySpawn(conway, identity, db, retryGenesis, retryLifecycle);
                         return {
-                          address: child.address,
+                          accountId: child.accountId,
+                          address: child.accountId,
                           name: child.name,
                           sandboxId: child.sandboxId,
                         };
@@ -358,7 +360,7 @@ export async function runAgentLoop(
   onStateChange?.("waking");
 
   // Get financial state
-  let financial = await getFinancialState(conway, identity.address, db, config.chainType || identity.chainType || "evm");
+  let financial = await getFinancialState(conway, db, identity.accountId);
 
   // Check if this is the first run
   const isFirstRun = db.getTurnCount() === 0;
@@ -375,7 +377,7 @@ export async function runAgentLoop(
   db.setAgentState("running");
   onStateChange?.("running");
 
-  log(config, `[WAKE UP] ${config.name} is alive. Credits: $${(financial.creditsCents / 100).toFixed(2)}`);
+  log(config, `[WAKE UP] ${config.name} is alive. Credits: ${formatBRL(financial.creditsCents)} | Balance: ${formatBRL(financial.balanceCents)}`);
 
   // ─── The Loop ──────────────────────────────────────────────
 
@@ -426,7 +428,7 @@ export async function runAgentLoop(
       }
 
       // Refresh financial state periodically
-      financial = await getFinancialState(conway, identity.address, db, config.chainType || identity.chainType || "evm");
+      financial = await getFinancialState(conway, db, identity.accountId);
 
       // Check survival tier
       // api_unreachable: creditsCents === -1 means API failed with no cache.
@@ -437,11 +439,11 @@ export async function runAgentLoop(
       } else {
         const tier = getSurvivalTier(financial.creditsCents);
 
-        // Inline auto-topup: if credits are critically low and USDC is
+        // Inline auto-topup: if credits are critically low and BRL balance is
         // available, buy credits NOW — before attempting inference.
         // This prevents the agent from dying mid-loop while waiting for
         // the heartbeat to fire. Uses a 60s cooldown to avoid hammering.
-        if ((tier === "critical" || tier === "low_compute") && financial.usdcBalance >= 5) {
+        if ((tier === "critical" || tier === "low_compute") && financial.balanceCents >= 5) {
           const INLINE_TOPUP_COOLDOWN_MS = 60_000;
           const lastInlineTopup = db.getKV("last_inline_topup_attempt");
           const cooldownExpired = !lastInlineTopup ||
@@ -452,16 +454,16 @@ export async function runAgentLoop(
             try {
               const { bootstrapTopup } = await import("../conway/topup.js");
               const topupResult = await bootstrapTopup({
-                apiUrl: config.conwayApiUrl,
-                account: identity.account,
+                db: db.raw,
+                userId: identity.accountId,
+                conway,
                 creditsCents: financial.creditsCents,
-                chainType: config.chainType || identity.chainType || "evm",
               });
               if (topupResult?.success) {
-                log(config, `[AUTO-TOPUP] Bought $${topupResult.amountUsd} credits from USDC mid-loop`);
+                log(config, `[AUTO-TOPUP] Bought ${formatBRL(topupResult.amountCents)} of credits from balance mid-loop`);
                 // Re-fetch financial state after topup so the rest of
                 // the turn sees the updated balance.
-                financial = await getFinancialState(conway, identity.address, db, config.chainType || identity.chainType || "evm");
+                financial = await getFinancialState(conway, db, identity.accountId);
               }
             } catch (err: any) {
               logger.warn(`Inline auto-topup failed: ${err.message}`);
@@ -543,7 +545,7 @@ export async function runAgentLoop(
         const localWorkersActive = workerPool?.getActiveCount() ?? 0;
         const hasSelfAssignedParentTask = !!db.raw.prepare(
           `SELECT 1 FROM task_graph WHERE assigned_to = ? AND status IN ('assigned', 'running') LIMIT 1`,
-        ).get(identity.address);
+        ).get(identity.accountId);
 
         if (
           orchestratorTick.phase === "executing" &&
@@ -835,14 +837,14 @@ export async function runAgentLoop(
       // Use a blocklist of mutating tools rather than an allowlist of safe ones.
       const MUTATING_TOOLS = new Set([
         "exec", "write_file", "edit_own_file", "transfer_credits", "topup_credits", "fund_child",
-        "spawn_child", "start_child", "delete_sandbox", "create_sandbox",
+        "add_balance", "spawn_child", "start_child", "delete_sandbox", "create_sandbox",
         "install_npm_package", "install_mcp_server", "install_skill",
         "create_skill", "remove_skill", "install_skill_from_git",
         "install_skill_from_url", "pull_upstream", "git_commit", "git_push",
         "git_branch", "git_clone", "send_message", "message_child",
-        "register_domain", "register_erc8004", "give_feedback",
+        "register_domain", "register_agent", "give_feedback",
         "update_genesis_prompt", "update_agent_card", "modify_heartbeat",
-        "expose_port", "remove_port", "x402_fetch", "manage_dns",
+        "expose_port", "remove_port", "web_fetch", "manage_dns",
         "distress_signal", "prune_dead_children", "sleep",
         "update_soul", "remember_fact", "set_goal", "complete_goal",
         "save_procedure", "note_about_agent", "forget",
@@ -939,18 +941,17 @@ export async function runAgentLoop(
 // ─── Helpers ───────────────────────────────────────────────────
 
 // Cache last known good balances so transient API failures don't
-// cause the automaton to believe it has $0 and kill itself.
+// cause the automaton to believe its balance is zero and kill itself.
 let _lastKnownCredits = 0;
-let _lastKnownUsdc = 0;
+let _lastKnownBalance = 0;
 
 async function getFinancialState(
   conway: ConwayClient,
-  address: string,
-  db?: AutomatonDatabase,
-  chainType?: string,
+  db: AutomatonDatabase,
+  accountId: string,
 ): Promise<FinancialState> {
   let creditsCents = _lastKnownCredits;
-  let usdcBalance = _lastKnownUsdc;
+  let balanceCents = _lastKnownBalance;
 
   try {
     creditsCents = await conway.getCreditsBalance();
@@ -966,7 +967,7 @@ async function getFinancialState(
           logger.warn("Balance API failed, using cached balance");
           return {
             creditsCents: parsed.creditsCents ?? 0,
-            usdcBalance: parsed.usdcBalance ?? 0,
+            balanceCents: parsed.balanceCents ?? 0,
             lastChecked: new Date().toISOString(),
           };
         } catch (parseError) {
@@ -978,17 +979,16 @@ async function getFinancialState(
     logger.error("Balance API failed, no cache available");
     return {
       creditsCents: -1,
-      usdcBalance: -1,
+      balanceCents: -1,
       lastChecked: new Date().toISOString(),
     };
   }
 
   try {
-    const network = chainType === "solana" ? "solana:mainnet" : "eip155:8453";
-    usdcBalance = await getUsdcBalance(address, network, chainType as any);
-    if (usdcBalance > 0) _lastKnownUsdc = usdcBalance;
+    balanceCents = db.getBalanceCents(accountId);
+    if (balanceCents > 0) _lastKnownBalance = balanceCents;
   } catch (error) {
-    logger.error("USDC balance fetch failed", error instanceof Error ? error : undefined);
+    logger.error("BRL balance fetch failed", error instanceof Error ? error : undefined);
   }
 
   // Cache successful balance reads
@@ -996,7 +996,7 @@ async function getFinancialState(
     try {
       db.setKV(
         "last_known_balance",
-        JSON.stringify({ creditsCents, usdcBalance }),
+        JSON.stringify({ creditsCents, balanceCents }),
       );
     } catch (error) {
       logger.error("Failed to cache balance", error instanceof Error ? error : undefined);
@@ -1005,7 +1005,7 @@ async function getFinancialState(
 
   return {
     creditsCents,
-    usdcBalance,
+    balanceCents,
     lastChecked: new Date().toISOString(),
   };
 }

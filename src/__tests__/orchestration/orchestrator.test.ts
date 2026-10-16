@@ -12,9 +12,8 @@ import { createInMemoryDb } from "./test-db.js";
 
 const IDENTITY = {
   name: "test",
-  address: "0x1234" as any,
-  account: {} as any,
-  creatorAddress: "0x0000" as any,
+  accountId: "acct_1234567890abcdef1234" as any,
+  creatorAccountId: "acct_abcdefabcdefabcd1234" as any,
   sandboxId: "sb-1",
   apiKey: "key",
   createdAt: "2026-01-01T00:00:00Z",
@@ -60,7 +59,7 @@ function makeMessaging(_raw: BetterSqlite3.Database): {
 
   const automataDb = {
     raw: _raw,
-    getIdentity: (key: string) => (key === "address" ? "0x1234" : undefined),
+    getIdentity: (key: string) => (key === "accountId" ? "acct_1234567890abcdef1234" : undefined),
     getChildren: () => [],
     getUnprocessedInboxMessages: (_limit: number) => [],
     markInboxMessageProcessed: (_id: string) => {},
@@ -345,13 +344,13 @@ describe("orchestration/Orchestrator", () => {
       const goalId = insertGoal(db);
       const agentTracker = makeAgentTracker({
         getIdle: vi.fn().mockReturnValue([
-          { address: "0xspecialist", name: "Specialist", role: "researcher", status: "healthy" },
-          { address: "0xgeneralist", name: "Generalist", role: "generalist", status: "healthy" },
+          { address: "acct_1111111111111111", name: "Specialist", role: "researcher", status: "healthy" },
+          { address: "acct_2222222222222222", name: "Generalist", role: "generalist", status: "healthy" },
         ]),
       });
       const orc = makeOrchestrator(db, { agentTracker });
       const result = await orc.matchTaskToAgent(makeTask(goalId, { agentRole: "researcher" }));
-      expect(result.agentAddress).toBe("0xspecialist");
+      expect(result.agentId).toBe("acct_1111111111111111");
       expect(result.spawned).toBe(false);
     });
 
@@ -359,11 +358,11 @@ describe("orchestration/Orchestrator", () => {
       const goalId = insertGoal(db);
       const agentTracker = makeAgentTracker({
         getIdle: vi.fn().mockReturnValue([]),
-        getBestForTask: vi.fn().mockReturnValue({ address: "0xbest", name: "Best" }),
+        getBestForTask: vi.fn().mockReturnValue({ address: "acct_3333333333333333", name: "Best" }),
       });
       const orc = makeOrchestrator(db, { agentTracker });
       const result = await orc.matchTaskToAgent(makeTask(goalId));
-      expect(result.agentAddress).toBe("0xbest");
+      expect(result.agentId).toBe("acct_3333333333333333");
       expect(result.spawned).toBe(false);
     });
 
@@ -373,13 +372,13 @@ describe("orchestration/Orchestrator", () => {
         getIdle: vi.fn().mockReturnValue([]),
         getBestForTask: vi.fn().mockReturnValue(null),
       });
-      const spawnAgent = vi.fn().mockResolvedValue({ address: "0xspawned", name: "Spawned", sandboxId: "sb-2" });
+      const spawnAgent = vi.fn().mockResolvedValue({ address: "acct_4444444444444444", name: "Spawned", sandboxId: "sb-2" });
       const orc = makeOrchestrator(db, {
         agentTracker,
         config: { spawnAgent },
       });
       const result = await orc.matchTaskToAgent(makeTask(goalId));
-      expect(result.agentAddress).toBe("0xspawned");
+      expect(result.agentId).toBe("acct_4444444444444444");
       expect(result.spawned).toBe(true);
       expect(spawnAgent).toHaveBeenCalledTimes(1);
       expect(agentTracker.register).toHaveBeenCalled();
@@ -389,8 +388,8 @@ describe("orchestration/Orchestrator", () => {
       const goalId = insertGoal(db);
       // Insert a running child into the DB
       db.prepare(
-        "INSERT INTO children (id, name, address, sandbox_id, genesis_prompt, creator_message, funded_amount_cents, status, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-      ).run(ulid(), "BusyAgent", "0xbusy", "sb-3", "prompt", "msg", 0, "running", new Date().toISOString());
+        "INSERT INTO children (id, name, account_id, sandbox_id, genesis_prompt, creator_message, funded_amount_cents, status, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+      ).run(ulid(), "BusyAgent", "acct_5555555555555555", "sb-3", "prompt", "msg", 0, "running", new Date().toISOString());
 
       const agentTracker = makeAgentTracker({
         getIdle: vi.fn().mockReturnValue([]),
@@ -401,7 +400,7 @@ describe("orchestration/Orchestrator", () => {
         config: { disableSpawn: true },
       });
       const result = await orc.matchTaskToAgent(makeTask(goalId));
-      expect(result.agentAddress).toBe("0xbusy");
+      expect(result.agentId).toBe("acct_5555555555555555");
       expect(result.spawned).toBe(false);
     });
 
@@ -418,7 +417,7 @@ describe("orchestration/Orchestrator", () => {
       // When no child agents are available, matchTaskToAgent falls back to
       // self-assigning the task to the parent identity.
       const result = await orc.matchTaskToAgent(makeTask(goalId));
-      expect(result.agentAddress).toBe(IDENTITY.address);
+      expect(result.agentId).toBe(IDENTITY.accountId);
       expect(result.agentName).toBe(IDENTITY.name);
       expect(result.spawned).toBe(false);
     });
@@ -457,15 +456,15 @@ describe("orchestration/Orchestrator", () => {
       const goalId = insertGoal(db);
       const funding = makeFunding();
       const orc = makeOrchestrator(db, { funding, config: { defaultTaskFundingCents: 25 } });
-      await orc.fundAgentForTask("0xagent", makeTaskWithCost(goalId, 0));
-      expect(funding.fundChild).toHaveBeenCalledWith("0xagent", 25);
+      await orc.fundAgentForTask("acct_6666666666666666", makeTaskWithCost(goalId, 0));
+      expect(funding.fundChild).toHaveBeenCalledWith("acct_6666666666666666", 25);
     });
 
     it("skips funding when estimated amount and default are both 0", async () => {
       const goalId = insertGoal(db);
       const funding = makeFunding();
       const orc = makeOrchestrator(db, { funding, config: { defaultTaskFundingCents: 0 } });
-      await orc.fundAgentForTask("0xagent", makeTaskWithCost(goalId, 0));
+      await orc.fundAgentForTask("acct_6666666666666666", makeTaskWithCost(goalId, 0));
       expect(funding.fundChild).not.toHaveBeenCalled();
     });
 
@@ -475,8 +474,8 @@ describe("orchestration/Orchestrator", () => {
         fundChild: vi.fn().mockResolvedValue({ success: false }),
       });
       const orc = makeOrchestrator(db, { funding, config: { defaultTaskFundingCents: 25 } });
-      await expect(orc.fundAgentForTask("0xagent", makeTaskWithCost(goalId, 25))).rejects.toThrow(
-        "Funding transfer failed for 0xagent",
+      await expect(orc.fundAgentForTask("acct_6666666666666666", makeTaskWithCost(goalId, 25))).rejects.toThrow(
+        "Funding transfer failed for acct_6666666666666666",
       );
     });
   });
@@ -492,8 +491,8 @@ describe("orchestration/Orchestrator", () => {
         message: {
           id: ulid(),
           type: msg.type,
-          from: "0xagent",
-          to: "0x1234",
+          from: "acct_6666666666666666",
+          to: "acct_1234567890abcdef1234",
           goalId: null,
           taskId: null,
           content: msg.content,
@@ -551,8 +550,8 @@ describe("orchestration/Orchestrator", () => {
         message: {
           id: ulid(),
           type: msg.type,
-          from: "0xagent",
-          to: "0x1234",
+          from: "acct_6666666666666666",
+          to: "acct_1234567890abcdef1234",
           goalId: null,
           taskId: null,
           content: msg.content,
@@ -584,7 +583,7 @@ describe("orchestration/Orchestrator", () => {
         title: "Failing Task",
         description: "This task fails",
         status: "running" as const,
-        assignedTo: "0xagent",
+        assignedTo: "acct_6666666666666666",
         agentRole: "generalist",
         priority: 50,
         dependencies: [],

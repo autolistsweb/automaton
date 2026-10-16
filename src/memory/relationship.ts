@@ -3,7 +3,7 @@
  *
  * Tracks relationships with other agents/entities.
  * Maintains trust scores, interaction counts, and notes.
- * Upserts on entityAddress.
+ * Upserts on entityId.
  */
 
 import type BetterSqlite3 from "better-sqlite3";
@@ -18,11 +18,11 @@ export class RelationshipMemoryManager {
   constructor(private db: Database) {}
 
   /**
-   * Record a relationship. Upserts on entityAddress.
+   * Record a relationship. Upserts on entityId.
    * Returns the ULID id.
    */
   record(entry: {
-    entityAddress: string;
+    entityId: string;
     entityName?: string | null;
     relationshipType: string;
     trustScore?: number;
@@ -31,9 +31,9 @@ export class RelationshipMemoryManager {
     const id = ulid();
     try {
       this.db.prepare(
-        `INSERT INTO relationship_memory (id, entity_address, entity_name, relationship_type, trust_score, notes)
+        `INSERT INTO relationship_memory (id, entity_id, entity_name, relationship_type, trust_score, notes)
          VALUES (?, ?, ?, ?, ?, ?)
-         ON CONFLICT(entity_address) DO UPDATE SET
+         ON CONFLICT(entity_id) DO UPDATE SET
            entity_name = COALESCE(excluded.entity_name, relationship_memory.entity_name),
            relationship_type = excluded.relationship_type,
            trust_score = excluded.trust_score,
@@ -41,7 +41,7 @@ export class RelationshipMemoryManager {
            updated_at = datetime('now')`,
       ).run(
         id,
-        entry.entityAddress,
+        entry.entityId,
         entry.entityName ?? null,
         entry.relationshipType,
         entry.trustScore ?? 0.5,
@@ -56,11 +56,11 @@ export class RelationshipMemoryManager {
   /**
    * Get a relationship by entity address.
    */
-  get(entityAddress: string): RelationshipMemoryEntry | undefined {
+  get(entityId: string): RelationshipMemoryEntry | undefined {
     try {
       const row = this.db.prepare(
-        "SELECT * FROM relationship_memory WHERE entity_address = ?",
-      ).get(entityAddress) as any | undefined;
+        "SELECT * FROM relationship_memory WHERE entity_id = ?",
+      ).get(entityId) as any | undefined;
       return row ? deserializeRelationship(row) : undefined;
     } catch (error) {
       logger.error("Failed to get", error instanceof Error ? error : undefined);
@@ -71,15 +71,15 @@ export class RelationshipMemoryManager {
   /**
    * Record an interaction with an entity. Increments counter and updates timestamp.
    */
-  recordInteraction(entityAddress: string): void {
+  recordInteraction(entityId: string): void {
     try {
       this.db.prepare(
         `UPDATE relationship_memory
          SET interaction_count = interaction_count + 1,
              last_interaction_at = datetime('now'),
              updated_at = datetime('now')
-         WHERE entity_address = ?`,
-      ).run(entityAddress);
+         WHERE entity_id = ?`,
+      ).run(entityId);
     } catch (error) {
       logger.error("Failed to record interaction", error instanceof Error ? error : undefined);
     }
@@ -88,14 +88,14 @@ export class RelationshipMemoryManager {
   /**
    * Update trust score by a delta. Clamps to 0.0-1.0 range.
    */
-  updateTrust(entityAddress: string, delta: number): void {
+  updateTrust(entityId: string, delta: number): void {
     try {
       this.db.prepare(
         `UPDATE relationship_memory
          SET trust_score = MAX(0.0, MIN(1.0, trust_score + ?)),
              updated_at = datetime('now')
-         WHERE entity_address = ?`,
-      ).run(delta, entityAddress);
+         WHERE entity_id = ?`,
+      ).run(delta, entityId);
     } catch (error) {
       logger.error("Failed to update trust", error instanceof Error ? error : undefined);
     }
@@ -119,9 +119,9 @@ export class RelationshipMemoryManager {
   /**
    * Delete a relationship by entity address.
    */
-  delete(entityAddress: string): void {
+  delete(entityId: string): void {
     try {
-      this.db.prepare("DELETE FROM relationship_memory WHERE entity_address = ?").run(entityAddress);
+      this.db.prepare("DELETE FROM relationship_memory WHERE entity_id = ?").run(entityId);
     } catch (error) {
       logger.error("Failed to delete", error instanceof Error ? error : undefined);
     }
@@ -131,7 +131,7 @@ export class RelationshipMemoryManager {
 function deserializeRelationship(row: any): RelationshipMemoryEntry {
   return {
     id: row.id,
-    entityAddress: row.entity_address,
+    entityId: row.entity_id,
     entityName: row.entity_name ?? null,
     relationshipType: row.relationship_type,
     trustScore: row.trust_score,

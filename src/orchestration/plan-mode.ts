@@ -46,7 +46,7 @@ export type ReplanTrigger =
   | { type: "budget_breach"; actualCents: number; estimatedCents: number }
   | { type: "requirement_change"; newInput: string; conflictScore: number }
   | { type: "environment_change"; resource: string; error: string }
-  | { type: "opportunity"; suggestion: string; agentAddress: string };
+  | { type: "opportunity"; suggestion: string; agentId: string };
 
 const TRANSITIONS: Record<ExecutionPhase, ReadonlySet<ExecutionPhase>> = {
   idle: new Set(["classifying"]),

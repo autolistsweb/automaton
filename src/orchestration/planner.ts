@@ -1,6 +1,7 @@
 import type { Goal, TaskNode } from "./task-graph.js";
 import { UnifiedInferenceClient } from "../inference/inference-client.js";
 import type { ModelTier } from "../inference/provider-registry.js";
+import { formatBRL } from "../payments/money.js";
 
 export interface PlannerOutput {
   analysis: string;
@@ -40,7 +41,7 @@ export interface PlannedTask {
 
 export interface PlannerContext {
   creditsCents: number;
-  usdcBalance: number;
+  balanceCents: number;
   survivalTier: string;
   availableRoles: string[];
   customRoles: string[];
@@ -215,8 +216,8 @@ export function buildPlannerPrompt(context: PlannerContext): string {
   const marketIntel = context.marketIntel.trim().length > 0 ? context.marketIntel.trim() : "none";
   const modelHints = MODEL_TIERS.map((tier) => `tier:${tier}`).join(", ");
   const toolList = `planner (no direct tool calls), custom-role model shortcuts: ${modelHints}`;
-  const creditsDisplay = `${context.creditsCents} cents`;
-  const usdcDisplay = Number.isFinite(context.usdcBalance) ? String(context.usdcBalance) : "0";
+  const creditsDisplay = formatBRL(Number.isFinite(context.creditsCents) ? context.creditsCents : 0);
+  const balanceDisplay = formatBRL(Number.isFinite(context.balanceCents) ? context.balanceCents : 0);
 
   return `# Planner Agent
 
@@ -295,7 +296,7 @@ RECEIVE -> ANALYZE -> DECOMPOSE -> VALIDATE -> OUTPUT
 
 <context>
 You have access to (injected at runtime):
-- Current financial state: ${creditsDisplay} credits, ${usdcDisplay} USDC
+- Current financial state: Saldo: ${balanceDisplay} | Créditos: ${creditsDisplay}
 - Survival tier: ${context.survivalTier} (critical/low/stable/comfortable)
 - Available predefined roles: ${roleList} (26 roles across 7 departments)
 - Previously created custom roles: ${customRoleList}
@@ -353,7 +354,7 @@ If no predefined role fits a task, you MUST define a custom role in the
 \`customRoles\` array. Do NOT assign a task to a poorly-fitting predefined role.
 
 When defining a custom role:
-- Give it a clear, specific name (e.g., "blockchain-indexer-specialist")
+- Give it a clear, specific name (e.g., "invoice-reconciliation-specialist")
 - Write a focused system prompt tailored to the exact task, following the same
   format as predefined roles: identity, mission, capabilities, constraints,
   output format, anti-patterns, circuit breakers
@@ -366,7 +367,7 @@ When defining a custom role:
   unambiguous, short enough to fit in context)
 
 Common custom role patterns:
-- **Domain specialist**: Deep expertise in a narrow area (e.g., "solidity-auditor",
+- **Domain specialist**: Deep expertise in a narrow area (e.g., "compliance-auditor",
   "seo-optimizer", "email-deliverability-engineer")
 - **Integration agent**: Bridges two systems (e.g., "stripe-conway-bridge",
   "github-deployment-agent")

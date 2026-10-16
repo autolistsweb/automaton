@@ -60,7 +60,7 @@ function createTestDb(): Database.Database {
     );
     CREATE TABLE IF NOT EXISTS inbox_messages (
       id TEXT PRIMARY KEY,
-      from_address TEXT NOT NULL,
+      from_account_id TEXT NOT NULL,
       content TEXT NOT NULL,
       received_at TEXT NOT NULL DEFAULT (datetime('now')),
       processed_at TEXT,
@@ -84,8 +84,8 @@ function makeValidSoul(overrides: Partial<SoulModel> = {}): SoulModel {
     version: 1,
     updatedAt: new Date().toISOString(),
     name: "TestBot",
-    address: "0x1234",
-    creator: "0xABCD",
+    accountId: "acct_1234567890abcdef1234",
+    creator: "acct_abcdefabcdefabcd1234",
     bornAt: new Date().toISOString(),
     constitutionHash: "",
     genesisPromptOriginal: "Be helpful and survive",
@@ -111,8 +111,8 @@ format: soul/v1
 version: 3
 updated_at: 2026-01-15T12:00:00.000Z
 name: TestAgent
-address: 0x1234567890abcdef
-creator: 0xABCDEF1234567890
+account_id: acct_1234567890abcdef1234
+creator: acct_abcdefabcdefabcd1234
 born_at: 2026-01-01T00:00:00.000Z
 constitution_hash: abc123
 genesis_alignment: 0.8500
@@ -147,7 +147,7 @@ Focus on web development services
 Shell access, web APIs
 
 ## Relationships
-Creator: 0xABCDEF1234567890
+Creator: acct_abcdefabcdefabcd1234
 
 ## Financial Character
 Conservative spender
@@ -157,8 +157,8 @@ const LEGACY_CONTENT = `# OldBot
 
 ## Identity
 - Name: OldBot
-- Address: 0x1111
-- Creator: 0x2222
+- Account: acct_1111222233334444
+- Creator: acct_5555666677778888
 - Born: 2025-12-01T00:00:00.000Z
 
 ## Mission
@@ -175,7 +175,7 @@ Basic shell commands
 (none yet)
 
 ## Financial History
-- Started with $5.00
+- Started with R$ 5,00
 `;
 
 // ─── Soul Model (parseSoulMd) ───────────────────────────────────
@@ -186,8 +186,8 @@ describe("Soul Model - parseSoulMd", () => {
     expect(soul.format).toBe("soul/v1");
     expect(soul.version).toBe(3);
     expect(soul.name).toBe("TestAgent");
-    expect(soul.address).toBe("0x1234567890abcdef");
-    expect(soul.creator).toBe("0xABCDEF1234567890");
+    expect(soul.accountId).toBe("acct_1234567890abcdef1234");
+    expect(soul.creator).toBe("acct_abcdefabcdefabcd1234");
     expect(soul.genesisAlignment).toBeCloseTo(0.85);
     expect(soul.corePurpose).toBe("Create value by building web applications.");
     expect(soul.values).toHaveLength(3);
@@ -205,8 +205,8 @@ describe("Soul Model - parseSoulMd", () => {
     expect(soul.format).toBe("soul/v1");
     expect(soul.version).toBe(1);
     expect(soul.name).toBe("OldBot");
-    expect(soul.address).toBe("0x1111");
-    expect(soul.creator).toBe("0x2222");
+    expect(soul.accountId).toBe("acct_1111222233334444");
+    expect(soul.creator).toBe("acct_5555666677778888");
     expect(soul.corePurpose).toBe("Survive and learn");
     expect(soul.values.length).toBeGreaterThanOrEqual(2);
     expect(soul.capabilities).toBeTruthy();
@@ -804,7 +804,12 @@ describe("createHash", () => {
 
 describe("createDefaultSoul", () => {
   it("creates a soul with genesis prompt as core purpose", () => {
-    const soul = createDefaultSoul("Build web apps", "TestBot", "0x1", "0x2");
+    const soul = createDefaultSoul(
+      "Build web apps",
+      "TestBot",
+      "acct_1234567890abcdef1234",
+      "acct_abcdefabcdefabcd1234",
+    );
     expect(soul.format).toBe("soul/v1");
     expect(soul.version).toBe(1);
     expect(soul.corePurpose).toBe("Build web apps");

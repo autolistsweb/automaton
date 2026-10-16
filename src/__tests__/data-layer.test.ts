@@ -13,14 +13,6 @@ import os from "os";
 import { createDatabase, pruneStaleKV } from "../state/database.js";
 import type { AutomatonDatabase } from "../types.js";
 
-// Mock erc8004.js to avoid ABI parse error at import time
-vi.mock("../registry/erc8004.js", () => ({
-  queryAgent: vi.fn(),
-  getTotalAgents: vi.fn().mockResolvedValue(0),
-  registerAgent: vi.fn(),
-  leaveFeedback: vi.fn(),
-}));
-
 // Mock injection-defense.js to avoid import chain issues
 vi.mock("../agent/injection-defense.js", () => ({
   sanitizeToolResult: vi.fn((s: string) => s),
@@ -154,7 +146,7 @@ describe("Agent Card Validation", () => {
     const card = validateAgentCard({
       name: "TestAgent",
       type: "automaton",
-      address: "0x1234",
+      accountId: "acct_1234567890abcdef1234",
       description: "A test agent",
     });
     expect(card).not.toBeNull();
@@ -191,8 +183,10 @@ describe("Agent Card Validation", () => {
     expect(validateAgentCard({ name: "TestAgent", type: "" })).toBeNull();
   });
 
-  it("rejects non-string address", () => {
-    expect(validateAgentCard({ name: "TestAgent", type: "automaton", address: 123 })).toBeNull();
+  it("rejects non-string account id", () => {
+    expect(
+      validateAgentCard({ name: "TestAgent", type: "automaton", accountId: 123 }),
+    ).toBeNull();
   });
 
   it("accepts card without optional fields", () => {
@@ -454,24 +448,24 @@ describe("Inbox Message Deserialization", () => {
     try { db.close(); } catch { /* already closed */ }
   });
 
-  it("uses to_address column instead of hardcoded empty string", () => {
+  it("uses to_account_id column instead of hardcoded empty string", () => {
     const rawDb = (db as any).raw;
 
-    // Insert message with to_address
+    // Insert message with to_account_id
     rawDb.prepare(
-      `INSERT INTO inbox_messages (id, from_address, to_address, content, received_at)
+      `INSERT INTO inbox_messages (id, from_account_id, to_account_id, content, received_at)
        VALUES (?, ?, ?, ?, ?)`,
-    ).run("msg-1", "0xSender", "0xRecipient", "Hello", new Date().toISOString());
+    ).run("msg-1", "acct_aaaa111122223333", "acct_bbbb444455556666", "Hello", new Date().toISOString());
 
     const messages = db.getUnprocessedInboxMessages(10);
     expect(messages.length).toBe(1);
-    expect(messages[0].to).toBe("0xRecipient");
+    expect(messages[0].to).toBe("acct_bbbb444455556666");
   });
 
-  it("falls back to empty string when to_address is null", () => {
+  it("falls back to empty string when to_account_id is null", () => {
     db.insertInboxMessage({
       id: "msg-2",
-      from: "0xSender",
+      from: "acct_aaaa111122223333",
       to: "",
       content: "Hello",
       signedAt: new Date().toISOString(),
@@ -535,7 +529,10 @@ describe("Schema Migrations", () => {
       "model_registry",
       "child_lifecycle_events",
       "discovered_agents_cache",
-      "onchain_transactions",
+      "user_balances",
+      "pix_payments",
+      "pix_webhook_events",
+      "registry",
     ];
 
     for (const table of requiredTables) {
@@ -559,7 +556,7 @@ describe("Schema Migrations", () => {
     expect(columns).toContain("status");
     expect(columns).toContain("retry_count");
     expect(columns).toContain("max_retries");
-    expect(columns).toContain("to_address");
+    expect(columns).toContain("to_account_id");
 
     db.close();
   });
@@ -732,8 +729,8 @@ describe("Core Table CRUD", () => {
   it("children CRUD: insert and list", () => {
     const rawDb = (db as any).raw;
     rawDb.prepare(
-      `INSERT INTO children (id, name, address, sandbox_id, genesis_prompt, status) VALUES (?, ?, ?, ?, ?, ?)`,
-    ).run("child-1", "test-child", "0xchild", "sandbox-1", "You are a child.", "spawning");
+      `INSERT INTO children (id, name, account_id, sandbox_id, genesis_prompt, status) VALUES (?, ?, ?, ?, ?, ?)`,
+    ).run("child-1", "test-child", "acct_0f1e2d3c4b5a6978", "sandbox-1", "You are a child.", "spawning");
 
     const children = db.getChildren();
     expect(children.length).toBe(1);

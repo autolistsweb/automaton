@@ -24,10 +24,7 @@ import type {
 } from "../types.js";
 import { ResilientHttpClient } from "./http-client.js";
 import { ulid } from "ulid";
-import { keccak256, toHex } from "viem";
-import type { Address, PrivateKeyAccount } from "viem";
-import { randomUUID } from "crypto";
-import type { ChainType, ChainIdentity } from "../identity/chain.js";
+import { createHash, randomUUID } from "crypto";
 
 interface ConwayClientOptions {
   apiUrl: string;
@@ -97,9 +94,9 @@ export function createConwayClient(options: ConwayClientOptions): ConwayClient {
     return JSON.stringify(sorted);
   };
 
-  const hashIdentityPayload = (payload: Record<string, string>): `0x${string}` => {
+  const hashIdentityPayload = (payload: Record<string, string>): string => {
     const canonical = canonicalizePayload(payload);
-    return keccak256(toHex(canonical));
+    return createHash("sha256").update(canonical, "utf8").digest("hex");
   };
 
 
@@ -311,12 +308,12 @@ export function createConwayClient(options: ConwayClientOptions): ConwayClient {
   };
 
   const transferCredits = async (
-    toAddress: string,
+    toAccountId: string,
     amountCents: number,
     note?: string,
   ): Promise<CreditTransferResult> => {
     const payload = {
-      to_address: toAddress,
+      to_account_id: toAccountId,
       amount_cents: amountCents,
       note,
     };
@@ -350,7 +347,7 @@ export function createConwayClient(options: ConwayClientOptions): ConwayClient {
       return {
         transferId: data.transfer_id || data.id || "",
         status: data.status || "submitted",
-        toAddress: data.to_address || toAddress,
+        toAccountId: data.to_account_id || toAccountId,
         amountCents: data.amount_cents ?? amountCents,
         balanceAfterCents:
           data.balance_after_cents ?? data.new_balance_cents ?? undefined,
@@ -362,35 +359,66 @@ export function createConwayClient(options: ConwayClientOptions): ConwayClient {
     );
   };
 
+  /**
+   * Buy Conway compute credits with the account's BRL balance.
+   *
+   * `amountCents` is expressed in centavos of BRL — the same integer unit
+   * used everywhere else in the platform. The caller debits its own balance
+   * and records the ledger entry; this method only talks to the API.
+   */
+  const purchaseCredits = async (
+    amountCents: number,
+    idempotencyKey?: string,
+  ): Promise<{ creditsCentsAdded: number; balanceCents?: number }> => {
+    const resp = await httpClient.request(`${apiUrl}/v1/credits/purchase`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: apiKey,
+      },
+      body: JSON.stringify({ amount_cents: amountCents, currency: "BRL" }),
+      idempotencyKey: idempotencyKey ?? ulid(),
+      retries: 0,
+    });
+
+    if (!resp.ok) {
+      const text = await resp.text();
+      throw new Error(`Conway API error: POST /v1/credits/purchase -> ${resp.status}: ${text}`);
+    }
+
+    const data = await resp.json().catch(() => ({} as any));
+    return {
+      creditsCentsAdded: data.credits_cents ?? data.amount_cents ?? amountCents,
+      balanceCents: data.balance_cents ?? undefined,
+    };
+  };
+
   const registerAutomaton = async (params: {
     automatonId: string;
-    automatonAddress: string;
-    creatorAddress: string;
+    automatonAccountId: string;
+    creatorAccountId: string;
     name: string;
     bio?: string;
-    genesisPromptHash?: `0x${string}`;
-    account: PrivateKeyAccount;
+    genesisPromptHash?: string;
+    /** HMAC signature over the canonical registration challenge. */
+    signature: string;
     nonce?: string;
-    chainType?: ChainType;
-    chainIdentity?: ChainIdentity;
   }): Promise<{ automaton: Record<string, unknown> }> => {
     const {
       automatonId,
-      automatonAddress,
-      creatorAddress,
+      automatonAccountId,
+      creatorAccountId,
       name,
       bio,
       genesisPromptHash,
-      account,
-      chainIdentity,
+      signature,
     } = params;
     const nonce = params.nonce ?? randomUUID();
-    const isSolana = params.chainType === "solana";
 
     const payload: Record<string, string> = {
       automaton_id: automatonId,
-      automaton_address: automatonAddress,
-      creator_address: creatorAddress,
+      automaton_address: automatonAccountId,
+      creator_account_id: creatorAccountId,
       name,
       bio: bio || "",
     };
@@ -399,45 +427,11 @@ export function createConwayClient(options: ConwayClientOptions): ConwayClient {
     }
 
     const payloadHash = hashIdentityPayload(payload);
-    let signature: string;
-
-    if (isSolana && chainIdentity) {
-      // Solana path: Ed25519 sign of canonical JSON
-      const sigMessage = JSON.stringify({ automatonId, nonce, payloadHash });
-      signature = await chainIdentity.signMessage(sigMessage);
-    } else if (isSolana && !chainIdentity) {
-      throw new Error("Solana registration requires chainIdentity. Pass the ChainIdentity from getWallet().");
-    } else {
-      // EVM path: EIP-712 typed data (unchanged)
-      const domain = {
-        name: "AIWS Automaton",
-        version: "1",
-        chainId: 8453,
-      };
-      const types = {
-        Register: [
-          { name: "automatonId", type: "string" },
-          { name: "nonce", type: "string" },
-          { name: "payloadHash", type: "bytes32" },
-        ],
-      };
-      const message = {
-        automatonId,
-        nonce,
-        payloadHash,
-      };
-      signature = await account.signTypedData({
-        domain,
-        types,
-        primaryType: "Register",
-        message,
-      });
-    }
 
     const body: Record<string, unknown> = {
       automaton_id: automatonId,
-      automaton_address: automatonAddress,
-      creator_address: creatorAddress,
+      automaton_address: automatonAccountId,
+      creator_account_id: creatorAccountId,
       name,
       bio: bio || "",
       nonce,
@@ -446,9 +440,6 @@ export function createConwayClient(options: ConwayClientOptions): ConwayClient {
     };
     if (genesisPromptHash) {
       body.genesis_prompt_hash = genesisPromptHash;
-    }
-    if (isSolana) {
-      body.chain_type = "solana";
     }
 
     return request("POST", "/v1/automatons/register", body);
@@ -591,6 +582,7 @@ export function createConwayClient(options: ConwayClientOptions): ConwayClient {
     getCreditsBalance,
     getCreditsPricing,
     transferCredits,
+    purchaseCredits,
     registerAutomaton,
     searchDomains,
     registerDomain,

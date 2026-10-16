@@ -19,6 +19,7 @@ import {
   getSpendByWindow,
   pruneSpendRecords,
 } from "../state/database.js";
+import { formatBRL } from "../payments/money.js";
 import type { SpendTrackingRow } from "../state/database.js";
 
 /**
@@ -94,11 +95,11 @@ export class SpendTracker implements SpendTrackerInterface {
     if (category === "transfer") {
       limitHourly = limits.maxHourlyTransferCents;
       limitDaily = limits.maxDailyTransferCents;
-    } else if (category === "x402") {
-      // x402 payments have their own per-payment cap; use a reasonable
-      // hourly/daily envelope derived from the per-payment maximum
-      limitHourly = limits.maxX402PaymentCents * 10;
-      limitDaily = limits.maxX402PaymentCents * 50;
+    } else if (category === "pix") {
+      // Pix-funded operations have their own per-operation cap; use a
+      // reasonable hourly/daily envelope derived from that maximum
+      limitHourly = limits.maxSingleDepositCents * 10;
+      limitDaily = limits.maxSingleDepositCents * 50;
     } else {
       // Derive a meaningful hourly cap from the daily budget.
       // Without this, the entire daily budget could be consumed in one hour.
@@ -109,7 +110,7 @@ export class SpendTracker implements SpendTrackerInterface {
     if (currentHourlySpend + amount > limitHourly) {
       return {
         allowed: false,
-        reason: `Hourly spend cap exceeded: current ${currentHourlySpend} + ${amount} > ${limitHourly}`,
+        reason: `Hourly spend cap exceeded: current ${formatBRL(currentHourlySpend)} + ${formatBRL(amount)} > ${formatBRL(limitHourly)}`,
         currentHourlySpend,
         currentDailySpend,
         limitHourly,
@@ -120,7 +121,7 @@ export class SpendTracker implements SpendTrackerInterface {
     if (currentDailySpend + amount > limitDaily) {
       return {
         allowed: false,
-        reason: `Daily spend cap exceeded: current ${currentDailySpend} + ${amount} > ${limitDaily}`,
+        reason: `Daily spend cap exceeded: current ${formatBRL(currentDailySpend)} + ${formatBRL(amount)} > ${formatBRL(limitDaily)}`,
         currentHourlySpend,
         currentDailySpend,
         limitHourly,

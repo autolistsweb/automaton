@@ -54,7 +54,7 @@ export class MemoryBudgetManager {
     const { items: relationships, tokens: relationshipTokens } = this.trimTier(
       memories.relationships,
       this.budget.relationshipMemoryTokens,
-      (entry) => estimateTokens(`${entry.entityAddress}: ${entry.relationshipType} trust=${entry.trustScore}`),
+      (entry) => estimateTokens(`${entry.entityId}: ${entry.relationshipType} trust=${entry.trustScore}`),
     );
     totalTokens += relationshipTokens;
 

@@ -13,6 +13,7 @@ import chalk from "chalk";
 import { loadConfig, saveConfig, resolvePath } from "../config.js";
 import { DEFAULT_TREASURY_POLICY, DEFAULT_MODEL_STRATEGY_CONFIG } from "../types.js";
 import type { AutomatonConfig, ModelStrategyConfig, TreasuryPolicy, ModelEntry } from "../types.js";
+import { formatBRL } from "../payments/money.js";
 import { closePrompts } from "./prompts.js";
 import { createDatabase } from "../state/database.js";
 import { ModelRegistry } from "../inference/registry.js";
@@ -115,7 +116,7 @@ function printModelTable(models: ModelEntry[], currentModelId: string): void {
     const cost =
       m.costPer1kInput === 0
         ? chalk.green("free     ")
-        : chalk.dim(`$${((m.costPer1kInput / 100 / 1000) * 1_000_000).toFixed(2)}/M in`);
+        : chalk.dim(`${formatBRL(m.costPer1kInput * 10)}/M in`);
     const active = m.modelId === currentModelId ? chalk.green(" ◀ active") : "";
     const tools = m.supportsTools ? "" : chalk.dim(" (no tools)");
     console.log(
@@ -185,7 +186,7 @@ function printMainMenu(config: AutomatonConfig): void {
   console.log("");
   console.log(`  ${chalk.white("1.")} Inference Providers   ${dim(providers)}`);
   console.log(`  ${chalk.white("2.")} Model Strategy        ${dim(config.inferenceModel)} / ${dim(strategy.maxTokensPerTurn + " tokens")}`);
-  console.log(`  ${chalk.white("3.")} Treasury Policy       ${dim("max transfer: " + (config.treasuryPolicy?.maxSingleTransferCents ?? DEFAULT_TREASURY_POLICY.maxSingleTransferCents) + "¢")}`);
+  console.log(`  ${chalk.white("3.")} Treasury Policy       ${dim("max transfer: " + formatBRL(config.treasuryPolicy?.maxSingleTransferCents ?? DEFAULT_TREASURY_POLICY.maxSingleTransferCents))}`);
   console.log(`  ${chalk.white("4.")} General               ${dim(config.name)} / ${dim(config.logLevel)}`);
   console.log("");
   console.log(chalk.dim("  q  Quit"));
@@ -268,7 +269,7 @@ async function configureModelStrategy(config: AutomatonConfig): Promise<void> {
 
 async function configureTreasury(config: AutomatonConfig): Promise<void> {
   console.log(chalk.cyan("\n  ── Treasury Policy ─────────────────────────────\n"));
-  console.log(chalk.dim("  All values are in cents (100 cents = $1.00).\n"));
+  console.log(chalk.dim(`  All values are integer centavos of BRL (100 = ${formatBRL(100)}).\n`));
 
   const t: TreasuryPolicy = {
     ...DEFAULT_TREASURY_POLICY,
@@ -279,7 +280,10 @@ async function configureTreasury(config: AutomatonConfig): Promise<void> {
   t.maxHourlyTransferCents = await askNumber("Max hourly transfers", t.maxHourlyTransferCents);
   t.maxDailyTransferCents = await askNumber("Max daily transfers", t.maxDailyTransferCents);
   t.minimumReserveCents = await askNumber("Minimum reserve", t.minimumReserveCents);
-  t.maxX402PaymentCents = await askNumber("Max x402 payment", t.maxX402PaymentCents);
+  t.maxSingleDepositCents = await askNumber(
+    "Max single Pix deposit (centavos)",
+    t.maxSingleDepositCents,
+  );
   t.maxInferenceDailyCents = await askNumber("Max daily inference spend", t.maxInferenceDailyCents);
   t.requireConfirmationAboveCents = await askNumber(
     "Require confirmation above",
@@ -303,7 +307,6 @@ async function configureGeneral(config: AutomatonConfig): Promise<void> {
   );
   config.maxChildren = await askNumber("Max child automatons", config.maxChildren);
   config.socialRelayUrl = (await askString("Social relay URL", config.socialRelayUrl)) || undefined;
-  config.rpcUrl = (await askString("RPC endpoint  (Base chain, e.g. https://mainnet.base.org)", config.rpcUrl)) || undefined;
 
   console.log("");
 }

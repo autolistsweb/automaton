@@ -5,7 +5,7 @@
  */
 
 export interface AgentStatusUpdate {
-  agentAddress: string;
+  agentId: string;
   department?: string;
   role?: string;
   status?: string;
@@ -169,7 +169,7 @@ export class AgentContextAggregator {
       for (const update of params.fullUpdates) {
         const status = update.status ?? update.kind ?? "update";
         const message = normalizeMessage(update.message, 180) ?? "(no message)";
-        lines.push(`- ${update.agentAddress} [${status}] ${message}`);
+        lines.push(`- ${update.agentId} [${status}] ${message}`);
       }
     }
 

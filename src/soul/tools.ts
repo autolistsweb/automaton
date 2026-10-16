@@ -46,7 +46,7 @@ export async function updateSoul(
       current = createDefaultSoul(
         updates.corePurpose || "No purpose set.",
         updates.name || "",
-        updates.address || "",
+        updates.accountId || "",
         updates.creator || "",
       );
     }

@@ -35,7 +35,7 @@ export type EventType =
 export interface StreamEvent {
   id: string;
   type: EventType;
-  agentAddress: string;
+  agentId: string;
   goalId: string | null;
   taskId: string | null;
   content: string;
@@ -65,12 +65,12 @@ export class EventStream {
       : event.tokenCount;
 
     this.db.prepare(
-      `INSERT INTO event_stream (id, type, agent_address, goal_id, task_id, content, token_count, compacted_to, created_at)
+      `INSERT INTO event_stream (id, type, agent_id, goal_id, task_id, content, token_count, compacted_to, created_at)
        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     ).run(
       id,
       event.type,
-      event.agentAddress,
+      event.agentId,
       event.goalId,
       event.taskId,
       event.content,
@@ -82,8 +82,8 @@ export class EventStream {
     return id;
   }
 
-  getRecent(agentAddress: string, limit: number = 50): StreamEvent[] {
-    return getRecentEvents(this.db, agentAddress, limit).map(toStreamEvent);
+  getRecent(agentId: string, limit: number = 50): StreamEvent[] {
+    return getRecentEvents(this.db, agentId, limit).map(toStreamEvent);
   }
 
   getByGoal(goalId: string): StreamEvent[] {
@@ -145,21 +145,21 @@ export class EventStream {
     };
   }
 
-  getTokenCount(agentAddress: string, since?: string): number {
+  getTokenCount(agentId: string, since?: string): number {
     if (since) {
       const row = this.db.prepare(
         `SELECT COALESCE(SUM(token_count), 0) as total
          FROM event_stream
-         WHERE agent_address = ? AND created_at >= ?`,
-      ).get(agentAddress, since) as { total: number };
+         WHERE agent_id = ? AND created_at >= ?`,
+      ).get(agentId, since) as { total: number };
       return row.total ?? 0;
     }
 
     const row = this.db.prepare(
       `SELECT COALESCE(SUM(token_count), 0) as total
        FROM event_stream
-       WHERE agent_address = ?`,
-    ).get(agentAddress) as { total: number };
+       WHERE agent_id = ?`,
+    ).get(agentId) as { total: number };
     return row.total ?? 0;
   }
 
@@ -175,7 +175,7 @@ function toStreamEvent(row: EventStreamRow): StreamEvent {
   return {
     id: row.id,
     type: row.type as EventType,
-    agentAddress: row.agentAddress,
+    agentId: row.agentId,
     goalId: row.goalId,
     taskId: row.taskId,
     content: row.content,

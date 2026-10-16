@@ -180,7 +180,7 @@ function createWorkerIdentity(
   return {
     ...parentIdentity,
     name: `worker-${role ?? "generalist"}-${workerId.slice(-6)}`,
-    address: `local://${workerId}`,
+    accountId: `local://${workerId}`,
     sandboxId: workerId,
   };
 }

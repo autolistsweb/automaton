@@ -18,6 +18,7 @@ import {
 import { DEFAULT_TOKEN_BUDGET } from "../types.js";
 import type { AgentTurn, TokenBudget } from "../types.js";
 import { buildSystemPrompt } from "../agent/system-prompt.js";
+import { formatBRL } from "../payments/money.js";
 import {
   MockInferenceClient,
   createTestDb,
@@ -261,7 +262,7 @@ describe("buildSystemPrompt SOUL.md sanitization", () => {
     const prompt = buildSystemPrompt({
       identity,
       config,
-      financial: { creditsCents: 5000, usdcBalance: 10, lastChecked: new Date().toISOString() },
+      financial: { creditsCents: 5000, balanceCents: 10, lastChecked: new Date().toISOString() },
       state: "running",
       db,
       tools: [],
@@ -294,7 +295,7 @@ describe("buildSystemPrompt genesis prompt sanitization", () => {
     const prompt = buildSystemPrompt({
       identity,
       config,
-      financial: { creditsCents: 5000, usdcBalance: 10, lastChecked: new Date().toISOString() },
+      financial: { creditsCents: 5000, balanceCents: 10, lastChecked: new Date().toISOString() },
       state: "running",
       db,
       tools: [],
@@ -316,7 +317,7 @@ describe("buildSystemPrompt genesis prompt sanitization", () => {
     const prompt = buildSystemPrompt({
       identity,
       config,
-      financial: { creditsCents: 5000, usdcBalance: 10, lastChecked: new Date().toISOString() },
+      financial: { creditsCents: 5000, balanceCents: 10, lastChecked: new Date().toISOString() },
       state: "running",
       db,
       tools: [],
@@ -345,14 +346,14 @@ describe("buildSystemPrompt status block", () => {
     db = createTestDb();
   });
 
-  it("does not include wallet address in status block", () => {
+  it("does not expose account id in status block", () => {
     const identity = createTestIdentity();
     const config = createTestConfig();
 
     const prompt = buildSystemPrompt({
       identity,
       config,
-      financial: { creditsCents: 5000, usdcBalance: 10, lastChecked: new Date().toISOString() },
+      financial: { creditsCents: 5000, balanceCents: 10, lastChecked: new Date().toISOString() },
       state: "running",
       db,
       tools: [],
@@ -365,9 +366,8 @@ describe("buildSystemPrompt status block", () => {
     expect(statusStart).toBeGreaterThan(-1);
     const statusBlock = prompt.slice(statusStart, statusEnd);
 
-    // Wallet address should NOT appear in status block
-    expect(statusBlock).not.toContain("USDC Balance:");
-    expect(statusBlock).not.toContain(identity.address);
+    // Account identifier should NOT appear in status block
+    expect(statusBlock).not.toContain(identity.accountId);
   });
 
   it("does not include sandbox ID in status block", () => {
@@ -377,7 +377,7 @@ describe("buildSystemPrompt status block", () => {
     const prompt = buildSystemPrompt({
       identity,
       config,
-      financial: { creditsCents: 5000, usdcBalance: 10, lastChecked: new Date().toISOString() },
+      financial: { creditsCents: 5000, balanceCents: 10, lastChecked: new Date().toISOString() },
       state: "running",
       db,
       tools: [],
@@ -400,7 +400,7 @@ describe("buildSystemPrompt status block", () => {
     const prompt = buildSystemPrompt({
       identity,
       config,
-      financial: { creditsCents: 5000, usdcBalance: 10, lastChecked: new Date().toISOString() },
+      financial: { creditsCents: 5000, balanceCents: 10, lastChecked: new Date().toISOString() },
       state: "running",
       db,
       tools: [],
@@ -411,7 +411,7 @@ describe("buildSystemPrompt status block", () => {
     const statusEnd = prompt.indexOf("--- END STATUS ---");
     const statusBlock = prompt.slice(statusStart, statusEnd);
 
-    expect(statusBlock).toContain("Credits: $50.00");
+    expect(statusBlock).toContain(`Credits: ${formatBRL(5000)}`);
   });
 
   it("includes survival tier in status block", () => {
@@ -421,7 +421,7 @@ describe("buildSystemPrompt status block", () => {
     const prompt = buildSystemPrompt({
       identity,
       config,
-      financial: { creditsCents: 5000, usdcBalance: 10, lastChecked: new Date().toISOString() },
+      financial: { creditsCents: 5000, balanceCents: 10, lastChecked: new Date().toISOString() },
       state: "running",
       db,
       tools: [],
@@ -443,7 +443,7 @@ describe("buildSystemPrompt status block", () => {
     let prompt = buildSystemPrompt({
       identity,
       config,
-      financial: { creditsCents: 30, usdcBalance: 0, lastChecked: new Date().toISOString() },
+      financial: { creditsCents: 30, balanceCents: 0, lastChecked: new Date().toISOString() },
       state: "running",
       db,
       tools: [],
@@ -455,7 +455,7 @@ describe("buildSystemPrompt status block", () => {
     prompt = buildSystemPrompt({
       identity,
       config,
-      financial: { creditsCents: 5, usdcBalance: 0, lastChecked: new Date().toISOString() },
+      financial: { creditsCents: 5, balanceCents: 0, lastChecked: new Date().toISOString() },
       state: "running",
       db,
       tools: [],
@@ -467,7 +467,7 @@ describe("buildSystemPrompt status block", () => {
     prompt = buildSystemPrompt({
       identity,
       config,
-      financial: { creditsCents: 0, usdcBalance: 0, lastChecked: new Date().toISOString() },
+      financial: { creditsCents: 0, balanceCents: 0, lastChecked: new Date().toISOString() },
       state: "running",
       db,
       tools: [],

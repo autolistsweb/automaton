@@ -29,14 +29,14 @@ import { logModification } from "./audit-log.js";
 /**
  * Files that the automaton cannot modify under any circumstances.
  * This list protects:
- * - Identity (wallet, config)
+ * - Identity (signing key, config)
  * - Defense systems (injection defense, this file)
  * - State database
  * - The audit log itself
  */
 const PROTECTED_FILES: readonly string[] = Object.freeze([
   // Identity
-  "wallet.json",
+  "account.json",
   "config.json",
   // Database
   "state.db",

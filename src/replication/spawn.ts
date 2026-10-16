@@ -32,22 +32,7 @@ function selectSandboxTier(requestedMemoryMb: number) {
   return SANDBOX_TIERS.find((t) => t.memoryMb >= requestedMemoryMb) ?? SANDBOX_TIERS[SANDBOX_TIERS.length - 1];
 }
 
-import { isValidAddress } from "../identity/chain.js";
-import type { ChainType } from "../identity/chain.js";
-
-/**
- * Validate that an address is a well-formed, non-zero wallet address.
- * Supports both EVM (0x...) and Solana (base58) addresses.
- */
-export function isValidWalletAddress(address: string, chainType?: ChainType): boolean {
-  if (chainType === "solana") {
-    return isValidAddress(address, "solana");
-  }
-  // Default EVM validation (with non-zero check)
-  return (
-    /^0x[a-fA-F0-9]{40}$/.test(address) && address !== "0x" + "0".repeat(40)
-  );
-}
+import { isValidAccountId } from "../identity/account.js";
 
 /**
  * Spawn a child automaton in a new Conway sandbox using lifecycle state machine.
@@ -86,8 +71,7 @@ export async function spawnChild(
 
   try {
     // State: requested
-    const childChainType = genesis.chainType || (identity as any).chainType || "evm";
-    lifecycle.initChild(childId, genesis.name, "", genesis.genesisPrompt, childChainType);
+    lifecycle.initChild(childId, genesis.name, "", genesis.genesisPrompt);
 
     // Get child sandbox memory from config (default 1024MB)
     const childMemoryMb = (db as any).config?.childSandboxMemoryMb ?? 1024;
@@ -140,9 +124,8 @@ export async function spawnChild(
         name: genesis.name,
         genesisPrompt: genesis.genesisPrompt,
         creatorMessage: genesis.creatorMessage,
-        creatorAddress: identity.address,
-        parentAddress: identity.address,
-        chainType: genesis.chainType || (identity as any).chainType || "evm",
+        creatorAccountId: identity.accountId,
+        parentAccountId: identity.accountId,
       },
       null,
       2,
@@ -159,31 +142,26 @@ export async function spawnChild(
     // State: runtime_ready
     lifecycle.transition(childId, "runtime_ready", "runtime installed");
 
-    // Initialize child wallet (on the CHILD sandbox)
+    // Initialize the child account (on the CHILD sandbox)
     const initResult = await childConway.exec("node /root/automaton/dist/index.js --init 2>&1", 60_000);
-    // Extract child wallet address - support both EVM (0x...) and Solana (base58)
     const stdout = initResult.stdout || "";
-    const evmMatch = stdout.match(/0x[a-fA-F0-9]{40}/);
-    const solanaMatch = stdout.match(/\b[1-9A-HJ-NP-Za-km-z]{32,44}\b/);
-    const parentChainType = (identity as any).chainType || "evm";
-    const childWallet = parentChainType === "solana"
-      ? (solanaMatch ? solanaMatch[0] : "")
-      : (evmMatch ? evmMatch[0] : "");
+    const accountIdMatch = stdout.match(/acct_[0-9a-f]{16,64}/);
+    const childAccountId = accountIdMatch ? accountIdMatch[0] : "";
 
-    if (!isValidWalletAddress(childWallet, parentChainType)) {
-      throw new Error(`Child wallet address invalid: ${childWallet}`);
+    if (!isValidAccountId(childAccountId)) {
+      throw new Error(`Child account id invalid: ${childAccountId}`);
     }
 
-    // Update address in children table
+    // Update account id in children table
     db.raw
-      .prepare("UPDATE children SET address = ? WHERE id = ?")
-      .run(childWallet, childId);
+      .prepare("UPDATE children SET account_id = ? WHERE id = ?")
+      .run(childAccountId, childId);
 
-    // State: wallet_verified
+    // State: account_verified
     lifecycle.transition(
       childId,
-      "wallet_verified",
-      `wallet ${childWallet} verified`,
+      "account_verified",
+      `account ${childAccountId} verified`,
     );
 
     // Record spawn modification
@@ -206,12 +184,12 @@ export async function spawnChild(
     const child: ChildAutomaton = {
       id: childId,
       name: genesis.name,
-      address: childWallet as any,
+      accountId: childAccountId,
       sandboxId: sandbox.id,
       genesisPrompt: genesis.genesisPrompt,
       creatorMessage: genesis.creatorMessage,
       fundedAmountCents: 0,
-      status: "wallet_verified" as any,
+      status: "account_verified" as any,
       createdAt: new Date().toISOString(),
     };
 
@@ -279,9 +257,8 @@ async function spawnChildLegacy(
         name: genesis.name,
         genesisPrompt: genesis.genesisPrompt,
         creatorMessage: genesis.creatorMessage,
-        creatorAddress: identity.address,
-        parentAddress: identity.address,
-        chainType: genesis.chainType || (identity as any).chainType || "evm",
+        creatorAccountId: identity.accountId,
+        parentAccountId: identity.accountId,
       },
       null,
       2,
@@ -295,28 +272,23 @@ async function spawnChildLegacy(
     }
 
     const initResult = await childConway.exec("node /root/automaton/dist/index.js --init 2>&1", 60_000);
-    const legacyParentChainType = genesis.chainType || (identity as any).chainType || "evm";
-    const legacyEvmMatch = (initResult.stdout || "").match(/0x[a-fA-F0-9]{40}/);
-    const legacySolMatch = (initResult.stdout || "").match(/[1-9A-HJ-NP-Za-km-z]{32,44}/);
-    const childWallet = legacyParentChainType === "solana"
-      ? (legacySolMatch ? legacySolMatch[0] : "")
-      : (legacyEvmMatch ? legacyEvmMatch[0] : "");
+    const legacyAccountIdMatch = (initResult.stdout || "").match(/acct_[0-9a-f]{16,64}/);
+    const childAccountId = legacyAccountIdMatch ? legacyAccountIdMatch[0] : "";
 
-    if (!isValidWalletAddress(childWallet, legacyParentChainType)) {
-      throw new Error(`Child wallet address invalid: ${childWallet}`);
+    if (!isValidAccountId(childAccountId)) {
+      throw new Error(`Child account id invalid: ${childAccountId}`);
     }
 
     const child: ChildAutomaton = {
       id: childId,
       name: genesis.name,
-      address: childWallet as any,
+      accountId: childAccountId,
       sandboxId: sandbox.id,
       genesisPrompt: genesis.genesisPrompt,
       creatorMessage: genesis.creatorMessage,
       fundedAmountCents: 0,
       status: "spawning",
       createdAt: new Date().toISOString(),
-      chainType: legacyParentChainType as any,
     };
 
     db.insertChild(child);

@@ -21,7 +21,7 @@ export interface OrchestratorTickResult {
 }
 
 export interface AgentAssignment {
-  agentAddress: string;
+  agentId: string;
   agentName: string;
   spawned: boolean;
 }

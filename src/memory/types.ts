@@ -52,7 +52,7 @@ const STRATEGIC_TOOLS = new Set([
   "edit_own_file",
   "modify_heartbeat",
   "spawn_child",
-  "register_erc8004",
+  "register_agent",
   "update_agent_card",
   "install_mcp_server",
   "update_soul",
@@ -84,7 +84,7 @@ const COMMUNICATION_TOOLS = new Set([
 
 const MAINTENANCE_TOOLS = new Set([
   "check_credits",
-  "check_usdc_balance",
+  "check_balance",
   "system_synopsis",
   "heartbeat_ping",
   "list_sandboxes",

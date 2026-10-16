@@ -193,18 +193,18 @@ export function recallProcedure(
  */
 export function noteAboutAgent(
   db: Database,
-  args: { entityAddress: string; entityName?: string; relationshipType: string; notes?: string; trustScore?: number },
+  args: { entityId: string; entityName?: string; relationshipType: string; notes?: string; trustScore?: number },
 ): string {
   try {
     const rel = new RelationshipMemoryManager(db);
     const id = rel.record({
-      entityAddress: args.entityAddress,
+      entityId: args.entityId,
       entityName: args.entityName ?? null,
       relationshipType: args.relationshipType,
       trustScore: args.trustScore ?? 0.5,
       notes: args.notes ?? null,
     });
-    return `Relationship noted: ${args.entityAddress} (${args.relationshipType}, trust: ${args.trustScore ?? 0.5})`;
+    return `Relationship noted: ${args.entityId} (${args.relationshipType}, trust: ${args.trustScore ?? 0.5})`;
   } catch (error) {
     return `Failed to note about agent: ${error instanceof Error ? error.message : error}`;
   }

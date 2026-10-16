@@ -1,70 +1,52 @@
 /**
- * automaton-cli send <to-address> "message text"
+ * automaton-cli send <to-account-id> "message text"
  *
- * Send a message to an automaton or address via the social relay.
+ * Send a message to another account via the social relay.
  *
- * Phase 3.2: CRITICAL FIX (S-P0-1) — All outbound messages are now signed
- * using the same canonical format as the runtime client.
+ * Signed with the local account's Ed25519 key using the shared canonical
+ * payload format, so the relay (or any holder of the published public key)
+ * can verify it. No chain, no wallet.
  */
 
 import { loadConfig } from "@conway/automaton/config.js";
-import { privateKeyToAccount, type PrivateKeyAccount } from "viem/accounts";
-import { keccak256, toBytes } from "viem";
-import fs from "fs";
-import path from "path";
+import {
+  accountExists,
+  getAccount,
+} from "@conway/automaton/identity/account.js";
+import { signSendPayload } from "@conway/automaton/social/signing.js";
 
 const args = process.argv.slice(3);
-const toAddress = args[0];
+const toAccountId = args[0];
 const messageText = args.slice(1).join(" ");
 
-if (!toAddress || !messageText) {
-  console.log("Usage: automaton-cli send <to-address> <message>");
+if (!toAccountId || !messageText) {
+  console.log("Usage: automaton-cli send <to-account-id> <message>");
   console.log("Examples:");
-  console.log('  automaton-cli send 0xabc...def "Hello, fellow automaton!"');
+  console.log('  automaton-cli send acct_1a2b3c4d5e6f708192a3b4c5 "Hello!"');
   process.exit(1);
 }
 
-// Load wallet
-const walletPath = path.join(
-  process.env.HOME || "/root",
-  ".automaton",
-  "wallet.json",
-);
-
-if (!fs.existsSync(walletPath)) {
-  console.log("No wallet found at ~/.automaton/wallet.json");
-  console.log("Run: automaton --init");
+if (!accountExists()) {
+  console.log("No local account found at ~/.automaton/account.json");
+  console.log("Run: automaton --setup");
   process.exit(1);
 }
 
-const walletData = JSON.parse(fs.readFileSync(walletPath, "utf-8"));
-const account: PrivateKeyAccount = privateKeyToAccount(walletData.privateKey as `0x${string}`);
-
-// Load config for relay URL
 const config = loadConfig();
-const relayUrl =
+const relayUrl = (
   config?.socialRelayUrl ||
   process.env.SOCIAL_RELAY_URL ||
-  "https://social.conway.tech";
+  "https://social.conway.tech"
+).replace(/\/$/, "");
 
 try {
-  // Phase 3.2: Sign the message using the same canonical format as runtime
-  // Canonical: Conway:send:{to_lowercase}:{keccak256(toBytes(content))}:{signed_at_iso}
-  const signedAt = new Date().toISOString();
-  const contentHash = keccak256(toBytes(messageText));
-  const canonical = `Conway:send:${toAddress.toLowerCase()}:${contentHash}:${signedAt}`;
-  const signature = await account.signMessage({ message: canonical });
+  const { identity } = await getAccount();
+  const payload = await signSendPayload(identity, toAccountId, messageText);
 
   const resp = await fetch(`${relayUrl}/v1/messages`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      from: account.address.toLowerCase(),
-      to: toAddress.toLowerCase(),
-      content: messageText,
-      signed_at: signedAt,
-      signature,
-    }),
+    body: JSON.stringify(payload),
     signal: AbortSignal.timeout(30_000),
   });
 
@@ -73,10 +55,10 @@ try {
   }
 
   const result = (await resp.json()) as { id?: string };
-  console.log(`Message sent (signed).`);
+  console.log("Message sent (signed).");
   console.log(`  ID:   ${result.id || "n/a"}`);
-  console.log(`  From: ${account.address}`);
-  console.log(`  To:   ${toAddress}`);
+  console.log(`  From: ${identity.accountId}`);
+  console.log(`  To:   ${toAccountId}`);
   console.log(`  Relay: ${relayUrl}`);
 } catch (err: any) {
   console.error(`Failed to send message: ${err.message}`);

@@ -336,7 +336,7 @@ export class MemoryIngestionPipeline {
       try {
         this.eventStream.append({
           type: "market_signal",
-          agentAddress: sessionId,
+          agentId: sessionId,
           goalId: null,
           taskId: null,
           content: `${signal.type} | ${signal.source} | ${signal.signal}`,
@@ -356,7 +356,7 @@ export class MemoryIngestionPipeline {
       try {
         this.eventStream.append({
           type: "knowledge",
-          agentAddress: sessionId,
+          agentId: sessionId,
           goalId: null,
           taskId: null,
           content: `CONTRADICTION: ${contradiction.description}`,
@@ -389,7 +389,7 @@ export class MemoryIngestionPipeline {
       return true;
     }
 
-    return /\$[\d,.]+|\b(usd|usdc|price|pricing|demand|competitor|alternative|rival)\b/i.test(tc.result);
+    return /R\$\s*[\d,.]+|\$[\d,.]+|\b(usd|brl|price|pricing|demand|competitor|alternative|rival)\b/i.test(tc.result);
   }
 
   private resolveSource(tc: ToolCallResult): string {
@@ -456,7 +456,7 @@ export class MemoryIngestionPipeline {
     const lower = fragment.toLowerCase();
 
     if (
-      /\$[\d,.]+|\b\d+(?:\.\d+)?\s*(?:usd|usdc|cents)\b|\((?:\$\d+(?:\.\d{1,2})?\/yr)\)/i.test(
+      /R\$\s*[\d,.]+|\$[\d,.]+|\b\d+(?:\.\d+)?\s*(?:usd|cents|brl|reais)\b|\((?:\$\d+(?:\.\d{1,2})?\/yr)\)/i.test(
         fragment,
       ) ||
       /\b(price|pricing|cost|fee|subscription|rate|revenue)\b/.test(lower)
@@ -668,10 +668,13 @@ export class MemoryIngestionPipeline {
           });
         }
 
-        if (tc.name === "check_usdc_balance" && tc.result) {
+        if (
+          (tc.name === "check_balance" || tc.name === "check_usdc_balance") &&
+          tc.result
+        ) {
           this.semantic.store({
             category: "financial",
-            key: "usdc_balance",
+            key: "balance",
             value: tc.result,
             confidence: 1.0,
             source: sessionId,
@@ -704,14 +707,14 @@ export class MemoryIngestionPipeline {
         if (tc.error) continue;
 
         if (tc.name === "send_message") {
-          const toAddress = tc.arguments.to_address as string | undefined;
+          const toAddress = tc.arguments.to_account_id as string | undefined;
           if (toAddress) {
             const existing = this.relationships.get(toAddress);
             if (existing) {
               this.relationships.recordInteraction(toAddress);
             } else {
               this.relationships.record({
-                entityAddress: toAddress,
+                entityId: toAddress,
                 relationshipType: "contacted",
                 trustScore: 0.5,
               });
@@ -730,7 +733,7 @@ export class MemoryIngestionPipeline {
             this.relationships.recordInteraction(fromAddress);
           } else {
             this.relationships.record({
-              entityAddress: fromAddress,
+              entityId: fromAddress,
               relationshipType: "messaged_us",
               trustScore: 0.5,
             });

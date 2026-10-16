@@ -36,7 +36,7 @@ export async function sendToChild(
  */
 export async function sendToParent(
   social: SocialClientInterface,
-  parentAddress: string,
+  parentAccountId: string,
   content: string,
   type: string = "child_message",
 ): Promise<{ id: string }> {
@@ -44,7 +44,7 @@ export async function sendToParent(
     throw new Error(`Message too long: ${content.length} bytes (max ${MESSAGE_LIMITS.maxContentLength})`);
   }
 
-  const result = await social.send(parentAddress, JSON.stringify({
+  const result = await social.send(parentAccountId, JSON.stringify({
     type,
     content,
     sentAt: new Date().toISOString(),

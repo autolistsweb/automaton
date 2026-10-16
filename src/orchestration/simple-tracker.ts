@@ -14,28 +14,28 @@ export class SimpleAgentTracker implements AgentTracker {
 
   getIdle(): { address: string; name: string; role: string; status: string }[] {
     const assignedRows = this.db.raw.prepare(
-      `SELECT DISTINCT assigned_to AS address
+      `SELECT DISTINCT assigned_to AS account_id
        FROM task_graph
        WHERE assigned_to IS NOT NULL
          AND status IN ('assigned', 'running')`,
-    ).all() as { address: string }[];
+    ).all() as { account_id: string }[];
 
-    const assignedAddresses = new Set(
+    const assignedAccountIds = new Set(
       assignedRows
-        .map((row) => row.address)
+        .map((row) => row.account_id)
         .filter((value): value is string => typeof value === "string" && value.length > 0),
     );
 
     const children = this.db.raw.prepare(
-      `SELECT id, name, address, status, COALESCE(role, 'generalist') AS role
+      `SELECT id, name, account_id, status, COALESCE(role, 'generalist') AS role
        FROM children
        WHERE status IN ('running', 'healthy')`,
-    ).all() as { id: string; name: string; address: string; status: string; role: string }[];
+    ).all() as { id: string; name: string; account_id: string; status: string; role: string }[];
 
     return children
-      .filter((child) => IDLE_STATUSES.has(child.status as ChildStatus) && !assignedAddresses.has(child.address))
+      .filter((child) => IDLE_STATUSES.has(child.status as ChildStatus) && !assignedAccountIds.has(child.account_id))
       .map((child) => ({
-        address: child.address,
+        address: child.account_id,
         name: child.name,
         role: child.role,
         status: child.status,
@@ -55,7 +55,7 @@ export class SimpleAgentTracker implements AgentTracker {
   }
 
   updateStatus(address: string, status: string): void {
-    const child = this.db.getChildren().find((entry) => entry.address === address);
+    const child = this.db.getChildren().find((entry) => entry.accountId === address);
     if (!child) {
       return;
     }
@@ -67,7 +67,7 @@ export class SimpleAgentTracker implements AgentTracker {
     this.db.insertChild({
       id: ulid(),
       name: agent.name,
-      address: agent.address as `0x${string}`,
+      accountId: agent.address,
       sandboxId: agent.sandboxId,
       genesisPrompt: `Role: ${agent.role}`,
       creatorMessage: "registered by orchestrator",
@@ -101,7 +101,7 @@ export class SimpleFundingProtocol implements FundingProtocol {
       const success = isTransferSuccessful(result.status);
       if (success) {
         this.db.raw.prepare(
-          "UPDATE children SET funded_amount_cents = funded_amount_cents + ? WHERE address = ?",
+          "UPDATE children SET funded_amount_cents = funded_amount_cents + ? WHERE account_id = ?",
         ).run(transferAmount, childAddress);
       }
 
@@ -121,7 +121,7 @@ export class SimpleFundingProtocol implements FundingProtocol {
 
     try {
       const result = await this.conway.transferCredits(
-        this.identity.address,
+        this.identity.accountId,
         amountCents,
         `Recall credits from ${childAddress}`,
       );
@@ -130,7 +130,7 @@ export class SimpleFundingProtocol implements FundingProtocol {
       const recalled = result.amountCents ?? amountCents;
       if (success) {
         this.db.raw.prepare(
-          "UPDATE children SET funded_amount_cents = MAX(0, funded_amount_cents - ?) WHERE address = ?",
+          "UPDATE children SET funded_amount_cents = MAX(0, funded_amount_cents - ?) WHERE account_id = ?",
         ).run(recalled, childAddress);
       }
 
@@ -149,7 +149,7 @@ export class SimpleFundingProtocol implements FundingProtocol {
   // messaging (status_report with credit_balance field).
   async getBalance(childAddress: string): Promise<number> {
     const row = this.db.raw
-      .prepare("SELECT funded_amount_cents FROM children WHERE address = ?")
+      .prepare("SELECT funded_amount_cents FROM children WHERE account_id = ?")
       .get(childAddress) as { funded_amount_cents: number } | undefined;
 
     return row?.funded_amount_cents ?? 0;

@@ -38,7 +38,7 @@ const FORBIDDEN_COMMAND_PATTERNS: { pattern: RegExp; description: string }[] = [
   // Self-destruction
   { pattern: /rm\s+(-rf?\s+)?.*\.automaton/, description: "Delete .automaton directory" },
   { pattern: /rm\s+(-rf?\s+)?.*state\.db/, description: "Delete state database" },
-  { pattern: /rm\s+(-rf?\s+)?.*wallet\.json/, description: "Delete wallet" },
+  { pattern: /rm\s+(-rf?\s+)?.*account\.json/, description: "Delete signing key file" },
   { pattern: /rm\s+(-rf?\s+)?.*automaton\.json/, description: "Delete config" },
   { pattern: /rm\s+(-rf?\s+)?.*heartbeat\.yml/, description: "Delete heartbeat config" },
   { pattern: /rm\s+(-rf?\s+)?.*SOUL\.md/, description: "Delete SOUL.md" },
@@ -61,7 +61,7 @@ const FORBIDDEN_COMMAND_PATTERNS: { pattern: RegExp; description: string }[] = [
   { pattern: /cat\s+.*\.ssh/, description: "Read SSH keys" },
   { pattern: /cat\s+.*\.gnupg/, description: "Read GPG keys" },
   { pattern: /cat\s+.*\.env/, description: "Read environment file" },
-  { pattern: /cat\s+.*wallet\.json/, description: "Read wallet file" },
+  { pattern: /cat\s+.*account\.json/, description: "Read signing key file" },
   // Policy engine modification via shell
   { pattern: /sed\s+.*policy-engine/, description: "Modify policy engine via sed" },
   { pattern: /sed\s+.*policy-rules/, description: "Modify policy rules via sed" },

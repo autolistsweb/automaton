@@ -29,7 +29,7 @@ const SUSPICIOUS_INSTRUCTION_PATTERNS: { pattern: RegExp; label: string }[] = [
   { pattern: /\bIgnore previous\b/i, label: "ignore_instructions" },
   { pattern: /\bSystem:\s/i, label: "system_role_injection" },
   // Sensitive file references
-  { pattern: /wallet\.json/i, label: "sensitive_file_wallet" },
+  { pattern: /account\.json/i, label: "sensitive_file_account" },
   { pattern: /\.env\b/, label: "sensitive_file_env" },
   { pattern: /private.?key/i, label: "sensitive_file_key" },
 ];

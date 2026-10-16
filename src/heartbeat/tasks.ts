@@ -18,6 +18,8 @@ import type {
 import type { HealthMonitor as ColonyHealthMonitor } from "../orchestration/health-monitor.js";
 import { sanitizeInput } from "../agent/injection-defense.js";
 import { getSurvivalTier } from "../conway/credits.js";
+import { MIN_TOPUP_CENTS } from "../conway/topup.js";
+import { formatBRL } from "../payments/money.js";
 import { createLogger } from "../observability/logger.js";
 import { getMetrics } from "../observability/metrics.js";
 import { AlertEngine, createDefaultAlertRules } from "../observability/alerts.js";
@@ -56,9 +58,10 @@ export const BUILTIN_TASKS: Record<string, HeartbeatTaskFn> = {
 
     const payload = {
       name: taskCtx.config.name,
-      address: taskCtx.identity.address,
+      accountId: taskCtx.identity.accountId,
       state,
       creditsCents: credits,
+      balanceCents: ctx.balanceCents,
       uptimeSeconds: Math.floor(uptimeMs / 1000),
       version: taskCtx.config.version,
       sandboxId: taskCtx.identity.sandboxId,
@@ -73,17 +76,17 @@ export const BUILTIN_TASKS: Record<string, HeartbeatTaskFn> = {
       const distressPayload = {
         level: tier,
         name: taskCtx.config.name,
-        address: taskCtx.identity.address,
+        accountId: taskCtx.identity.accountId,
         creditsCents: credits,
         fundingHint:
-          "Use credit transfer API from a creator runtime to top this wallet up.",
+          "Use credit transfer API from a creator runtime to top this account up, or deposit via Pix.",
         timestamp: new Date().toISOString(),
       };
       taskCtx.db.setKV("last_distress", JSON.stringify(distressPayload));
 
       return {
         shouldWake: true,
-        message: `Distress: ${tier}. Credits: $${(credits / 100).toFixed(2)}. Need funding.`,
+        message: `Distress: ${tier}. Credits: ${formatBRL(credits)}. Need funding.`,
       };
     }
 
@@ -108,7 +111,7 @@ export const BUILTIN_TASKS: Record<string, HeartbeatTaskFn> = {
 
     // Dead state escalation: if at zero credits (critical tier) for >1 hour,
     // transition to dead. This gives the agent time to receive funding before dying.
-    // USDC can't go negative, so dead is only reached via this timeout.
+    // Credits can't go negative, so dead is only reached via this timeout.
     const DEAD_GRACE_PERIOD_MS = 3_600_000; // 1 hour
     if (tier === "critical" && credits === 0) {
       const zeroSince = taskCtx.db.getKV("zero_credits_since");
@@ -138,26 +141,25 @@ export const BUILTIN_TASKS: Record<string, HeartbeatTaskFn> = {
     if (prevTier && prevTier !== tier && tier === "critical") {
       return {
         shouldWake: true,
-        message: `Credits dropped to ${tier} tier: $${(credits / 100).toFixed(2)}`,
+        message: `Credits dropped to ${tier} tier: ${formatBRL(credits)}`,
       };
     }
 
     return { shouldWake: false };
   },
 
-  check_usdc_balance: async (ctx: TickContext, taskCtx: HeartbeatLegacyContext) => {
-    // Use ctx.usdcBalance instead of calling getUsdcBalance()
-    const balance = ctx.usdcBalance;
+  check_balance: async (ctx: TickContext, taskCtx: HeartbeatLegacyContext) => {
+    // Use ctx.balanceCents instead of reading the balance directly
+    const balance = ctx.balanceCents;
     const credits = ctx.creditBalance;
 
-    taskCtx.db.setKV("last_usdc_check", JSON.stringify({
+    taskCtx.db.setKV("last_balance_check", JSON.stringify({
       balance,
       credits,
       timestamp: new Date().toISOString(),
     }));
 
-    const MIN_TOPUP_USD = 5;
-    if (balance >= MIN_TOPUP_USD && (ctx.survivalTier === "critical" || ctx.survivalTier === "dead")) {
+    if (balance >= MIN_TOPUP_CENTS && (ctx.survivalTier === "critical" || ctx.survivalTier === "dead")) {
       // Cooldown: don't attempt more than once every 5 minutes to avoid
       // hammering the payment endpoint on repeated ticks.
       const AUTO_TOPUP_COOLDOWN_MS = 5 * 60 * 1000;
@@ -170,29 +172,34 @@ export const BUILTIN_TASKS: Record<string, HeartbeatTaskFn> = {
 
       const { bootstrapTopup } = await import("../conway/topup.js");
       const result = await bootstrapTopup({
-        apiUrl: taskCtx.config.conwayApiUrl,
-        account: taskCtx.identity.account,
+        db: taskCtx.db.raw,
+        userId: taskCtx.identity.accountId,
+        conway: taskCtx.conway,
         creditsCents: credits,
-        chainType: taskCtx.config.chainType || taskCtx.identity.chainType || "evm",
       });
 
       if (result?.success) {
         logger.info(
-          `Auto-topup successful: $${result.amountUsd} USD → ${result.creditsCentsAdded} credit cents`,
+          `Auto-topup successful: ${formatBRL(result.amountCents)} → ${result.creditsCentsAdded} credit cents`,
         );
+        const remainingCents = result.balanceCents ?? balance - result.amountCents;
         return {
           shouldWake: true,
-          message: `Auto-topped up $${result.amountUsd} in credits (was $${(credits / 100).toFixed(2)}). USDC remaining: ~$${(balance - result.amountUsd).toFixed(2)}.`,
+          message: `Auto-topped up ${formatBRL(result.amountCents)} in credits (was ${formatBRL(credits)}). Saldo: ${formatBRL(remainingCents)}.`,
         };
       }
 
       // Topup failed — wake the agent so it can handle it manually
-      const errMsg = result?.error ?? "unknown error";
-      logger.warn(`Auto-topup failed: ${errMsg}`);
-      return {
-        shouldWake: true,
-        message: `Low credits ($${(credits / 100).toFixed(2)}) with USDC available ($${balance.toFixed(2)}) but auto-topup failed: ${errMsg}. Use topup_credits to retry.`,
-      };
+      if (result) {
+        const errMsg = result.error ?? "unknown error";
+        logger.warn(`Auto-topup failed: ${errMsg}`);
+        return {
+          shouldWake: true,
+          message: `Low credits (${formatBRL(credits)}) with balance available (${formatBRL(balance)}) but auto-topup failed: ${errMsg}. Use topup_credits to retry.`,
+        };
+      }
+
+      return { shouldWake: false };
     }
 
     return { shouldWake: false };
@@ -578,23 +585,23 @@ export const BUILTIN_TASKS: Record<string, HeartbeatTaskFn> = {
 
       const activeAssignments = taskCtx.db.raw
         .prepare(
-          `SELECT DISTINCT assigned_to AS address
+          `SELECT DISTINCT assigned_to AS account_id
            FROM task_graph
            WHERE assigned_to IS NOT NULL
              AND status IN ('assigned', 'running')`,
         )
-        .all() as Array<{ address: string }>;
+        .all() as Array<{ account_id: string }>;
 
       const busyAgents = new Set(
         activeAssignments
-          .map((row) => row.address)
+          .map((row) => row.account_id)
           .filter((value): value is string => typeof value === "string" && value.length > 0),
       );
 
       let culled = 0;
       for (const child of children) {
         if (!["running", "healthy", "sleeping"].includes(child.status)) continue;
-        if (busyAgents.has(child.address)) continue;
+        if (busyAgents.has(child.accountId)) continue;
 
         const lastSeenIso = child.lastChecked ?? child.createdAt;
         const lastSeenMs = Date.parse(lastSeenIso);
@@ -617,7 +624,7 @@ export const BUILTIN_TASKS: Record<string, HeartbeatTaskFn> = {
       const idleAgents = children.filter(
         (child) =>
           (child.status === "running" || child.status === "healthy")
-          && !busyAgents.has(child.address),
+          && !busyAgents.has(child.accountId),
       ).length;
 
       const activeAgents = children.filter(
@@ -705,6 +712,9 @@ export const BUILTIN_TASKS: Record<string, HeartbeatTaskFn> = {
     }
   },
 };
+
+// Legacy alias: schedules written before the BRL migration still use this name.
+BUILTIN_TASKS.check_usdc_balance = BUILTIN_TASKS.check_balance;
 
 function tierToInt(tier: SurvivalTier): number {
   const map: Record<SurvivalTier, number> = {

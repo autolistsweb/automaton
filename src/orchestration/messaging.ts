@@ -84,7 +84,7 @@ interface PendingInboxMessage {
 export interface MessageTransport {
   /** Deliver a message to the recipient. */
   deliver(to: string, envelope: string): Promise<void>;
-  /** List known recipient addresses (for broadcast). */
+  /** List known recipient account ids (for broadcast). */
   getRecipients(): string[];
 }
 
@@ -102,16 +102,17 @@ export class LocalDBTransport implements MessageTransport {
   async deliver(to: string, envelope: string): Promise<void> {
     // Write directly to inbox_messages table
     const id = ulid();
-    const fromAddress = this.db.getIdentity("address") ?? "unknown";
+    const fromAddress =
+      this.db.getIdentity("accountId") ?? this.db.getIdentity("address") ?? "unknown";
     this.db.raw.prepare(
-      `INSERT INTO inbox_messages (id, from_address, to_address, content, received_at, status)
+      `INSERT INTO inbox_messages (id, from_account_id, to_account_id, content, received_at, status)
        VALUES (?, ?, ?, ?, datetime('now'), 'received')`,
     ).run(id, fromAddress, to, envelope);
   }
 
   getRecipients(): string[] {
     const children = this.db.getChildren();
-    return children.map((c) => c.address);
+    return children.map((c) => c.accountId);
   }
 }
 
@@ -229,7 +230,8 @@ export class ColonyMessaging {
     const recipients = this.transport.getRecipients();
     if (recipients.length === 0) return;
 
-    const fromAddress = this.db.getIdentity("address") ?? "unknown";
+    const fromAddress =
+      this.db.getIdentity("accountId") ?? this.db.getIdentity("address") ?? "unknown";
     const createdAt = new Date().toISOString();
 
     await Promise.all(recipients.map((to) =>
@@ -260,7 +262,8 @@ export class ColonyMessaging {
     requiresResponse?: boolean;
     expiresAt?: string;
   }): AgentMessage {
-    const fromAddress = this.db.getIdentity("address") ?? "unknown";
+    const fromAddress =
+      this.db.getIdentity("accountId") ?? this.db.getIdentity("address") ?? "unknown";
     return {
       id: ulid(),
       type: params.type,
@@ -368,7 +371,7 @@ export class ColonyMessaging {
     try {
       insertEvent(this.db.raw, {
         type: "action",
-        agentAddress: message.from,
+        agentId: message.from,
         goalId: message.goalId,
         taskId: message.taskId,
         content: JSON.stringify({

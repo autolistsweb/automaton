@@ -69,7 +69,7 @@ export interface HealthReport {
 
 export interface HealAction {
   type: "fund" | "restart" | "reassign" | "stop";
-  agentAddress: string;
+  agentId: string;
   reason: string;
   success: boolean;
 }
@@ -139,10 +139,10 @@ export class HealthMonitor {
     nowIso: string,
   ): Promise<AgentHealthStatus> {
     const nowMs = Date.parse(nowIso);
-    const currentTask = this.getActiveTask(child.address);
+    const currentTask = this.getActiveTask(child.accountId);
     const lastHeartbeat = this.resolveLastHeartbeat(child);
-    const creditBalance = await this.getCreditBalance(child.address);
-    const errorStats = this.getErrorStats(child.address);
+    const creditBalance = await this.getCreditBalance(child.accountId);
+    const errorStats = this.getErrorStats(child.accountId);
 
     const issues = new Set<string>();
 
@@ -180,7 +180,7 @@ export class HealthMonitor {
     }
 
     return {
-      address: child.address,
+      address: child.accountId,
       name: child.name,
       status: child.status,
       healthy: issues.size === 0,
@@ -197,17 +197,17 @@ export class HealthMonitor {
       .prepare(
         `SELECT MAX(created_at) AS ts
          FROM event_stream
-         WHERE agent_address = ?`,
+         WHERE agent_id = ?`,
       )
-      .get(child.address) as { ts: string | null } | undefined;
+      .get(child.accountId) as { ts: string | null } | undefined;
 
     const inboxRow = this.db.raw
       .prepare(
         `SELECT MAX(received_at) AS ts
          FROM inbox_messages
-         WHERE from_address = ?`,
+         WHERE from_account_id = ?`,
       )
-      .get(child.address) as { ts: string | null } | undefined;
+      .get(child.accountId) as { ts: string | null } | undefined;
 
     return latestIso([
       child.lastChecked ?? null,
@@ -331,7 +331,7 @@ export class HealthMonitor {
       const result = await this.funding.fundChild(agent.address, amountCents);
       return {
         type: "fund",
-        agentAddress: agent.address,
+        agentId: agent.address,
         reason: `credit balance ${currentBalance}c below ${MIN_INFERENCE_CREDITS_CENTS}c`,
         success: result.success,
       };
@@ -342,7 +342,7 @@ export class HealthMonitor {
       });
       return {
         type: "fund",
-        agentAddress: agent.address,
+        agentId: agent.address,
         reason: `credit balance ${currentBalance}c below threshold`,
         success: false,
       };
@@ -359,7 +359,7 @@ export class HealthMonitor {
 
     return {
       type: "restart",
-      agentAddress: agent.address,
+      agentId: agent.address,
       reason,
       success,
     };
@@ -380,7 +380,7 @@ export class HealthMonitor {
     if (!task) {
       return {
         type: "reassign",
-        agentAddress: agent.address,
+        agentId: agent.address,
         reason: `task ${taskId} not found`,
         success: false,
       };
@@ -420,7 +420,7 @@ export class HealthMonitor {
 
       return {
         type: "reassign",
-        agentAddress: agent.address,
+        agentId: agent.address,
         reason: `task ${taskId} exceeded max retries`,
         success: false,
       };
@@ -445,7 +445,7 @@ export class HealthMonitor {
 
     return {
       type: "reassign",
-      agentAddress: agent.address,
+      agentId: agent.address,
       reason,
       success: true,
     };
@@ -460,7 +460,7 @@ export class HealthMonitor {
 
     return {
       type: "stop",
-      agentAddress: agent.address,
+      agentId: agent.address,
       reason,
       success,
     };

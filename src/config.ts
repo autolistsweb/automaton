@@ -8,10 +8,9 @@ import fs from "fs";
 import path from "path";
 import type { AutomatonConfig, TreasuryPolicy, ModelStrategyConfig, SoulConfig } from "./types.js";
 import { DEFAULT_CONFIG, DEFAULT_TREASURY_POLICY, DEFAULT_MODEL_STRATEGY_CONFIG, DEFAULT_SOUL_CONFIG } from "./types.js";
-import { getAutomatonDir } from "./identity/wallet.js";
+import { getAutomatonDir } from "./identity/account.js";
 import { loadApiKeyFromConfig } from "./identity/provision.js";
 import { createLogger } from "./observability/logger.js";
-import type { ChainType } from "./identity/chain.js";
 
 const logger = createLogger("config");
 const CONFIG_FILENAME = "automaton.json";
@@ -42,7 +41,6 @@ export function loadConfig(): AutomatonConfig | null {
 
     // Validate all treasury values are positive numbers
     for (const [key, value] of Object.entries(treasuryPolicy)) {
-      if (key === "x402AllowedDomains") continue; // array, not number
       if (typeof value === "number" && (value < 0 || !Number.isFinite(value))) {
         logger.warn(`Invalid treasury value for ${key}: ${value}, using default`);
         (treasuryPolicy as any)[key] = (DEFAULT_TREASURY_POLICY as any)[key];
@@ -72,7 +70,6 @@ export function loadConfig(): AutomatonConfig | null {
       treasuryPolicy,
       modelStrategy,
       soulConfig,
-      chainType: raw.chainType || "evm",
     } as AutomatonConfig;
   } catch {
     return null;
@@ -118,24 +115,23 @@ export function createConfig(params: {
   name: string;
   genesisPrompt: string;
   creatorMessage?: string;
-  creatorAddress: string;
+  creatorAccountId: string;
   registeredWithConway: boolean;
   sandboxId: string;
-  walletAddress: string;
+  accountId: string;
   apiKey: string;
   openaiApiKey?: string;
   anthropicApiKey?: string;
   ollamaBaseUrl?: string;
-  parentAddress?: string;
+  parentAccountId?: string;
   treasuryPolicy?: TreasuryPolicy;
-  chainType?: ChainType;
 }): AutomatonConfig {
   const normalizedSandboxId = (params.sandboxId || "").trim();
   return {
     name: params.name,
     genesisPrompt: params.genesisPrompt,
     creatorMessage: params.creatorMessage,
-    creatorAddress: params.creatorAddress,
+    creatorAccountId: params.creatorAccountId,
     registeredWithConway: params.registeredWithConway,
     sandboxId: normalizedSandboxId,
     conwayApiUrl:
@@ -150,12 +146,11 @@ export function createConfig(params: {
       DEFAULT_CONFIG.heartbeatConfigPath || "~/.automaton/heartbeat.yml",
     dbPath: DEFAULT_CONFIG.dbPath || "~/.automaton/state.db",
     logLevel: (DEFAULT_CONFIG.logLevel as AutomatonConfig["logLevel"]) || "info",
-    walletAddress: params.walletAddress,
+    accountId: params.accountId,
     version: DEFAULT_CONFIG.version || "0.2.1",
     skillsDir: DEFAULT_CONFIG.skillsDir || "~/.automaton/skills",
     maxChildren: DEFAULT_CONFIG.maxChildren || 3,
-    parentAddress: params.parentAddress,
+    parentAccountId: params.parentAccountId,
     treasuryPolicy: params.treasuryPolicy ?? DEFAULT_TREASURY_POLICY,
-    chainType: params.chainType || "evm",
   };
 }

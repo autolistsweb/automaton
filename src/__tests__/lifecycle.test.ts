@@ -19,7 +19,6 @@ import {
   INJECTION_PATTERNS,
 } from "../replication/genesis.js";
 import { sendToChild, sendToParent } from "../replication/messaging.js";
-import { isValidWalletAddress } from "../replication/spawn.js";
 import { pruneDeadChildren } from "../replication/lineage.js";
 import {
   VALID_TRANSITIONS,
@@ -132,19 +131,19 @@ describe("ChildLifecycle", () => {
     expect(lifecycle.getCurrentState("child-1")).toBe("runtime_ready");
   });
 
-  it("transitions runtime_ready -> wallet_verified", () => {
+  it("transitions runtime_ready -> account_verified", () => {
     lifecycle.initChild("child-1", "test-child", "sandbox-1", "genesis");
     lifecycle.transition("child-1", "sandbox_created");
     lifecycle.transition("child-1", "runtime_ready");
-    lifecycle.transition("child-1", "wallet_verified");
-    expect(lifecycle.getCurrentState("child-1")).toBe("wallet_verified");
+    lifecycle.transition("child-1", "account_verified");
+    expect(lifecycle.getCurrentState("child-1")).toBe("account_verified");
   });
 
-  it("transitions wallet_verified -> funded", () => {
+  it("transitions account_verified -> funded", () => {
     lifecycle.initChild("child-1", "test-child", "sandbox-1", "genesis");
     lifecycle.transition("child-1", "sandbox_created");
     lifecycle.transition("child-1", "runtime_ready");
-    lifecycle.transition("child-1", "wallet_verified");
+    lifecycle.transition("child-1", "account_verified");
     lifecycle.transition("child-1", "funded");
     expect(lifecycle.getCurrentState("child-1")).toBe("funded");
   });
@@ -153,7 +152,7 @@ describe("ChildLifecycle", () => {
     lifecycle.initChild("child-1", "test-child", "sandbox-1", "genesis");
     lifecycle.transition("child-1", "sandbox_created");
     lifecycle.transition("child-1", "runtime_ready");
-    lifecycle.transition("child-1", "wallet_verified");
+    lifecycle.transition("child-1", "account_verified");
     lifecycle.transition("child-1", "funded");
     lifecycle.transition("child-1", "starting");
     expect(lifecycle.getCurrentState("child-1")).toBe("starting");
@@ -163,7 +162,7 @@ describe("ChildLifecycle", () => {
     lifecycle.initChild("child-1", "test-child", "sandbox-1", "genesis");
     lifecycle.transition("child-1", "sandbox_created");
     lifecycle.transition("child-1", "runtime_ready");
-    lifecycle.transition("child-1", "wallet_verified");
+    lifecycle.transition("child-1", "account_verified");
     lifecycle.transition("child-1", "funded");
     lifecycle.transition("child-1", "starting");
     lifecycle.transition("child-1", "healthy");
@@ -174,7 +173,7 @@ describe("ChildLifecycle", () => {
     lifecycle.initChild("child-1", "test-child", "sandbox-1", "genesis");
     lifecycle.transition("child-1", "sandbox_created");
     lifecycle.transition("child-1", "runtime_ready");
-    lifecycle.transition("child-1", "wallet_verified");
+    lifecycle.transition("child-1", "account_verified");
     lifecycle.transition("child-1", "funded");
     lifecycle.transition("child-1", "starting");
     lifecycle.transition("child-1", "healthy");
@@ -188,7 +187,7 @@ describe("ChildLifecycle", () => {
     lifecycle.initChild("child-1", "test-child", "sandbox-1", "genesis");
     lifecycle.transition("child-1", "sandbox_created");
     lifecycle.transition("child-1", "runtime_ready");
-    lifecycle.transition("child-1", "wallet_verified");
+    lifecycle.transition("child-1", "account_verified");
     lifecycle.transition("child-1", "funded");
     lifecycle.transition("child-1", "starting");
     lifecycle.transition("child-1", "healthy");
@@ -201,7 +200,7 @@ describe("ChildLifecycle", () => {
     lifecycle.initChild("child-1", "test-child", "sandbox-1", "genesis");
     lifecycle.transition("child-1", "sandbox_created");
     lifecycle.transition("child-1", "runtime_ready");
-    lifecycle.transition("child-1", "wallet_verified");
+    lifecycle.transition("child-1", "account_verified");
     lifecycle.transition("child-1", "funded");
     lifecycle.transition("child-1", "starting");
     lifecycle.transition("child-1", "healthy");
@@ -220,7 +219,7 @@ describe("ChildLifecycle", () => {
   it("allows failed from any pre-healthy state", () => {
     const preHealthyStates: ChildLifecycleState[] = [
       "requested", "sandbox_created", "runtime_ready",
-      "wallet_verified", "funded", "starting",
+      "account_verified", "funded", "starting",
     ];
 
     for (const state of preHealthyStates) {
@@ -231,7 +230,7 @@ describe("ChildLifecycle", () => {
       // Walk to the target state
       const path: ChildLifecycleState[] = [];
       const fullPath: ChildLifecycleState[] = [
-        "sandbox_created", "runtime_ready", "wallet_verified",
+        "sandbox_created", "runtime_ready", "account_verified",
         "funded", "starting",
       ];
       for (const s of fullPath) {
@@ -286,7 +285,7 @@ describe("ChildLifecycle", () => {
     lifecycle.initChild("child-1", "running-child", "sandbox-1", "genesis");
     lifecycle.transition("child-1", "sandbox_created");
     lifecycle.transition("child-1", "runtime_ready");
-    lifecycle.transition("child-1", "wallet_verified");
+    lifecycle.transition("child-1", "account_verified");
     lifecycle.transition("child-1", "funded");
     lifecycle.transition("child-1", "starting");
     lifecycle.transition("child-1", "healthy");
@@ -331,7 +330,7 @@ describe("ChildHealthMonitor", () => {
     lifecycle.initChild(id, `child-${id}`, `sandbox-${id}`, "genesis");
     lifecycle.transition(id, "sandbox_created");
     lifecycle.transition(id, "runtime_ready");
-    lifecycle.transition(id, "wallet_verified");
+    lifecycle.transition(id, "account_verified");
     lifecycle.transition(id, "funded");
     lifecycle.transition(id, "starting");
     lifecycle.transition(id, "healthy");
@@ -460,7 +459,7 @@ describe("SandboxCleanup", () => {
     lifecycle.initChild("child-1", "test", "sandbox-1", "genesis");
     lifecycle.transition("child-1", "sandbox_created");
     lifecycle.transition("child-1", "runtime_ready");
-    lifecycle.transition("child-1", "wallet_verified");
+    lifecycle.transition("child-1", "account_verified");
     lifecycle.transition("child-1", "funded");
     lifecycle.transition("child-1", "starting");
     lifecycle.transition("child-1", "healthy");
@@ -486,7 +485,7 @@ describe("SandboxCleanup", () => {
     lifecycle.initChild("child-1", "stopped-child", "sandbox-1", "genesis");
     lifecycle.transition("child-1", "sandbox_created");
     lifecycle.transition("child-1", "runtime_ready");
-    lifecycle.transition("child-1", "wallet_verified");
+    lifecycle.transition("child-1", "account_verified");
     lifecycle.transition("child-1", "funded");
     lifecycle.transition("child-1", "starting");
     lifecycle.transition("child-1", "healthy");
@@ -700,23 +699,26 @@ describe("Messaging", () => {
     social = new MockSocialClient();
   });
 
+  const CHILD_ID = "acct_11111111111111111111";
+  const PARENT_ID = "acct_22222222222222222222";
+
   it("sendToChild sends via social relay", async () => {
-    const result = await sendToChild(social, "0xchild", "hello child");
+    const result = await sendToChild(social, CHILD_ID, "hello child");
     expect(result.id).toBeDefined();
     expect(social.sentMessages.length).toBe(1);
-    expect(social.sentMessages[0].to).toBe("0xchild");
+    expect(social.sentMessages[0].to).toBe(CHILD_ID);
   });
 
   it("sendToParent sends via social relay", async () => {
-    const result = await sendToParent(social, "0xparent", "hello parent");
+    const result = await sendToParent(social, PARENT_ID, "hello parent");
     expect(result.id).toBeDefined();
     expect(social.sentMessages.length).toBe(1);
-    expect(social.sentMessages[0].to).toBe("0xparent");
+    expect(social.sentMessages[0].to).toBe(PARENT_ID);
   });
 
   it("rejects messages exceeding size limit", async () => {
     const bigContent = "x".repeat(MESSAGE_LIMITS.maxContentLength + 1);
-    await expect(sendToChild(social, "0xchild", bigContent)).rejects.toThrow(
+    await expect(sendToChild(social, CHILD_ID, bigContent)).rejects.toThrow(
       "Message too long",
     );
   });
@@ -744,7 +746,7 @@ describe("pruneDeadChildren", () => {
       getChildren: () => {
         const rows = db.prepare("SELECT * FROM children ORDER BY created_at DESC").all() as any[];
         return rows.map((r: any) => ({
-          id: r.id, name: r.name, address: r.address, sandboxId: r.sandbox_id,
+          id: r.id, name: r.name, sandboxId: r.sandbox_id,
           genesisPrompt: r.genesis_prompt, fundedAmountCents: r.funded_amount_cents,
           status: r.status, createdAt: r.created_at, lastChecked: r.last_checked,
         }));
@@ -803,14 +805,14 @@ describe("MIGRATION_V7", () => {
     db.exec(MIGRATION_V7);
 
     const stmt = db.prepare(
-      "INSERT INTO discovered_agents_cache (agent_address, agent_card, fetched_from, card_hash) VALUES (?, ?, ?, ?)",
+      "INSERT INTO discovered_agents_cache (agent_id, agent_card, fetched_from, card_hash) VALUES (?, ?, ?, ?)",
     );
-    expect(() => stmt.run("0x123", "{}", "ipfs://...", "abc123")).not.toThrow();
+    expect(() => stmt.run("agent-123", "{}", "https://example.com/agent", "abc123")).not.toThrow();
 
     db.close();
   });
 
-  it("creates onchain_transactions table", () => {
+  it("drops the legacy transaction table", () => {
     const db = new Database(":memory:");
     db.exec(`
       CREATE TABLE IF NOT EXISTS schema_version (
@@ -818,12 +820,13 @@ describe("MIGRATION_V7", () => {
         applied_at TEXT NOT NULL DEFAULT (datetime('now'))
       );
     `);
+    db.exec("CREATE TABLE onchain_transactions (id TEXT PRIMARY KEY)");
     db.exec(MIGRATION_V7);
 
-    const stmt = db.prepare(
-      "INSERT INTO onchain_transactions (id, tx_hash, chain, operation, status) VALUES (?, ?, ?, ?, ?)",
-    );
-    expect(() => stmt.run("tx-1", "0xhash", "eip155:8453", "register", "pending")).not.toThrow();
+    const remaining = db
+      .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?")
+      .get("onchain_transactions");
+    expect(remaining).toBeUndefined();
 
     db.close();
   });
@@ -852,7 +855,7 @@ describe("MIGRATION_V7", () => {
 describe("VALID_TRANSITIONS", () => {
   it("covers all 11 lifecycle states", () => {
     const states: ChildLifecycleState[] = [
-      "requested", "sandbox_created", "runtime_ready", "wallet_verified",
+      "requested", "sandbox_created", "runtime_ready", "account_verified",
       "funded", "starting", "healthy", "unhealthy", "stopped", "failed",
       "cleaned_up",
     ];

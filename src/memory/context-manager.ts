@@ -80,7 +80,7 @@ export type EventType =
 export interface StreamEvent {
   id: string;
   type: EventType | string;
-  agentAddress: string;
+  agentId: string;
   goalId: string | null;
   taskId: string | null;
   content: string;
@@ -128,6 +128,14 @@ function formatCacheKey(text: string, model?: string): string {
   return `${model ?? "default"}::${text}`;
 }
 
+/**
+ * Encoding cost grows superlinearly with input size (tens of seconds for
+ * multi-kilobyte payloads), so anything longer than this falls back to the
+ * character-count heuristic below, which is the same approximation used when
+ * the encoder is unavailable.
+ */
+const MAX_ENCODED_TEXT_LENGTH = 1024;
+
 export function createTokenCounter(): TokenCounter {
   const cache = new Map<string, number>();
   let encoder: Tiktoken | null = null;
@@ -150,7 +158,7 @@ export function createTokenCounter(): TokenCounter {
     }
 
     let count: number;
-    if (encoder) {
+    if (encoder && normalizedText.length <= MAX_ENCODED_TEXT_LENGTH) {
       try {
         count = encoder.encode(normalizedText).length;
       } catch {
@@ -487,7 +495,7 @@ export class ContextManager {
     return {
       id,
       type,
-      agentAddress: typeof event?.agentAddress === "string" ? event.agentAddress : "unknown",
+      agentId: typeof event?.agentId === "string" ? event.agentId : "unknown",
       goalId: typeof event?.goalId === "string" ? event.goalId : null,
       taskId: typeof event?.taskId === "string" ? event.taskId : null,
       content,

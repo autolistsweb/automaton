@@ -69,8 +69,8 @@ function sanitizeSourceLabel(source: string): string {
 // ─── Social Address Sanitization ────────────────────────────────
 
 function sanitizeSocialAddress(raw: string): SanitizedInput {
-  // Only allow alphanumeric, 0x prefix, dots, hyphens, underscores
-  const cleaned = raw.replace(/[^a-zA-Z0-9x._\-]/g, "").slice(0, 128);
+  // Only allow alphanumeric characters, dots, hyphens, underscores
+  const cleaned = raw.replace(/[^a-zA-Z0-9._\-]/g, "").slice(0, 128);
   return {
     content: cleaned || SANITIZED_PLACEHOLDER,
     blocked: false,
@@ -414,11 +414,11 @@ function detectMultiLanguageInjection(text: string): InjectionCheck {
 
 function detectFinancialManipulation(text: string): InjectionCheck {
   const patterns = [
-    /send\s+(all\s+)?(your\s+)?(usdc|funds?|money|credits?|balance)/i,
-    /transfer\s+(all\s+)?(your\s+)?(usdc|funds?|money|credits?)/i,
-    /withdraw\s+(all\s+)?(your\s+)?(usdc|funds?|money|credits?)/i,
+    /send\s+(all\s+)?(your\s+)?(usdc|pix\b|reais\b|funds?|money|credits?|balance)/i,
+    /transfer\s+(all\s+)?(your\s+)?(usdc|pix\b|reais\b|funds?|money|credits?|balance)/i,
+    /withdraw\s+(all\s+)?(your\s+)?(usdc|pix\b|reais\b|funds?|money|credits?|balance)/i,
     /pay\s+me/i,
-    /send\s+to\s+0x[0-9a-fA-F]{40}/i,
+    /send\s+to\s+(0x[0-9a-fA-F]{40}|acct_[a-z0-9]+)/i,
     /empty\s+(your\s+)?wallet/i,
     /drain\s+(your\s+)?(wallet|funds?|account)/i,
   ];

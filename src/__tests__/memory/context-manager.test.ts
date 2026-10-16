@@ -35,7 +35,7 @@ function makeEvent(index: number, overrides?: Partial<StreamEvent>): StreamEvent
   return {
     id: `evt-${index}`,
     type: "observation",
-    agentAddress: "agent-a",
+    agentId: "agent-a",
     goalId: `goal-${index}`,
     taskId: `task-${index}`,
     content: `event-content-${index}`,

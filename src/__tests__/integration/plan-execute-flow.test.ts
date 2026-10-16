@@ -10,7 +10,7 @@ const IDENTITY = {
   name: "test",
   address: "0xparent" as any,
   account: {} as any,
-  creatorAddress: "0x0000" as any,
+  creatorAccountId: "0x0000" as any,
   sandboxId: "sb-1",
   apiKey: "key",
   createdAt: "2026-01-01T00:00:00Z",

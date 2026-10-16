@@ -8,6 +8,7 @@ dist
 *.db-wal
 *.db-shm
 *.tgz
-.automaton/wallet.json
+coverage
+.automaton/account.json
 .automaton/state.db
 

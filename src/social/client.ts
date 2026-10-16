@@ -2,15 +2,15 @@
  * Social Client Factory
  *
  * Creates a SocialClient for the automaton runtime.
- * Self-contained: uses viem for signing and fetch for HTTP.
+ * Self-contained: signs with the local account key and talks to the relay over HTTPS.
  *
  * Phase 3.2: Hardened with HTTPS enforcement, shared signing,
  * request timeouts, replay protection, and rate limiting.
  */
 
-import type { PrivateKeyAccount } from "viem";
+import type { AccountIdentity } from "../identity/account.js";
 import type { SocialClientInterface, InboxMessage } from "../types.js";
-import type { ChainIdentity } from "../identity/chain.js";
+
 import { ResilientHttpClient } from "../conway/http-client.js";
 import { signSendPayload, signPollPayload, MESSAGE_LIMITS } from "./signing.js";
 import { validateRelayUrl, validateMessage } from "./validation.js";
@@ -21,13 +21,13 @@ const logger = createLogger("social");
 const REQUEST_TIMEOUT_MS = 30_000;
 
 /**
- * Create a SocialClient wired to the agent's wallet.
+ * Create a SocialClient wired to the agent's account identity.
  *
  * @throws if relayUrl is not HTTPS
  */
 export function createSocialClient(
   relayUrl: string,
-  account: PrivateKeyAccount | ChainIdentity,
+  account: AccountIdentity,
   db?: import("better-sqlite3").Database,
 ): SocialClientInterface {
   // Phase 3.2: Validate relay URL as HTTPS
@@ -90,7 +90,7 @@ export function createSocialClient(
       outboundTimestamps.push(Date.now());
 
       // Phase 3.2: Validate message before sending
-      const validation = validateMessage({ from: account.address, to, content });
+      const validation = validateMessage({ from: account.accountId, to, content });
       if (!validation.valid) {
         throw new Error(`Message validation failed: ${validation.errors.join("; ")}`);
       }
@@ -127,7 +127,7 @@ export function createSocialClient(
         method: "POST",
         headers: {
           "Content-Type": "application/json",
-          "X-Wallet-Address": pollAuth.address,
+          "X-Account-Id": pollAuth.accountId,
           "X-Signature": pollAuth.signature,
           "X-Timestamp": pollAuth.timestamp,
         },
@@ -186,7 +186,7 @@ export function createSocialClient(
       const res = await httpClient.request(`${baseUrl}/v1/messages/count`, {
         method: "GET",
         headers: {
-          "X-Wallet-Address": pollAuth.address,
+          "X-Account-Id": pollAuth.accountId,
           "X-Signature": pollAuth.signature,
           "X-Timestamp": pollAuth.timestamp,
         },

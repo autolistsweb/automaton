@@ -6,7 +6,7 @@ import {
 
 function makeUpdate(overrides: Partial<AgentStatusUpdate> = {}): AgentStatusUpdate {
   return {
-    agentAddress: "0xagent1",
+    agentId: "0xagent1",
     department: "engineering",
     role: "generalist",
     status: "running",
@@ -183,7 +183,7 @@ describe("AgentContextAggregator", () => {
     it("respects token budget and truncates when exceeded", () => {
       const updates = Array.from({ length: 50 }, (_, i) =>
         makeUpdate({
-          agentAddress: `0xagent${i}`,
+          agentId: `0xagent${i}`,
           department: `dept-${i % 5}`,
           message: `Long message about progress on task number ${i} with details`,
         }),

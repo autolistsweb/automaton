@@ -1,5 +1,6 @@
 import readline from "readline";
 import chalk from "chalk";
+import { isValidAccountId } from "../identity/account.js";
 
 let rl: readline.Interface | null = null;
 
@@ -64,23 +65,16 @@ export async function promptMultiline(label: string): Promise<string> {
   return result;
 }
 
-export async function promptAddress(label: string, chainType?: string): Promise<string> {
+/**
+ * Prompt for an automaton account id (`acct_` + lowercase hex).
+ */
+export async function promptAccountId(label: string): Promise<string> {
   while (true) {
     const value = await ask(chalk.white(`  → ${label}: `));
-    if (chainType === "solana") {
-      // Solana: base58-encoded 32-byte public key
-      try {
-        const bs58 = await import("bs58");
-        if (bs58.default.decode(value).length === 32) return value;
-      } catch {
-        // fall through to error
-      }
-      console.log(chalk.yellow("  Invalid Solana address. Must be a base58-encoded 32-byte public key."));
-    } else {
-      // EVM: 0x + 40 hex chars
-      if (/^0x[0-9a-fA-F]{40}$/.test(value)) return value;
-      console.log(chalk.yellow("  Invalid Ethereum address. Must be 0x followed by 40 hex characters."));
-    }
+    if (isValidAccountId(value)) return value;
+    console.log(
+      chalk.yellow("  Invalid account id. Must be acct_ followed by lowercase hex characters."),
+    );
   }
 }
 

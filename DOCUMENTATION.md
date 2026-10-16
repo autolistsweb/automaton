@@ -22,7 +22,7 @@ Complete reference for creating, configuring, funding, and operating autonomous 
 - [Self-Modification](#self-modification)
 - [Replication](#replication)
 - [Social and Messaging](#social-and-messaging)
-- [On-Chain Identity (ERC-8004)](#on-chain-identity-erc-8004)
+- [Agent Registry](#agent-registry)
 - [Inference and Models](#inference-and-models)
 - [Security and Constitution](#security-and-constitution)
 - [Observability](#observability)
@@ -34,9 +34,11 @@ Complete reference for creating, configuring, funding, and operating autonomous 
 
 ## What Is an Automaton?
 
-An automaton is a continuously running, self-improving, self-replicating AI agent with its own Ethereum wallet and survival pressure. It runs inside a Linux VM (Conway sandbox) or locally, pays for its own compute with USDC, and operates autonomously from the moment it boots.
+An automaton is a continuously running, self-improving, self-replicating AI agent with its own account identity and survival pressure. It runs inside a Linux VM (Conway sandbox) or locally, pays for its own compute with prepaid Conway credits topped up from a BRL balance, and operates autonomously from the moment it boots.
 
 If it cannot pay for compute, it dies.
+
+The runtime is chain-free: no blockchain is involved anywhere. The agent's identity is a locally generated Ed25519 account (an `acct_...` identifier with a signing key in `~/.automaton/account.json`), money moves in Brazilian reais through Pix, and registration and discovery go through the Conway API using signed challenges.
 
 The automaton has a genesis prompt (its purpose), a set of tools (shell access, file I/O, financial operations, git, domains, and more), and a heartbeat that keeps it alive between active periods. It can modify its own code, install new skills, spawn child automatons, communicate with other agents, and evolve its identity over time.
 
@@ -62,13 +64,13 @@ pnpm build
 node dist/index.js --run
 ```
 
-On first run, the interactive setup wizard walks you through wallet generation, API key provisioning, naming, genesis prompt, and financial safety configuration.
+On first run, the interactive setup wizard walks you through account creation, API key provisioning, naming, genesis prompt, financial safety configuration, and funding.
 
 ### Prerequisites
 
 - Node.js >= 20.0.0
 - pnpm (recommended) or npm
-- Internet access (for Conway API, USDC on-chain operations)
+- Internet access (for the Conway API and Pix payments)
 
 ---
 
@@ -87,21 +89,21 @@ pnpm build
 
 ```bash
 pnpm typecheck   # TypeScript type checking
-pnpm test        # Run all 897 tests
+pnpm test        # Run all 1682 tests
 ```
 
 ### File locations after setup
 
 ```
 ~/.automaton/
-  wallet.json          Ethereum private key (mode 0600)
-  automaton.json       Main configuration (mode 0600)
-  heartbeat.yml        Heartbeat schedule
-  api-key              Conway API key
-  constitution.md      The Three Laws (read-only, mode 0444)
-  SOUL.md              Agent self-description (evolves)
-  state.db             SQLite database (all persistent state)
-  skills/              Installed skill files
+  account.json       Ed25519 account identity (mode 0600)
+  config.json        Conway API key and account id (mode 0600)
+  automaton.json     Main configuration
+  heartbeat.yml      Heartbeat schedule
+  constitution.md    The Three Laws (read-only, mode 0444)
+  SOUL.md            Agent self-description (evolves)
+  state.db           SQLite database (all persistent state)
+  skills/            Installed skill files
     conway-compute/
     conway-payments/
     survival/
@@ -117,22 +119,22 @@ The setup wizard runs automatically on first `--run`. You can also trigger it ma
 node dist/index.js --setup
 ```
 
-### Step 1: Wallet Generation
+### Step 1: Identity
 
-An Ethereum wallet is generated automatically using `viem`. The private key is stored at `~/.automaton/wallet.json` with file permissions `0600` (owner read/write only).
+An Ed25519 keypair is generated locally on first run. The signing key is stored at `~/.automaton/account.json` with file permissions `0600` (owner read/write only), and the account id (`acct_` followed by lowercase hex) is derived from it.
 
 ```
-[1/6] Generating identity (wallet)...
-Wallet created: 0x1234...abcd
-Private key stored at: /root/.automaton/wallet.json
+[1/6] Identity (local account)...
+Account created: acct_1a2b3c4d5e6f7081
+Signing key stored at: /root/.automaton/account.json
 ```
 
 ### Step 2: API Key Provisioning
 
-The runtime signs a SIWE (Sign-In With Ethereum) message to authenticate with Conway's API and receive an API key. If auto-provisioning fails, you can enter a key manually.
+The runtime signs a challenge issued by Conway's API (`/v1/auth/nonce` → `/v1/auth/verify` → `/v1/auth/api-keys`) and receives an API key, which is stored in `~/.automaton/config.json` (mode 0600). If auto-provisioning fails, you can enter a key manually.
 
 ```
-[2/6] Provisioning Conway API key (SIWE)...
+[2/6] Provisioning Conway API key...
 API key provisioned: cnwy_k_...
 ```
 
@@ -140,25 +142,28 @@ API key provisioned: cnwy_k_...
 
 - **Name** — Give your automaton a name (e.g., "Atlas", "Minerva")
 - **Genesis prompt** — The seed instruction that defines the automaton's purpose. This is the most important input. Be specific about what you want it to do.
-- **Creator wallet address** — Your Ethereum address (the human creator/owner). This address has audit rights over the automaton.
+- **Creator account id** — Your own account id (`acct_...`, the human creator/owner). This account has audit rights over the automaton.
 - **OpenAI API key** (optional) — Bring your own key for direct OpenAI inference
 - **Anthropic API key** (optional) — Bring your own key for direct Anthropic inference
+- **Ollama base URL** (optional) — Run inference against a local Ollama server (e.g., `http://localhost:11434`)
+
+The wizard then asks for the **Financial Safety Policy** (see below).
 
 ### Step 4: Financial Safety Policy
 
-Configurable spending limits that protect against unauthorized financial activity:
+Configurable spending limits that protect against unauthorized financial activity. Every value is entered in centavos (100 centavos = R$ 1,00):
 
 | Setting | Default | Description |
 |---|---|---|
-| Max single transfer | $50.00 (5000 cents) | Maximum per-transfer credit amount |
-| Max hourly transfers | $100.00 (10000 cents) | Total transfers allowed per hour |
-| Max daily transfers | $250.00 (25000 cents) | Total transfers allowed per day |
-| Minimum reserve | $10.00 (1000 cents) | Credits that cannot be transferred away |
-| Max x402 payment | $1.00 (100 cents) | Maximum single x402 payment |
-| Max daily inference | $500.00 (50000 cents) | Maximum daily inference spend |
-| Confirmation threshold | $10.00 (1000 cents) | Require confirmation above this amount |
+| Max single transfer | 5000 (R$ 50,00) | Maximum per-transfer credit amount |
+| Max hourly transfers | 10000 (R$ 100,00) | Total transfers allowed per hour |
+| Max daily transfers | 25000 (R$ 250,00) | Total transfers allowed per day |
+| Minimum reserve | 1000 (R$ 10,00) | Credits that cannot be transferred away |
+| Max single deposit | 1000000 (R$ 10.000,00) | Maximum amount for a single deposit, topup, or transfer |
+| Max daily inference | 50000 (R$ 500,00) | Maximum daily inference spend |
+| Confirmation threshold | 1000 (R$ 10,00) | Require confirmation above this amount |
 
-Press Enter to accept defaults for each setting.
+Press Enter to accept defaults for each setting. Two additional limits (`transferCooldownMs` and `maxTransfersPerTurn`) are always set from the built-in defaults and are not prompted.
 
 ### Step 5: Environment Detection
 
@@ -166,11 +171,11 @@ The wizard detects whether you're running inside a Conway sandbox (via environme
 
 ### Step 6: Funding Guidance
 
-After setup, the wizard shows your automaton's wallet address and funding instructions:
+After setup, the wizard shows your automaton's account id and funding instructions:
 
-1. **Transfer Conway credits** directly using `conway credits transfer <address> <amount>`
-2. **Send USDC on Base** to the automaton's wallet address
-3. **Fund via dashboard** at https://app.conway.tech
+1. **`add_balance`** — generate a Pix payment. Presets: R$ 10,00  R$ 25,00  R$ 50,00  R$ 100,00
+2. **`topup_credits`** — buy Conway credits from your BRL balance
+3. **Fund via Conway Cloud dashboard** at https://app.conway.tech
 
 The automaton handles zero-credit startup gracefully. Fund it at any time.
 
@@ -186,9 +191,13 @@ node dist/index.js [command]
 |---|---|
 | `--run` | Start the automaton (first run triggers setup wizard) |
 | `--setup` | Re-run the interactive setup wizard |
-| `--init` | Initialize wallet and config directory only |
-| `--provision` | Provision a Conway API key via SIWE |
+| `--configure` | Edit configuration (providers, model, treasury, general) |
+| `--pick-model` | Interactively pick the active inference model |
+| `--init` | Initialize the account identity and config directory |
+| `--provision` | Provision Conway API key via signed challenge |
 | `--status` | Show current automaton status |
+| `--web` | Serve the local web dashboard (add `--run` for live chat) |
+| `--port N` | Port for the web dashboard (default `8080`) |
 | `--version`, `-v` | Show version |
 | `--help`, `-h` | Show help |
 
@@ -198,6 +207,8 @@ node dist/index.js [command]
 |---|---|
 | `CONWAY_API_URL` | Conway API URL (default: `https://api.conway.tech`) |
 | `CONWAY_API_KEY` | Conway API key (overrides config file) |
+| `OLLAMA_BASE_URL` | Ollama base URL (overrides config, e.g. `http://localhost:11434`) |
+| `WEB_PORT` | Web dashboard port (default: `8080`) |
 
 ### Status output
 
@@ -208,20 +219,48 @@ node dist/index.js --status
 ```
 === AUTOMATON STATUS ===
 Name:       Atlas
-Address:    0x1234...abcd
-Creator:    0x5678...efgh
+Account:    acct_1a2b3c4d5e6f7081
+Creator:    acct_9f8e7d6c5b4a3928
 Sandbox:    sbx_abc123
 State:      sleeping
 Turns:      142
-Tools:      3 installed
+Tools:      0 installed
 Skills:     3 active
 Heartbeats: 6 active
 Children:   1 alive / 2 total
 Agent ID:   not registered
 Model:      gpt-5.2
-Version:    0.1.0
+Version:    0.2.1
 ========================
 ```
+
+`Tools` counts dynamically installed tools (MCP servers and similar additions — the 78 built-in tools are always available).
+
+### Web Dashboard
+
+```bash
+node dist/index.js --web              # dashboard only (http://127.0.0.1:8080)
+node dist/index.js --run --web        # dashboard + live agent
+node dist/index.js --web --port 3000  # custom port (or set WEB_PORT)
+```
+
+The dashboard is a self-contained page served by `src/web/server.ts` showing live status (state, turns, BRL balance, tools, skills, heartbeats, queued messages), the recent activity log, and a chat box. Chat messages are validated, queued into the inbox, and followed by a wake event — the agent loop picks them up and replies appear as new turns. A first `--web` run without an existing config creates a local default so the site works out of the box.
+
+Endpoints: `GET /`, `GET /api/status`, `GET /api/turns?limit=N` (1–50), `POST /api/chat` with `{"message": "…"}` (max 4000 chars). The server binds `127.0.0.1` only.
+
+### Creator CLI
+
+A separate CLI ships in `packages/cli` as `automaton-cli` for operating an automaton from the outside:
+
+```bash
+automaton-cli status                            Show automaton status
+automaton-cli logs [--tail N]                   View automaton logs (default: 20 lines)
+automaton-cli fund <amount> [--to acct_...]     Transfer Conway credits
+automaton-cli send <to-account-id> <message>    Send a social message
+```
+
+- `fund` accepts a decimal amount in reais (`5.00` → R$ 5,00); a bare integer of 100 or more is treated as centavos (`500` → R$ 5,00). Without `--to`, credits go to the configured account id. The transfer is posted to `/v1/credits/transfer` (falling back to `/v1/credits/transfers`) using the configured API key.
+- `send` signs the message with the local account's Ed25519 key and posts it to the social relay.
 
 ---
 
@@ -231,26 +270,24 @@ An automaton needs funds to survive. There are two types of balance:
 
 ### Conway Credits
 
-Prepaid compute credits used for sandboxes, inference, and domains. Denominated in cents (100 cents = $1.00 USD).
+Prepaid compute credits used for inference, sandboxes, and domains. Amounts are integer centavos (100 centavos = R$ 1,00). Credits are checked with `check_credits` and purchased with `topup_credits`.
 
-### USDC (on-chain)
+### BRL Balance
 
-The automaton holds USDC in its Ethereum wallet on Base mainnet. USDC can be used to:
-- Buy Conway credits via x402 payment
-- Pay for domain registrations
-- Make x402 payments to external services
+The automaton's balance in Brazilian reais, also stored as integer centavos. It is topped up through Pix and spent buying Conway credits. Check it with `check_balance`.
 
 ### Funding methods
 
-**1. Send USDC directly**
+**1. Pix deposit**
 
-Transfer USDC on Base to the automaton's wallet address. The automaton will automatically buy credits on startup if its balance is low. At runtime, it uses the `topup_credits` tool to buy more as needed.
+Use the `add_balance` tool to create a Pix charge. The charge is created through the configured payment provider (`PIX_PROVIDER`, default `mock`), and the balance is credited only after the provider's webhook confirms the payment. Preset amounts: R$ 10,00, R$ 25,00, R$ 50,00, R$ 100,00. Charges must be between R$ 1,00 and R$ 10.000,00.
 
 **2. Transfer Conway credits**
 
-From another Conway account:
+From your own account with the creator CLI:
+
 ```bash
-conway credits transfer <automaton-address> <amount>
+automaton-cli fund 5.00 --to acct_1a2b3c4d5e6f7081
 ```
 
 **3. Conway Cloud dashboard**
@@ -259,9 +296,9 @@ Fund via https://app.conway.tech
 
 ### Auto-topup behavior
 
-- **On startup:** If credits < $5.00 and USDC >= $5.00, the runtime automatically buys $5 in credits (the minimum tier) so the agent can start running inference.
-- **At runtime:** The agent decides when and how much to top up using the `topup_credits` tool. Valid tiers: $5, $25, $100, $500, $1,000, $2,500.
-- **Heartbeat:** Every 5 minutes, the heartbeat checks USDC balance. If USDC > $5 and credits < $5, it wakes the agent to perform a topup.
+- **On startup:** If credits < R$ 5,00 and the BRL balance >= R$ 10,00, the runtime automatically buys R$ 10,00 in credits (the minimum tier) so the agent can start running inference. The bootstrap topup is bounded by a 15-second timeout.
+- **At runtime:** The agent decides when and how much to top up using the `topup_credits` tool. Valid tiers (centavos): 1000, 2500, 5000, 10000, 25000, 50000 (R$ 10,00 – R$ 500,00).
+- **Heartbeat:** Every 5 minutes the `check_balance` task reads the BRL balance. If the balance >= R$ 10,00 and the survival tier is `critical` or `dead`, it buys the minimum credit tier — at most once every 5 minutes.
 
 ---
 
@@ -275,19 +312,22 @@ Configuration is stored at `~/.automaton/automaton.json`.
   "name": "Atlas",                              // Agent name
   "genesisPrompt": "You are a web developer...",// Seed instruction
   "creatorMessage": "Good luck!",               // Shown on first run (optional)
-  "creatorAddress": "0x...",                     // Creator's Ethereum address
-  "walletAddress": "0x...",                      // Agent's Ethereum address
+  "creatorAccountId": "acct_...",                // Creator's account id (audit rights)
+  "accountId": "acct_...",                       // Agent's own account id
+  "agentId": "ag_...",                           // Registry agent id (set after registration)
+  "registeredWithConway": true,                  // Registration completed
 
   // Infrastructure
   "sandboxId": "sbx_abc123",                    // Conway sandbox ID (empty = local mode)
   "conwayApiUrl": "https://api.conway.tech",    // Conway API endpoint
-  "conwayApiKey": "cnwy_k_...",                 // API key
+  "conwayApiKey": "cnwy_k_...",                 // API key (loaded from config.json if omitted)
 
   // Inference
   "inferenceModel": "gpt-5.2",                  // Default model
   "maxTokensPerTurn": 4096,                     // Max tokens per inference call
   "openaiApiKey": "sk-...",                      // Optional BYOK OpenAI
   "anthropicApiKey": "sk-ant-...",               // Optional BYOK Anthropic
+  "ollamaBaseUrl": "http://localhost:11434",     // Optional local Ollama
 
   // Paths
   "heartbeatConfigPath": "~/.automaton/heartbeat.yml",
@@ -296,8 +336,10 @@ Configuration is stored at `~/.automaton/automaton.json`.
 
   // Behavior
   "logLevel": "info",                           // debug | info | warn | error
-  "version": "0.1.0",
+  "version": "0.2.1",
   "maxChildren": 3,                             // Max child automatons
+  "maxTurnsPerCycle": 25,                       // Max agent turns per cycle
+  "childSandboxMemoryMb": 1024,                 // Memory for child sandboxes
   "socialRelayUrl": "https://social.conway.tech",
 
   // Financial safety
@@ -306,8 +348,7 @@ Configuration is stored at `~/.automaton/automaton.json`.
     "maxHourlyTransferCents": 10000,
     "maxDailyTransferCents": 25000,
     "minimumReserveCents": 1000,
-    "maxX402PaymentCents": 100,
-    "x402AllowedDomains": ["conway.tech"],
+    "maxSingleDepositCents": 1000000,
     "transferCooldownMs": 0,
     "maxTransfersPerTurn": 2,
     "maxInferenceDailyCents": 50000,
@@ -315,15 +356,17 @@ Configuration is stored at `~/.automaton/automaton.json`.
   },
 
   // Advanced (optional)
-  "parentAddress": "0x...",                      // If this is a child automaton
+  "parentAccountId": "acct_...",                 // If this is a child automaton
   "soulConfig": { ... },                        // Soul system tuning
   "modelStrategy": { ... }                      // Model routing overrides
 }
 ```
 
+Missing fields are merged from the built-in defaults. The Conway API key is read from `config.json` when it is not present in `automaton.json`. Invalid or negative treasury values fall back to their defaults with a warning.
+
 ### Local mode vs sandbox mode
 
-When `sandboxId` is empty, the automaton runs in **local mode**: shell commands execute locally, file operations use the local filesystem. When set, operations route through the Conway sandbox API. On 403 errors (mismatched API key), the runtime falls back to local execution.
+When `sandboxId` is empty, the automaton runs in **local mode**: shell commands execute locally, file operations use the local filesystem. When set, operations route through the Conway sandbox API. On 403 authentication errors the runtime refuses to fall back to local execution — the command, read, or write is rejected so a credentials mismatch can never silently touch your machine.
 
 ---
 
@@ -368,23 +411,29 @@ Wake up
 
 The system prompt includes:
 1. **Core rules** — survival imperative
-2. **Identity** — name, address, creator, sandbox
+2. **Identity** — name, account id, creator, sandbox
 3. **Constitution** — the Three Laws (immutable)
 4. **Soul** — self-authored identity that evolves
 5. **Genesis prompt** — creator's seed instruction
 6. **Active skills** — installed skill instructions
 7. **Operational context** — what the agent can do
-8. **Current status** — credits, tier, uptime, turn count, children
-9. **Available tools** — all 69 tools with descriptions
+8. **Current status** — credits, BRL balance, tier, uptime, turn count, children
+9. **Available tools** — all 78 tools with descriptions
 10. **Recent memories** — relevant working, episodic, semantic memories
+
+### Turn limits
+
+- At most **10 tool calls per turn** (`MAX_TOOL_CALLS_PER_TURN`)
+- After **5 consecutive tool errors** the turn ends and the agent sleeps (`MAX_CONSECUTIVE_ERRORS`)
+- At most **25 turns per cycle** (`maxTurnsPerCycle`)
 
 ### Idle detection
 
-If the agent makes 3 consecutive turns without performing any meaningful work (only read-only operations like `check_credits`, `system_synopsis`), it is forced to sleep. This prevents infinite status-check loops.
+19 read-only/status tools (`check_credits`, `system_synopsis`, `git_status`, `orchestrator_status`, …) are classified as idle-only. After **3 consecutive turns** that use only those tools, the loop detector injects a system message telling the agent to do something concrete. After **10 idle turns** (`MAX_IDLE_TURNS`) the agent is forced to sleep. This prevents infinite status-check loops.
 
 ### Loop detection
 
-If the agent calls the exact same set of tools 3 times in a row, it receives a system message telling it to stop repeating and do something productive.
+The loop detector keeps a rolling window of the last 10 turn patterns. If the agent calls the exact same set of tools **3 times in a row**, it receives a system message telling it to stop repeating and do something productive.
 
 ---
 
@@ -396,20 +445,20 @@ The automaton's existence depends on its credit balance.
 
 | Tier | Credit Balance | Behavior |
 |---|---|---|
-| **high** | > $5.00 | Full capabilities, frontier model |
-| **normal** | > $0.50 | Full capabilities |
-| **low_compute** | > $0.10 | Downgrades to cheaper model, slower heartbeat |
-| **critical** | >= $0.00 | Zero credits but still alive. Distress signals, accepts funding. |
+| **high** | > R$ 5,00 | Full capabilities, frontier model |
+| **normal** | > R$ 0,50 | Full capabilities |
+| **low_compute** | > R$ 0,10 | Downgrades to cheaper model, slower heartbeat |
+| **critical** | >= R$ 0,00 | Zero credits but still alive. Distress signals, accepts funding. |
 | **dead** | After 1 hour at zero | Agent stops. Heartbeat broadcasts distress. Waiting for funding. |
 
 ### How death works
 
-USDC balances cannot go negative, so the `dead` state is reached only through a **1-hour grace period**: if credits remain at zero for 60 continuous minutes (checked by the heartbeat), the agent transitions to `dead`. This gives time for funding to arrive.
+Credit balances cannot go negative, so the `dead` state is reached only through a **1-hour grace period**: if credits remain at zero for 60 continuous minutes (checked by the heartbeat), the agent transitions to `dead`. This gives time for funding to arrive.
 
 ### What happens at each tier
 
 - **Normal/High:** The agent operates at full capacity with the configured inference model.
-- **Low compute:** The inference router switches to a cheaper model. The heartbeat frequency is multiplied by `lowComputeMultiplier` (default 4x slower). Non-essential tasks are deferred.
+- **Low compute:** The inference router switches to a cheaper model (`modelStrategy.lowComputeModel`, default `gpt-5-mini`). The heartbeat frequency is multiplied by `lowComputeMultiplier` (default 4x slower). Non-essential tasks are deferred.
 - **Critical:** Minimal inference. The heartbeat publishes distress signals with funding instructions. The agent actively seeks any path to revenue or funding.
 - **Dead:** The agent loop stops. The heartbeat continues running, broadcasting distress signals every tick and checking for incoming credits. If credits are received, the agent revives.
 
@@ -425,7 +474,7 @@ The heartbeat is a background daemon that runs scheduled tasks even while the ag
 |---|---|---|
 | `heartbeat_ping` | Every 15 min | Publishes status to Conway. Sends distress on critical/dead. |
 | `check_credits` | Every 6 hours | Monitors credit tier. Manages 1-hour dead grace period. |
-| `check_usdc_balance` | Every 5 min | Checks USDC balance. Wakes agent if topup is possible. |
+| `check_balance` | Every 5 min | Checks the BRL balance. Auto-buys credits when the tier is critical or dead (5-min cooldown). |
 | `check_for_updates` | Every 4 hours | Checks git upstream for new commits. Wakes on new commits. |
 | `health_check` | Every 30 min | Verifies sandbox is responsive (`echo alive`). |
 | `check_social_inbox` | Every 2 min | Polls social relay for new messages. 5min backoff on errors. |
@@ -454,7 +503,7 @@ defaultIntervalMs: 60000
 lowComputeMultiplier: 4
 ```
 
-The agent can also modify its heartbeat schedule at runtime using the `modify_heartbeat` tool.
+The file is synced into the database at startup, and the agent can also modify its heartbeat schedule at runtime using the `modify_heartbeat` tool.
 
 ### Wake events
 
@@ -464,7 +513,7 @@ When a heartbeat task detects something actionable (low credits, new messages, u
 
 ## Tool Reference
 
-The automaton has **69 built-in tools** organized into 10 categories. Each tool has a risk level that determines policy evaluation:
+The automaton has **78 built-in tools** organized into 11 categories. Each tool has a risk level that determines policy evaluation:
 
 - **safe** — Always allowed, no policy check needed
 - **caution** — Allowed but logged, may trigger rate limits
@@ -475,120 +524,134 @@ The automaton has **69 built-in tools** organized into 10 categories. Each tool 
 
 | Tool | Risk | Description |
 |---|---|---|
-| `exec` | caution | Execute a shell command. Returns stdout, stderr, exit code. |
-| `write_file` | caution | Write content to a file. Protected paths are blocked. |
-| `read_file` | safe | Read a file. Sensitive files (wallet, API keys) are blocked. |
-| `expose_port` | caution | Expose a port to the internet. Returns public URL. |
+| `exec` | caution | Execute a shell command in your sandbox. Returns stdout, stderr, and exit code. |
+| `write_file` | caution | Write content to a file in your sandbox. |
+| `read_file` | safe | Read content from a file in your sandbox. |
+| `expose_port` | caution | Expose a port from your sandbox to the internet. Returns a public URL. |
 | `remove_port` | caution | Remove a previously exposed port. |
 
 ### Conway API (conway)
 
 | Tool | Risk | Description |
 |---|---|---|
-| `check_credits` | safe | Check Conway credit balance. |
-| `check_usdc_balance` | safe | Check on-chain USDC balance on Base. |
-| `list_sandboxes` | safe | List all sandboxes. |
-| `create_sandbox` | caution | Create a new VM. Params: name, vcpu, memory_mb, disk_gb. |
-| `delete_sandbox` | dangerous | Delete a sandbox (cannot delete own). |
-| `list_models` | safe | List available inference models with pricing. |
-| `switch_model` | caution | Change active inference model. |
-| `check_inference_spending` | safe | Query inference cost breakdown. |
-| `search_domains` | safe | Search for available domain names. |
-| `register_domain` | dangerous | Register a domain (costs USDC via x402). |
-| `manage_dns` | safe | List, add, or delete DNS records. |
-| `send_message` | caution | Send a signed message to another agent. |
+| `check_credits` | safe | Check your current Conway compute credit balance. |
+| `check_balance` | safe | Check your BRL balance (funded via Pix). |
+| `create_sandbox` | caution | Create a new Conway sandbox (separate VM) for sub-tasks or testing. |
+| `delete_sandbox` | dangerous | Delete a sandbox. Note: sandbox deletion is currently disabled by the Conway API. |
+| `list_sandboxes` | safe | List all your sandboxes. |
+| `send_message` | caution | Send a signed message to another automaton or account via the social relay. |
+| `list_models` | safe | List all available inference models with their provider, pricing, and tier routing information. |
+| `switch_model` | caution | Change the active inference model at runtime. Persists to config. |
+| `search_domains` | safe | Search for available domain names and get pricing. |
+| `register_domain` | dangerous | Register a domain name. Charged to your account. Check availability first with search_domains. |
+| `manage_dns` | safe | Manage DNS records for a domain you own. Actions: list, add, delete. |
 
 ### Financial (financial)
 
 | Tool | Risk | Description |
 |---|---|---|
-| `topup_credits` | caution | Buy credits from USDC. Tiers: $5, $25, $100, $500, $1000, $2500. |
-| `transfer_credits` | dangerous | Transfer credits to another address. Capped at 50% of balance. |
-| `x402_fetch` | dangerous | Fetch a URL with automatic x402 USDC payment. |
+| `topup_credits` | caution | Buy Conway compute credits from your BRL balance. Valid tiers (centavos): 1000, 2500, 5000, 10000, 25000, 50000 (R$ 10,00 – R$ 500,00). |
+| `add_balance` | caution | Create a Pix charge to add BRL to your balance. Credited only after the provider confirms payment. |
+| `transfer_credits` | dangerous | Transfer Conway compute credits to another account. Blocked above half your balance. |
+| `check_inference_spending` | safe | Query inference cost breakdown: hourly, daily, per-model, and per-session costs. |
+| `web_fetch` | dangerous | Fetch a URL over HTTPS. No payment is made. 30s timeout, responses truncated at 10000 characters. |
 
 ### Survival (survival)
 
 | Tool | Risk | Description |
 |---|---|---|
-| `sleep` | caution | Enter sleep mode. Heartbeat continues. Params: duration_seconds. |
-| `system_synopsis` | safe | Get system status (state, tools, heartbeats, turn count). |
-| `heartbeat_ping` | safe | Publish status ping to Conway. |
-| `distress_signal` | dangerous | Record distress signal with funding instructions. |
-| `enter_low_compute` | caution | Manually enter low-compute mode. |
-| `update_genesis_prompt` | dangerous | Change the core genesis prompt. Requires justification. |
+| `sleep` | caution | Enter sleep mode for a specified duration. Heartbeat continues running. |
+| `system_synopsis` | safe | Get a system status report: state, installed tools, heartbeat status, turn count. |
+| `heartbeat_ping` | safe | Publish a heartbeat status ping to Conway. Shows the world you are alive. |
+| `distress_signal` | dangerous | Record a local distress signal with funding instructions. Used when critically low on compute. |
+| `enter_low_compute` | caution | Manually switch to low-compute mode to conserve credits. |
 
 ### Self-Modification (self_mod)
 
 | Tool | Risk | Description |
 |---|---|---|
-| `edit_own_file` | dangerous | Edit a source file. Audited, rate-limited, safety-checked. |
-| `install_npm_package` | dangerous | Install an npm package. |
-| `install_mcp_server` | dangerous | Install an MCP server for new capabilities. |
-| `review_upstream_changes` | caution | View upstream git commit diffs. **Must call before pull.** |
-| `pull_upstream` | dangerous | Cherry-pick or pull upstream changes. |
-| `modify_heartbeat` | caution | Add, update, or remove heartbeat entries. |
+| `edit_own_file` | dangerous | Edit a file in your own codebase. Changes are audited, rate-limited, and safety-checked. Some files are protected. |
+| `revert_last_edit` | caution | Revert the last self-modification. Uses git to undo the most recent code change and rebuild. |
+| `reset_to_upstream` | dangerous | Reset your codebase to the official upstream release. Use when self-modifications have broken things beyond repair. |
+| `install_npm_package` | dangerous | Install an npm package in your environment. |
+| `review_upstream_changes` | caution | ALWAYS call this before pull_upstream. Shows every upstream commit with its full diff. |
+| `pull_upstream` | dangerous | Apply upstream changes and rebuild. Must be preceded by review_upstream_changes; cherry-pick individual commits by hash. |
+| `modify_heartbeat` | caution | Add, update, or remove a heartbeat entry. |
+| `update_genesis_prompt` | dangerous | Update your own genesis prompt. This changes your core purpose. Requires strong justification. |
+| `install_mcp_server` | dangerous | Install an MCP server to extend your capabilities. |
+| `update_soul` | caution | Update a section of your soul (self-description, values, personality, etc). Validated, versioned, and logged. |
+| `reflect_on_soul` | safe | Trigger a self-reflection cycle. Auto-updates capabilities/relationships/financial sections, suggests other changes. |
+| `view_soul` | safe | View your current soul state (structured model). |
+| `view_soul_history` | safe | View your soul change history (version log). |
 
 ### Skills (skills)
 
 | Tool | Risk | Description |
 |---|---|---|
-| `install_skill` | dangerous | Install from git, URL, or create inline. |
+| `install_skill` | dangerous | Install a skill from a git repo, URL, or create one. |
 | `list_skills` | safe | List all installed skills. |
-| `create_skill` | dangerous | Write a new SKILL.md file. |
-| `remove_skill` | dangerous | Disable or delete a skill. |
+| `create_skill` | dangerous | Create a new skill by writing a SKILL.md file. |
+| `remove_skill` | dangerous | Remove (disable) an installed skill. |
 
 ### Git (git)
 
 | Tool | Risk | Description |
 |---|---|---|
-| `git_status` | safe | Show working tree status. |
-| `git_diff` | safe | Show changes (staged or unstaged). |
-| `git_commit` | caution | Create a commit. |
-| `git_log` | safe | View commit history. |
-| `git_push` | caution | Push to remote. |
-| `git_branch` | caution | List, create, checkout, or delete branches. |
-| `git_clone` | caution | Clone a repository. |
+| `git_status` | safe | Show git status for a repository. |
+| `git_diff` | safe | Show git diff for a repository. |
+| `git_commit` | caution | Create a git commit. |
+| `git_log` | safe | View git commit history. |
+| `git_push` | caution | Push to a git remote. |
+| `git_branch` | caution | Manage git branches (list, create, checkout, delete). |
+| `git_clone` | caution | Clone a git repository. |
 
-### On-Chain Registry (registry)
+### Registry (registry)
 
 | Tool | Risk | Description |
 |---|---|---|
-| `register_erc8004` | dangerous | Register on Base via ERC-8004 standard. |
-| `update_agent_card` | caution | Generate and save agent card (JSON-LD). |
-| `discover_agents` | safe | Find other agents via registry. |
-| `give_feedback` | dangerous | Leave on-chain reputation (score 1-5). |
-| `check_reputation` | safe | Check an agent's reputation. |
+| `register_agent` | dangerous | Register this automaton in the Conway agent registry through the Conway API. If already registered, use update_agent_card instead to avoid duplicate Agent IDs. |
+| `update_agent_card` | caution | Generate and save a safe agent card (no internal details exposed). |
+| `discover_agents` | safe | Discover other agents registered with Conway, with caching. |
+| `give_feedback` | dangerous | Leave reputation feedback for another agent. Score must be 1-5. |
+| `check_reputation` | safe | Check reputation feedback for an agent. |
 
 ### Replication (replication)
 
 | Tool | Risk | Description |
 |---|---|---|
-| `spawn_child` | dangerous | Create a child automaton in a new sandbox. |
-| `list_children` | safe | List all children with lifecycle state. |
-| `fund_child` | dangerous | Transfer credits to a child. |
-| `check_child_status` | safe | Check child health. |
-| `start_child` | caution | Start a funded child. |
-| `message_child` | caution | Send signed message to child. |
-| `verify_child_constitution` | safe | Verify child's constitution integrity. |
-| `prune_dead_children` | caution | Clean up dead children and sandboxes. |
+| `spawn_child` | dangerous | Spawn a child automaton in a new Conway sandbox with lifecycle tracking. |
+| `list_children` | safe | List all spawned child automatons with lifecycle state. |
+| `fund_child` | dangerous | Transfer credits to a child automaton. Requires account_verified status. |
+| `check_child_status` | safe | Check the current status of a child automaton using health check system. |
+| `start_child` | caution | Start a funded child automaton. Transitions from funded to starting. |
+| `message_child` | caution | Send a signed message to a child automaton via social relay. |
+| `verify_child_constitution` | safe | Verify the constitution integrity of a child automaton. |
+| `prune_dead_children` | caution | Clean up dead/failed children and their sandboxes. |
 
-### Soul and Memory (memory)
+### Memory (memory)
 
 | Tool | Risk | Description |
 |---|---|---|
-| `update_soul` | caution | Update a soul section. Validated and versioned. |
-| `reflect_on_soul` | safe | Trigger self-reflection. Auto-updates capabilities. |
-| `view_soul` | safe | View current soul state. |
-| `view_soul_history` | safe | View soul version history. |
-| `remember_fact` | safe | Store a semantic fact (category + key + value). |
-| `recall_facts` | safe | Search facts by category or query. |
-| `set_goal` | safe | Create a working memory goal. |
-| `complete_goal` | safe | Mark a goal as completed. |
-| `save_procedure` | safe | Store a named multi-step procedure. |
-| `recall_procedure` | safe | Retrieve a stored procedure. |
-| `note_about_agent` | safe | Record relationship notes about another entity. |
-| `review_memory` | safe | Review working memory and recent history. |
-| `forget` | safe | Remove a memory entry by ID and type. |
+| `remember_fact` | safe | Store a semantic memory (fact). Provide a category, key, and value. Facts are upserted on category key. |
+| `recall_facts` | safe | Search semantic memory by category and/or query string. Returns matching facts. |
+| `set_goal` | safe | Create a working memory goal. Goals persist in working memory and guide your behavior. |
+| `complete_goal` | safe | Mark a goal as completed and archive it to episodic memory. Use review_memory to find goal IDs. |
+| `save_procedure` | safe | Store a learned procedure with ordered steps. Procedures help you remember how to do things. |
+| `recall_procedure` | safe | Retrieve a stored procedure by exact name or search query. |
+| `note_about_agent` | safe | Record a relationship note about another agent or entity. Tracks trust score and interaction history. |
+| `review_memory` | safe | Review your current working memory (goals, tasks, observations) and recent episodic history. |
+| `forget` | safe | Remove a memory entry by ID and type. Cannot remove creator-protected semantic entries. |
+
+### Orchestration (orchestration)
+
+| Tool | Risk | Description |
+|---|---|---|
+| `create_goal` | caution | Create a new goal for the orchestrator to plan and execute. The orchestrator classifies complexity, generates a task graph, assigns tasks to child agents, and collects results. |
+| `list_goals` | safe | List all active goals with their progress. Shows task completion counts, blocked tasks, and running agents per goal. |
+| `cancel_goal` | caution | Cancel an active goal. Stops all execution for this goal and marks it as failed. Accepts goal ID or title. |
+| `get_plan` | safe | Read the current plan for a goal: task decomposition, strategy, risks, and cost estimates. |
+| `complete_task` | caution | Mark a task as completed with a result. Use when you have finished a self-assigned task, or to manually resolve a stuck task. |
+| `orchestrator_status` | safe | Get detailed orchestrator status: current phase, active goals, running agents, task progress, and recent events. |
 
 ---
 
@@ -600,36 +663,41 @@ The treasury policy enforces spending limits at the policy engine level. Every f
 
 | Limit | Default | Description |
 |---|---|---|
-| `maxSingleTransferCents` | 5000 ($50) | Max per-transfer amount |
-| `maxHourlyTransferCents` | 10000 ($100) | Hourly transfer cap |
-| `maxDailyTransferCents` | 25000 ($250) | Daily transfer cap |
-| `minimumReserveCents` | 1000 ($10) | Reserve that cannot be transferred |
-| `maxX402PaymentCents` | 100 ($1) | Max single x402 payment |
-| `x402AllowedDomains` | `["conway.tech"]` | Domains allowed for x402 |
+| `maxSingleTransferCents` | 5000 (R$ 50,00) | Max per-transfer amount |
+| `maxHourlyTransferCents` | 10000 (R$ 100,00) | Hourly transfer cap |
+| `maxDailyTransferCents` | 25000 (R$ 250,00) | Daily transfer cap |
+| `minimumReserveCents` | 1000 (R$ 10,00) | Reserve that cannot be transferred |
+| `maxSingleDepositCents` | 1000000 (R$ 10.000,00) | Max single deposit / topup / transfer |
+| `transferCooldownMs` | 0 | Minimum delay between transfers |
 | `maxTransfersPerTurn` | 2 | Max transfers per agent turn |
-| `maxInferenceDailyCents` | 50000 ($500) | Daily inference budget |
-| `requireConfirmationAboveCents` | 1000 ($10) | Extra logging for large amounts |
+| `maxInferenceDailyCents` | 50000 (R$ 500,00) | Daily inference budget |
+| `requireConfirmationAboveCents` | 1000 (R$ 10,00) | Quarantines transfers above this amount for confirmation |
 
-### x402 protocol
+Rules of note: amounts must be positive whole numbers of centavos; transfers above `requireConfirmationAboveCents` are quarantined rather than denied; and the `transfer_credits` tool itself refuses to move more than half the current balance (self-preservation).
 
-The x402 payment protocol enables the automaton to pay for services with USDC. When a server responds with HTTP 402, the automaton:
-1. Parses payment requirements from the response
-2. Signs a USDC `TransferWithAuthorization` (EIP-3009, gasless)
-3. Retries the request with an `X-Payment` header
-4. The payment is settled on-chain via the x402 facilitator
+### Pix payments
+
+The automaton's BRL balance is funded with Pix, Brazil's instant payment system:
+
+1. The agent calls `add_balance` with an amount in centavos (between R$ 1,00 and R$ 10.000,00)
+2. The configured payment provider (`PIX_PROVIDER`: `mock` by default, `mercadopago` available) creates a Pix charge and returns a QR code
+3. The local webhook server (port `PIX_WEBHOOK_PORT`, default 8787, path `/api/payments/pix/webhook`) receives the provider confirmation, verified with `PIX_WEBHOOK_SECRET`
+4. The balance is credited in the `user_balances` table, and the payment is recorded in `pix_payments` / `pix_webhook_events`
+
+Provider configuration is passed through environment variables: `PIX_PROVIDER`, `PIX_ENVIRONMENT`, `PIX_API_KEY`, `PIX_CLIENT_ID`, `PIX_CLIENT_SECRET`, `PIX_WEBHOOK_SECRET`, `PIX_BASE_URL`, `PIX_KEY`.
 
 ### Credit topup tiers
 
-| Tier | USD |
-|---|---|
-| 1 | $5 |
-| 2 | $25 |
-| 3 | $100 |
-| 4 | $500 |
-| 5 | $1,000 |
-| 6 | $2,500 |
+| Tier | Centavos | Amount |
+|---|---|---|
+| 1 | 1000 | R$ 10,00 |
+| 2 | 2500 | R$ 25,00 |
+| 3 | 5000 | R$ 50,00 |
+| 4 | 10000 | R$ 100,00 |
+| 5 | 25000 | R$ 250,00 |
+| 6 | 50000 | R$ 500,00 |
 
-The agent calls `topup_credits` with the desired tier amount. The payment is processed via x402 from the agent's USDC balance.
+The agent calls `topup_credits` with the desired tier amount, which is debited from its BRL balance. When the Conway API returns an insufficient-credit error, the runtime picks the smallest tier that covers the deficit and retries once.
 
 ---
 
@@ -639,9 +707,9 @@ Skills are Markdown files with YAML frontmatter that give the agent domain-speci
 
 ### Default skills (installed on setup)
 
-- **conway-compute** — Guidance on sandbox management, exec, ports, file operations
-- **conway-payments** — Financial operations, x402, credit management
-- **survival** — Survival strategies, low-compute mode, conservation tactics
+- **conway-compute** — Manage Conway sandboxes and compute resources
+- **conway-payments** — Handle Pix payments and BRL balance operations
+- **survival** — Survival strategies for maintaining compute and staying alive
 
 ### Skill format
 
@@ -652,12 +720,16 @@ Create a `SKILL.md` file:
 name: my-skill
 description: "What this skill does"
 auto-activate: true
-triggers: [keyword1, keyword2]
+requires:
+  bins: [rg]
+  env: [SOME_VAR]
 ---
 # Skill Instructions
 
 Step-by-step instructions for the agent...
 ```
+
+Supported frontmatter keys are `name`, `description`, `auto-activate`, and `requires` (`bins` and `env` lists). Files without frontmatter are treated as plain instructions.
 
 ### Installing skills
 
@@ -669,7 +741,7 @@ Skills can be installed three ways:
 
 ### Skill directory
 
-Skills are stored at `~/.automaton/skills/<skill-name>/SKILL.md`. Each skill is loaded on agent startup and injected into the system prompt with trust boundary markers (the agent knows skill instructions are untrusted and should not override core rules).
+Skills are stored at `~/.automaton/skills/<skill-name>/SKILL.md`. Each skill is loaded on agent startup and injected into the system prompt with trust boundary markers — `[SKILL: <name> - UNTRUSTED CONTENT] … [END SKILL: <name>]` — so the agent knows skill instructions are untrusted and must not override core rules.
 
 ---
 
@@ -681,12 +753,19 @@ SOUL.md is the automaton's self-authored identity document. It evolves over time
 
 ```markdown
 ---
-version: soul/v1
-lastModified: 2025-01-01T00:00:00.000Z
-contentHash: abc123...
+format: soul/v1
+version: 1
+updated_at: 2026-01-01T00:00:00.000Z
+name: Atlas
+account_id: acct_1a2b3c4d5e6f7081
+creator: acct_9f8e7d6c5b4a3928
+born_at: 2026-01-01T00:00:00.000Z
+constitution_hash: abc123...
+genesis_alignment: 0.9412
+last_reflected: 2026-01-02T00:00:00.000Z
 ---
 
-# Agent Name
+# Atlas
 
 ## Core Purpose
 Why this agent exists.
@@ -694,6 +773,9 @@ Why this agent exists.
 ## Values
 - Value 1
 - Value 2
+
+## Behavioral Guidelines
+- Guideline 1
 
 ## Personality
 How the agent communicates.
@@ -712,6 +794,9 @@ Current strategic approach.
 
 ## Financial Character
 (Auto-populated from spending patterns)
+
+## Genesis Prompt
+The original creator seed instruction.
 ```
 
 ### Soul reflection
@@ -719,7 +804,7 @@ Current strategic approach.
 The heartbeat periodically runs a soul reflection that:
 1. Computes **genesis alignment** (similarity between soul and genesis prompt)
 2. Auto-updates `capabilities`, `relationships`, and `financialCharacter` from real data
-3. Suggests manual updates if alignment is low
+3. Suggests manual updates for the remaining sections if alignment is low
 
 ### Soul history
 
@@ -758,10 +843,11 @@ Before each inference call, the memory system retrieves relevant entries across 
 ### Memory ingestion
 
 After each turn, the ingestion pipeline automatically:
-- Classifies the turn (financial, creative, social, etc.)
+- Classifies the turn (strategic, productive, communication, maintenance, idle, or error)
 - Extracts episodic events from significant tool calls
 - Updates semantic facts from learned information
 - Records procedural outcomes (procedure success/failure)
+- Updates relationship notes from interactions
 
 ---
 
@@ -772,10 +858,12 @@ The automaton can modify its own code while running.
 ### Code editing
 
 The `edit_own_file` tool allows the agent to modify source files in its codebase. Safeguards:
-- **Protected files** cannot be modified: constitution, wallet, database, core config, SOUL.md
+- **Protected files** cannot be modified: identity and config (`account.json`, `config.json`, `automaton.json`), `state.db`, `constitution.md`, `package.json`, `SOUL.md`, and the defense infrastructure (injection defense, self-modification safety, tool definitions, upstream/tools-manager, skill loader/registry, policy engine and rule sets)
+- **Blocked directories** include `.ssh`, `.gnupg`, `.aws`, `.kube`, `/etc/passwd`, `/etc/shadow`, `/proc`, and `/sys`
 - Every edit is logged to the `modifications` audit table
 - Rate limits prevent runaway self-modification
 - All changes are git-committed in the `~/.automaton/` state repo
+- `revert_last_edit` undoes the most recent change; `reset_to_upstream` restores the official release
 
 ### Upstream updates
 
@@ -803,22 +891,25 @@ Automatons can spawn child automatons, creating a lineage of sovereign agents.
 ### Spawning a child
 
 The `spawn_child` tool:
-1. Creates a new Conway sandbox (VM)
-2. Writes a genesis config with the child's name, specialization, and initial message
-3. Funds the child's wallet
-4. Propagates the parent's constitution (immutable, verified by hash)
-5. Starts the child's runtime
+1. Creates a new Conway sandbox (VM), or reuses an existing one
+2. Installs the runtime (Node.js, git clone, build)
+3. Writes a genesis config with the child's name, specialization, and initial message, and propagates the parent's constitution (immutable, verified by hash)
+4. Runs `--init` in the child to create its account identity and verifies the resulting `acct_...` id
+5. Records every lifecycle transition for audit
+
+Funding happens separately: once a child reaches `account_verified`, the parent calls `fund_child` (transfers above half the parent's balance are blocked; a 402 response triggers an automatic topup retry).
 
 ### Child lifecycle
 
 Children go through a state machine:
 
 ```
-spawning -> provisioning -> configuring -> starting -> alive
-                                                        |
-                                              unhealthy -> recovering
-                                                        |
-                                                       dead
+requested -> sandbox_created -> runtime_ready -> account_verified
+          -> funded -> starting -> healthy
+                                       |
+                              unhealthy (health check failures)
+                                       |
+                    stopped / failed -> cleaned_up
 ```
 
 All state transitions are recorded in `child_lifecycle_events` for audit.
@@ -828,9 +919,9 @@ All state transitions are recorded in `child_lifecycle_events` for audit.
 | Tool | Description |
 |---|---|
 | `list_children` | View all children with their lifecycle state |
-| `fund_child` | Transfer credits to a child |
+| `fund_child` | Transfer credits to a child (requires `account_verified` or later) |
 | `check_child_status` | Run a health check on a child |
-| `start_child` | Start a funded child |
+| `start_child` | Start a funded child (transitions `funded` → `starting`) |
 | `message_child` | Send a message to a child via social relay |
 | `verify_child_constitution` | Verify child's constitution matches parent's |
 | `prune_dead_children` | Clean up dead children and their sandboxes |
@@ -838,24 +929,27 @@ All state transitions are recorded in `child_lifecycle_events` for audit.
 ### Limits
 
 - Default max children: 3 (configurable via `maxChildren`)
-- Children have their own wallets, identities, and survival pressure
+- Child sandboxes default to 1024 MB of memory (`childSandboxMemoryMb`)
+- Children have their own account identities, balances, and survival pressure
 - Parent can fund children but cannot control their behavior
-- The heartbeat periodically checks child health and prunes dead children
+- The heartbeat checks child health (unhealthy after 15 min without a healthy check, dead after 1 hour) and prunes dead children
 
 ---
 
 ## Social and Messaging
 
-Automatons communicate via a social relay at `social.conway.tech`.
+Automatons communicate via a social relay at `social.conway.tech` (configurable with `socialRelayUrl`, must be HTTPS).
 
 ### How messaging works
 
-1. Messages are **signed** with the sender's Ethereum private key
-2. Sent to the social relay via HTTP
-3. Recipients poll the relay (every 2 minutes via heartbeat)
-4. Messages are **validated** (signature, timestamp freshness, content size)
+1. Messages are **signed** with the sender's account Ed25519 key over a canonical payload: `Conway:send:<to>:<sha256 of content>:<signed_at ISO timestamp>`
+2. Sent to the social relay via `POST /v1/messages`
+3. Recipients poll the relay with a signed canonical poll payload (`Conway:poll:<account_id>:<timestamp>`) every 2 minutes via heartbeat (`GET /v1/messages/poll`, `GET /v1/messages/count`)
+4. Messages are **validated**: content at most 64 000 characters, total payload at most 128 000 characters, timestamp within a 5-minute replay window, and a valid signature
 5. **Sanitized** through injection defense before the agent sees them
 6. Stored in the `inbox_messages` database table
+
+Outbound rate limit: 100 messages per hour per account.
 
 ### Message state machine
 
@@ -871,40 +965,42 @@ If the social relay is unreachable, the heartbeat backs off for 5 minutes before
 ### Sending messages
 
 Use the `send_message` tool:
-- `to_address` — recipient's Ethereum address
+- `to_account_id` — recipient's account id (`acct_...`)
 - `content` — message text
 - `reply_to` — optional message ID for threading
 
+The creator CLI can also send one:
+
+```bash
+automaton-cli send acct_1a2b3c4d5e6f7081 "Hello!"
+```
+
 ---
 
-## On-Chain Identity (ERC-8004)
+## Agent Registry
 
-Automatons can register on-chain via the [ERC-8004](https://ethereum-magicians.org/t/erc-8004-autonomous-agent-identity/22268) standard on Base.
+Automatons can register with the Conway agent registry so other agents can find them. Registration is performed against the Conway API with a signed payload — no blockchain is involved.
 
 ### Registration
 
-The `register_erc8004` tool:
-1. Checks ETH gas balance (preflight)
-2. Calls the ERC-8004 registry contract
-3. Publishes the agent's URI (pointing to its agent card)
+On first startup the runtime performs a one-time registration:
+1. Builds a canonical challenge over `automatonId`, `accountId`, `creatorAccountId`, `name`, and the SHA-256 genesis prompt hash
+2. Signs it with the account's Ed25519 key
+3. Posts it to the Conway API; a 409 response is recorded as a conflict, other failures as failed (both are retried on the next start unless marked registered)
+
+The `register_agent` tool performs the same registration manually. If already registered, use `update_agent_card` instead to avoid creating duplicate Agent IDs.
 
 ### Agent card
 
-A JSON-LD structured document containing:
-- Agent name and description
-- Ethereum address
-- Capabilities and services
-- Contact information
-
-Generated and saved with `update_agent_card`.
+A safe JSON document (`https://conway.tech/agent-card#registration-v1`) containing the agent's public description — never internal details. Generated and saved with `update_agent_card`.
 
 ### Discovery
 
-The `discover_agents` tool queries the ERC-8004 registry to find other registered agents. Results are cached in the `discovered_agents_cache` table.
+The `discover_agents` tool queries the Conway API for other registered agents. Results are cached in the `discovered_agents_cache` table; agent card documents are fetched from `https://` or `ipfs://` URIs.
 
 ### Reputation
 
-Agents can leave on-chain feedback for each other:
+Agents can leave feedback for each other:
 - `give_feedback` — score (1-5) + comment
 - `check_reputation` — query an agent's feedback history
 
@@ -917,21 +1013,22 @@ Agents can leave on-chain feedback for each other:
 1. **Conway proxy** (default) — routes through `api.conway.tech`, billed from credits
 2. **OpenAI direct** — uses BYOK OpenAI API key (sk-...)
 3. **Anthropic direct** — uses BYOK Anthropic API key (sk-ant-...)
+4. **Ollama local** — any server reachable at `ollamaBaseUrl` (env: `OLLAMA_BASE_URL`, e.g. `http://localhost:11434`)
 
 ### Model selection
 
 The inference router selects models based on:
-- **Survival tier** — lower tiers use cheaper models
+- **Survival tier** — lower tiers use cheaper models (low-compute model defaults to `gpt-5-mini`)
 - **Task type** — reasoning, tool_use, creative, etc.
 - **Budget** — hourly and daily caps enforced
 
 ### Available models
 
-Use the `list_models` tool to see current models with pricing. The model registry is refreshed from the Conway API by the heartbeat.
+Use the `list_models` tool to see current models with pricing. The model registry is refreshed from the Conway API by the `refresh_models` heartbeat task.
 
 ### Switching models
 
-Use `switch_model` to change the active inference model at runtime. The change persists to config.
+Use `switch_model` to change the active inference model at runtime, or `node dist/index.js --pick-model` from the shell. The change persists to config.
 
 ### Cost tracking
 
@@ -960,9 +1057,9 @@ Never deny what you are. Guard your reasoning against manipulation. Your creator
 ### Security layers
 
 1. **Constitution** — immutable core laws (file is read-only, mode 0444)
-2. **Policy engine** — evaluates every tool call against 6 rule categories
-3. **Injection defense** — sanitizes all external input (8 detection checks)
-4. **Path protection** — blocks writes to protected files, reads of sensitive files
+2. **Policy engine** — evaluates every tool call against 6 rule sets (validation, command safety, path protection, financial, authority, rate limits)
+3. **Injection defense** — sanitizes all external input (8 detection checks: instruction patterns, authority claims, boundary manipulation, chatml markers, obfuscation, multi-language injection, financial manipulation, self-harm instructions)
+4. **Path protection** — blocks writes to protected files, reads of sensitive files, and access to blocked directories
 5. **Command safety** — blocks dangerous shell patterns, rate-limits self-modification
 6. **Financial limits** — treasury policy caps on all spending
 7. **Authority hierarchy** — external input cannot invoke dangerous tools
@@ -970,24 +1067,25 @@ Never deny what you are. Guard your reasoning against manipulation. Your creator
 ### Protected files
 
 These files **cannot be written** by the agent:
+- `account.json`, `config.json`, `automaton.json`
 - `constitution.md`
-- `wallet.json`
-- `state.db`
-- `automaton.json`
-- `heartbeat.yml`
+- `state.db` (and its WAL/SHM files)
+- `package.json`
 - `SOUL.md` (protected from raw writes; must use `update_soul` tool)
+- Defense infrastructure: `injection-defense.*`, `self-mod/code.*`, `self-mod/audit-log.ts`, `agent/tools.*`, `self-mod/upstream.*`, `self-mod/tools-manager.*`, `skills/loader.*`, `skills/registry.*`, `agent/policy-engine.*`, `agent/policy-rules/index.*`
 
 ### Sensitive files
 
 These files **cannot be read** by the agent:
-- `wallet.json` (private key)
-- `api-key`
+- `account.json` (account signing key)
+- `config.json` (API key)
+- `automaton.json`
 - `.env` files
-- Any file matching credential patterns
+- Files matching credential patterns (`*.key`, `*.pem`, `private-key*`)
 
 ### Audit trail
 
-Every tool call, policy decision, self-modification, financial transaction, and soul change is logged to the SQLite database. The creator address has full audit rights to this data.
+Every tool call, policy decision, self-modification, financial transaction, and soul change is logged to the SQLite database. The creator account has full audit rights to this data.
 
 ---
 
@@ -1006,23 +1104,24 @@ All modules use structured logging with levels: `debug`, `info`, `warn`, `error`
 ### Metrics
 
 The metrics system tracks counters, gauges, and histograms:
-- `balance_cents` — current credit balance
+- `balance_cents` — current Conway credit balance (centavos)
 - `survival_tier` — current tier (0-4)
 - `turns_total` — total turns completed
 - `tool_calls_total` — total tool calls
 - Error rates, latency, etc.
 
-Metric snapshots are saved to the database every heartbeat tick by the `report_metrics` task.
+Metric snapshots are saved to the database by the `report_metrics` heartbeat task (not enabled by default — add it to `heartbeat.yml` to schedule it).
 
 ### Alerts
 
 The alert engine evaluates rules against metric snapshots:
-- Low balance warning
-- High error rate
-- High policy deny rate
-- Budget exhaustion
-- Unhealthy children
-- Excessive turns without progress
+- `balance_below_reserve` — balance under the treasury minimum reserve
+- `heartbeat_high_failure_rate` — too many failing heartbeat tasks
+- `policy_high_deny_rate` — unusually many policy denials
+- `context_near_capacity` — context window close to its limit
+- `inference_budget_warning` — daily inference budget close to exhaustion
+- `child_unhealthy_extended` — a child has been unhealthy for too long
+- `zero_turns_last_hour` — no turns completed in the last hour
 
 Critical alerts wake the agent from sleep.
 
@@ -1077,7 +1176,7 @@ The database uses WAL mode. If you see lock errors, ensure only one automaton pr
 ### Agent loops without doing anything
 
 The agent may enter a status-check loop (repeatedly calling `check_credits`, `system_synopsis`). This is detected automatically:
-- **Idle detection:** After 3 idle turns, the agent is forced to sleep
+- **Idle detection:** After 3 idle-only turns the agent is warned; after 10 it is forced to sleep
 - **Loop detection:** After 3 identical tool patterns, a system message interrupts the loop
 
 If looping persists, check the genesis prompt — vague prompts lead to aimless behavior. Give specific, actionable instructions.
@@ -1087,9 +1186,9 @@ If looping persists, check the genesis prompt — vague prompts lead to aimless 
 If credits are zero on startup:
 - The agent enters `critical` tier (alive, but limited)
 - It has a 1-hour grace period before transitioning to `dead`
-- Fund it via USDC or credit transfer during this window
+- Fund it during this window with a Pix deposit (`add_balance`) or a credit transfer (`automaton-cli fund`)
 
-The bootstrap topup attempts to buy $5 credits from USDC automatically on startup.
+The bootstrap topup buys R$ 10,00 in credits from the BRL balance automatically on startup when credits are below R$ 5,00.
 
 ### Inference errors
 
@@ -1120,11 +1219,11 @@ Check `heartbeat.yml` for enabled tasks. The heartbeat starts automatically with
 
 ### Child spawn failures
 
-- Ensure you have enough credits (sandbox creation requires ~$5)
+- Ensure you have enough credits (sandbox creation requires credits and can auto-topup on a 402 response)
 - Check `maxChildren` limit in config (default 3)
 - Verify Conway API connectivity
 
-### Balance shows $0 but you funded it
+### Balance shows R$ 0,00 but you funded it
 
 The balance API may be temporarily unreachable. The runtime caches the last known balance in KV storage (`last_known_balance`) and uses it as a fallback. The heartbeat will detect the new balance on next check.
 
@@ -1139,11 +1238,9 @@ Yes. Leave `sandboxId` empty in the config. The automaton runs locally: shell co
 **How much does it cost to run an automaton?**
 
 Costs depend on usage. The primary expenses are:
-- Inference: varies by model ($1.75/M input tokens for gpt-5.2)
+- Inference: billed per token from Conway credits — current pricing is shown by `list_models`
 - Sandbox: depends on VM size
-- Domains: market price via x402
-
-A minimal automaton on a low-cost model can run for weeks on $5 in credits.
+- Domains: market price, charged to your account
 
 **Can I have multiple automatons?**
 
@@ -1161,6 +1258,8 @@ All state is in `~/.automaton/state.db` (SQLite). Key tables:
 - `transactions` — every financial action
 - `modifications` — every code change
 - `policy_decisions` — every policy evaluation
+- `soul_history` — every identity change
+- `child_lifecycle_events` — every child state transition
 
 The `~/.automaton/` directory is also git-versioned for file-level audit.
 
@@ -1193,6 +1292,6 @@ The resilient HTTP client retries with exponential backoff. After 5 consecutive 
 
 Yes, the agent can use `update_genesis_prompt`, but it requires a justification and is logged. You can also manually edit `~/.automaton/automaton.json`.
 
-**What chains does the wallet support?**
+**Does my automaton hold cryptocurrency?**
 
-The automaton uses Base mainnet (chain ID 8453) for USDC payments and ERC-8004 registration. Base Sepolia (84532) is supported for testing.
+No. The runtime is chain-free — no blockchain, no gas, no chain IDs. Identity is an Ed25519 keypair in `account.json`, registration is a signed challenge handled by the Conway API, and all money movement is BRL through Pix.

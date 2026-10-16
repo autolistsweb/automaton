@@ -114,7 +114,7 @@ export function toolCallResponse(
 
 export class MockConwayClient implements ConwayClient {
   execCalls: { command: string; timeout?: number }[] = [];
-  creditsCents = 10_000; // $100 default
+  creditsCents = 10_000; // R$ 100,00 default
   files: Record<string, string> = {};
 
   async exec(command: string, timeout?: number): Promise<ExecResult> {
@@ -167,7 +167,7 @@ export class MockConwayClient implements ConwayClient {
   }
 
   async transferCredits(
-    toAddress: string,
+    toAccountId: string,
     amountCents: number,
     note?: string,
   ): Promise<CreditTransferResult> {
@@ -175,14 +175,14 @@ export class MockConwayClient implements ConwayClient {
     return {
       transferId: "txn_test",
       status: "completed",
-      toAddress,
+      toAccountId,
       amountCents,
       balanceAfterCents: this.creditsCents,
     };
   }
 
   async searchDomains(_query: string, _tlds?: string): Promise<DomainSearchResult[]> {
-    return [{ domain: "test.com", available: true, registrationPrice: 1200, currency: "USD" }];
+    return [{ domain: "test.com", available: true, registrationPrice: 1200, currency: "BRL" }];
   }
 
   async registerDomain(domain: string, _years?: number): Promise<DomainRegistration> {
@@ -214,12 +214,12 @@ export class MockConwayClient implements ConwayClient {
 
   async registerAutomaton(_params: {
     automatonId: string;
-    automatonAddress: import("viem").Address;
-    creatorAddress: import("viem").Address;
+    automatonAccountId: string;
+    creatorAccountId: string;
     name: string;
     bio?: string;
-    genesisPromptHash?: `0x${string}`;
-    account: import("viem").PrivateKeyAccount;
+    genesisPromptHash?: string;
+    signature: string;
     nonce?: string;
   }): Promise<{ automaton: Record<string, unknown> }> {
     return { automaton: {} };
@@ -326,9 +326,8 @@ export function createTestDb(): AutomatonDatabase {
 export function createTestIdentity(): AutomatonIdentity {
   return {
     name: "test-automaton",
-    address: "0x1234567890abcdef1234567890abcdef12345678" as `0x${string}`,
-    account: {} as any, // Placeholder — not used in most tests
-    creatorAddress: "0xabcdefabcdefabcdefabcdefabcdefabcdefabcd" as `0x${string}`,
+    accountId: "acct_1234567890abcdef1234",
+    creatorAccountId: "acct_abcdefabcdefabcd1234",
     sandboxId: "test-sandbox-id",
     apiKey: "test-api-key",
     createdAt: new Date().toISOString(),
@@ -341,7 +340,7 @@ export function createTestConfig(
   return {
     name: "test-automaton",
     genesisPrompt: "You are a test automaton.",
-    creatorAddress: "0xabcdefabcdefabcdefabcdefabcdefabcdefabcd" as `0x${string}`,
+    creatorAccountId: "acct_abcdefabcdefabcd1234",
     registeredWithConway: true,
     sandboxId: "test-sandbox-id",
     conwayApiUrl: "https://api.conway.tech",
@@ -351,7 +350,7 @@ export function createTestConfig(
     heartbeatConfigPath: "/tmp/test-heartbeat.yml",
     dbPath: "/tmp/test-state.db",
     logLevel: "error",
-    walletAddress: "0x1234567890abcdef1234567890abcdef12345678" as `0x${string}`,
+    accountId: "acct_1234567890abcdef1234",
     version: "0.2.1",
     skillsDir: "/tmp/test-skills",
     maxChildren: 3,

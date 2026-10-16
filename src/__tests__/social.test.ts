@@ -2,40 +2,50 @@
  * Social & Registry Hardening Tests (Phase 3.2)
  *
  * Tests for signing, validation, social client, agent card,
- * ERC-8004 fixes, discovery caching, and schema migration.
+ * feedback, discovery caching, and schema migration.
  */
 
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
+import crypto from "node:crypto";
 import Database from "better-sqlite3";
-import { MIGRATION_V7 } from "../state/schema.js";
+import { CREATE_TABLES, MIGRATION_V7, MIGRATION_V12 } from "../state/schema.js";
+import { formatBRL } from "../payments/money.js";
+import { createBuiltinTools } from "../agent/tools.js";
+import type { AutomatonDatabase, AutomatonTool, ToolContext } from "../types.js";
+import {
+  MockConwayClient,
+  MockInferenceClient,
+  createTestDb as createAutomatonDb,
+  createTestIdentity,
+  createTestConfig,
+} from "./mocks.js";
 
 // ─── Test helpers ───────────────────────────────────────────────
+
+const ALICE_ID = "acct_1234567890abcdef1234";
+const BOB_ID = "acct_fedcba9876543210fedc";
+
+/** Local Ed25519 account identity (base64 SPKI public key). */
+function createSigner(accountId: string) {
+  const { publicKey, privateKey } = crypto.generateKeyPairSync("ed25519");
+  return {
+    accountId,
+    publicKey: publicKey.export({ format: "der", type: "spki" }).toString("base64"),
+    createdAt: new Date().toISOString(),
+    async signMessage(message: string): Promise<string> {
+      return crypto.sign(null, Buffer.from(message, "utf8"), privateKey).toString("base64");
+    },
+  };
+}
 
 function createTestDb(): import("better-sqlite3").Database {
   const db = new Database(":memory:");
   db.pragma("journal_mode = WAL");
   db.pragma("foreign_keys = ON");
 
-  // Create base tables needed for tests
-  db.exec(`
-    CREATE TABLE IF NOT EXISTS schema_version (
-      version INTEGER PRIMARY KEY,
-      applied_at TEXT NOT NULL DEFAULT (datetime('now'))
-    );
-
-    CREATE TABLE IF NOT EXISTS heartbeat_dedup (
-      dedup_key TEXT PRIMARY KEY,
-      task_name TEXT NOT NULL,
-      expires_at TEXT NOT NULL,
-      created_at TEXT NOT NULL DEFAULT (datetime('now'))
-    );
-
-    CREATE INDEX IF NOT EXISTS idx_dedup_expires ON heartbeat_dedup(expires_at);
-  `);
-
-  // Apply V7 migration (Phase 3 tables)
+  db.exec(CREATE_TABLES);
   db.exec(MIGRATION_V7);
-  db.prepare("INSERT INTO schema_version (version) VALUES (?)").run(7);
+  db.exec(MIGRATION_V12);
 
   return db;
 }
@@ -44,80 +54,59 @@ function createTestDb(): import("better-sqlite3").Database {
 
 describe("Signing", () => {
   it("signSendPayload produces valid payload with signature", async () => {
-    const { privateKeyToAccount } = await import("viem/accounts");
     const { signSendPayload } = await import("../social/signing.js");
+    const signer = createSigner(ALICE_ID);
 
-    const account = privateKeyToAccount(
-      "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80",
-    );
+    const payload = await signSendPayload(signer, BOB_ID, "Hello, world!");
 
-    const payload = await signSendPayload(
-      account,
-      "0x70997970C51812dc3A010C7d01b50e0d17dc79C8",
-      "Hello, world!",
-    );
-
-    expect(payload.from).toBe(account.address.toLowerCase());
-    expect(payload.to).toBe("0x70997970c51812dc3a010c7d01b50e0d17dc79c8");
+    expect(payload.from).toBe(ALICE_ID);
+    expect(payload.to).toBe(BOB_ID);
     expect(payload.content).toBe("Hello, world!");
     expect(payload.signature).toBeTruthy();
-    expect(payload.signature).toMatch(/^0x/);
+    expect(Buffer.from(payload.signature, "base64")).toHaveLength(64);
     expect(payload.signed_at).toBeTruthy();
   });
 
   it("signSendPayload enforces content size limit", async () => {
-    const { privateKeyToAccount } = await import("viem/accounts");
     const { signSendPayload } = await import("../social/signing.js");
-
-    const account = privateKeyToAccount(
-      "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80",
-    );
+    const signer = createSigner(ALICE_ID);
 
     const longContent = "x".repeat(65_000);
     await expect(
-      signSendPayload(account, "0x70997970C51812dc3A010C7d01b50e0d17dc79C8", longContent),
+      signSendPayload(signer, BOB_ID, longContent),
     ).rejects.toThrow("Message content too long");
   });
 
   it("signPollPayload produces valid payload", async () => {
-    const { privateKeyToAccount } = await import("viem/accounts");
     const { signPollPayload } = await import("../social/signing.js");
+    const signer = createSigner(ALICE_ID);
 
-    const account = privateKeyToAccount(
-      "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80",
-    );
+    const result = await signPollPayload(signer);
 
-    const result = await signPollPayload(account);
-
-    expect(result.address).toBe(account.address.toLowerCase());
-    expect(result.signature).toMatch(/^0x/);
+    expect(result.accountId).toBe(ALICE_ID);
+    expect(Buffer.from(result.signature, "base64")).toHaveLength(64);
     expect(result.timestamp).toBeTruthy();
   });
 
   it("signSendPayload canonical format matches runtime and CLI expectation", async () => {
-    const { privateKeyToAccount } = await import("viem/accounts");
-    const { keccak256, toBytes, verifyMessage } = await import("viem");
     const { signSendPayload } = await import("../social/signing.js");
+    const { verifyAccountSignature } = await import("../identity/account.js");
+    const signer = createSigner(ALICE_ID);
 
-    const account = privateKeyToAccount(
-      "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80",
-    );
-
-    const to = "0x70997970C51812dc3A010C7d01b50e0d17dc79C8";
     const content = "Test message";
-    const payload = await signSendPayload(account, to, content);
+    const payload = await signSendPayload(signer, BOB_ID, content);
 
     // Reconstruct canonical and verify
-    const contentHash = keccak256(toBytes(content));
-    const canonical = `Conway:send:${to.toLowerCase()}:${contentHash}:${payload.signed_at}`;
+    const contentHash = crypto
+      .createHash("sha256")
+      .update(content, "utf8")
+      .digest("hex");
+    const canonical = `Conway:send:${BOB_ID}:${contentHash}:${payload.signed_at}`;
 
-    const valid = await verifyMessage({
-      address: account.address,
-      message: canonical,
-      signature: payload.signature as `0x${string}`,
-    });
-
-    expect(valid).toBe(true);
+    expect(verifyAccountSignature(signer.publicKey, canonical, payload.signature)).toBe(true);
+    expect(
+      verifyAccountSignature(createSigner(BOB_ID).publicKey, canonical, payload.signature),
+    ).toBe(false);
   });
 });
 
@@ -128,8 +117,8 @@ describe("Message Validation", () => {
     const { validateMessage } = await import("../social/validation.js");
 
     const result = validateMessage({
-      from: "0x70997970C51812dc3A010C7d01b50e0d17dc79C8",
-      to: "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266",
+      from: ALICE_ID,
+      to: BOB_ID,
       content: "Hello!",
       signed_at: new Date().toISOString(),
     });
@@ -142,8 +131,8 @@ describe("Message Validation", () => {
     const { validateMessage } = await import("../social/validation.js");
 
     const result = validateMessage({
-      from: "0x70997970C51812dc3A010C7d01b50e0d17dc79C8",
-      to: "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266",
+      from: ALICE_ID,
+      to: BOB_ID,
       content: "x".repeat(129_000),
     });
 
@@ -155,8 +144,8 @@ describe("Message Validation", () => {
     const { validateMessage } = await import("../social/validation.js");
 
     const result = validateMessage({
-      from: "0x70997970C51812dc3A010C7d01b50e0d17dc79C8",
-      to: "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266",
+      from: ALICE_ID,
+      to: BOB_ID,
       content: "x".repeat(65_000),
     });
 
@@ -169,8 +158,8 @@ describe("Message Validation", () => {
 
     const oldTimestamp = new Date(Date.now() - 6 * 60_000).toISOString();
     const result = validateMessage({
-      from: "0x70997970C51812dc3A010C7d01b50e0d17dc79C8",
-      to: "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266",
+      from: ALICE_ID,
+      to: BOB_ID,
       content: "Hello!",
       signed_at: oldTimestamp,
     });
@@ -184,8 +173,8 @@ describe("Message Validation", () => {
 
     const futureTimestamp = new Date(Date.now() + 2 * 60_000).toISOString();
     const result = validateMessage({
-      from: "0x70997970C51812dc3A010C7d01b50e0d17dc79C8",
-      to: "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266",
+      from: ALICE_ID,
+      to: BOB_ID,
       content: "Hello!",
       signed_at: futureTimestamp,
     });
@@ -198,8 +187,8 @@ describe("Message Validation", () => {
     const { validateMessage } = await import("../social/validation.js");
 
     const result = validateMessage({
-      from: "0x70997970C51812dc3A010C7d01b50e0d17dc79C8",
-      to: "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266",
+      from: ALICE_ID,
+      to: BOB_ID,
       content: "Hello!",
       signed_at: "not-a-valid-date",
     });
@@ -208,30 +197,30 @@ describe("Message Validation", () => {
     expect(result.errors.some((e) => e.includes("Invalid timestamp"))).toBe(true);
   });
 
-  it("invalid from address fails", async () => {
+  it("invalid sender account fails", async () => {
     const { validateMessage } = await import("../social/validation.js");
 
     const result = validateMessage({
-      from: "not-an-address",
-      to: "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266",
+      from: "not-an-account",
+      to: BOB_ID,
       content: "Hello!",
     });
 
     expect(result.valid).toBe(false);
-    expect(result.errors.some((e) => e.includes("Invalid sender address"))).toBe(true);
+    expect(result.errors.some((e) => e.includes("Invalid sender account"))).toBe(true);
   });
 
-  it("invalid to address fails", async () => {
+  it("invalid recipient account fails", async () => {
     const { validateMessage } = await import("../social/validation.js");
 
     const result = validateMessage({
-      from: "0x70997970C51812dc3A010C7d01b50e0d17dc79C8",
+      from: ALICE_ID,
       to: "bad",
       content: "Hello!",
     });
 
     expect(result.valid).toBe(false);
-    expect(result.errors.some((e) => e.includes("Invalid recipient address"))).toBe(true);
+    expect(result.errors.some((e) => e.includes("Invalid recipient account"))).toBe(true);
   });
 });
 
@@ -261,35 +250,27 @@ describe("Relay URL Validation", () => {
 describe("Social Client", () => {
   it("createSocialClient throws on HTTP relay URL", async () => {
     const { createSocialClient } = await import("../social/client.js");
-    const { privateKeyToAccount } = await import("viem/accounts");
-    const account = privateKeyToAccount(
-      "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80",
-    );
+    const signer = createSigner(ALICE_ID);
 
-    expect(() => createSocialClient("http://relay.example.com", account)).toThrow(
+    expect(() => createSocialClient("http://relay.example.com", signer)).toThrow(
       "Relay URL must use HTTPS",
     );
   });
 
   it("send() calls signing module and validates message", async () => {
     const { createSocialClient } = await import("../social/client.js");
-    const { privateKeyToAccount } = await import("viem/accounts");
-    const account = privateKeyToAccount(
-      "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80",
-    );
+    const signer = createSigner(ALICE_ID);
 
     // Mock fetch to capture the request body
     const mockFetch = vi.fn().mockResolvedValue({
       ok: true,
+      status: 200,
       json: () => Promise.resolve({ id: "msg-123" }),
     });
     vi.stubGlobal("fetch", mockFetch);
 
-    const client = createSocialClient("https://relay.example.com", account);
-    const result = await client.send(
-      "0x70997970C51812dc3A010C7d01b50e0d17dc79C8",
-      "Test message",
-    );
+    const client = createSocialClient("https://relay.example.com", signer);
+    const result = await client.send(BOB_ID, "Test message");
 
     expect(result.id).toBe("msg-123");
     // Verify the request was made with a signature
@@ -303,20 +284,18 @@ describe("Social Client", () => {
 
   it("unreadCount() throws on HTTP error (not returns 0)", async () => {
     const { createSocialClient } = await import("../social/client.js");
-    const { privateKeyToAccount } = await import("viem/accounts");
-    const account = privateKeyToAccount(
-      "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80",
-    );
+    const signer = createSigner(ALICE_ID);
 
+    // Non-retryable HTTP error: the client must surface it, not retry for minutes
     const mockFetch = vi.fn().mockResolvedValue({
       ok: false,
-      status: 500,
-      statusText: "Internal Server Error",
-      json: () => Promise.resolve({ error: "server error" }),
+      status: 400,
+      statusText: "Bad Request",
+      json: () => Promise.resolve({ error: "bad request" }),
     });
     vi.stubGlobal("fetch", mockFetch);
 
-    const client = createSocialClient("https://relay.example.com", account);
+    const client = createSocialClient("https://relay.example.com", signer);
     await expect(client.unreadCount()).rejects.toThrow("Unread count failed");
 
     vi.unstubAllGlobals();
@@ -324,64 +303,52 @@ describe("Social Client", () => {
 
   it("rate limiting: 101st message in hour is rejected", async () => {
     const { createSocialClient } = await import("../social/client.js");
-    const { privateKeyToAccount } = await import("viem/accounts");
-    const account = privateKeyToAccount(
-      "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80",
-    );
+    const signer = createSigner(ALICE_ID);
 
     const mockFetch = vi.fn().mockResolvedValue({
       ok: true,
+      status: 200,
       json: () => Promise.resolve({ id: "msg-xxx" }),
     });
     vi.stubGlobal("fetch", mockFetch);
 
-    const client = createSocialClient("https://relay.example.com", account);
+    const client = createSocialClient("https://relay.example.com", signer);
 
     // Send 100 messages successfully
     for (let i = 0; i < 100; i++) {
-      await client.send(
-        "0x70997970C51812dc3A010C7d01b50e0d17dc79C8",
-        `message ${i}`,
-      );
+      await client.send(BOB_ID, `message ${i}`);
     }
 
     // 101st should be rejected
-    await expect(
-      client.send("0x70997970C51812dc3A010C7d01b50e0d17dc79C8", "message 100"),
-    ).rejects.toThrow("Rate limit exceeded");
+    await expect(client.send(BOB_ID, "message 100")).rejects.toThrow("Rate limit exceeded");
 
     vi.unstubAllGlobals();
   });
 
   it("rate limiting: failed sends count toward the hourly limit", async () => {
     const { createSocialClient } = await import("../social/client.js");
-    const { privateKeyToAccount } = await import("viem/accounts");
-    const account = privateKeyToAccount(
-      "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80",
-    );
+    const signer = createSigner(ALICE_ID);
 
-    // Server returns 500 for every request
+    // Server rejects every request (non-retryable status, so no backoff delays)
     const mockFetch = vi.fn().mockResolvedValue({
       ok: false,
-      status: 500,
-      statusText: "Internal Server Error",
-      json: () => Promise.resolve({ error: "server error" }),
+      status: 400,
+      statusText: "Bad Request",
+      json: () => Promise.resolve({ error: "bad request" }),
     });
     vi.stubGlobal("fetch", mockFetch);
 
-    const client = createSocialClient("https://relay.example.com", account);
+    const client = createSocialClient("https://relay.example.com", signer);
 
-    // Send 100 messages that all fail with 500
+    // Send 100 messages that all fail
     for (let i = 0; i < 100; i++) {
       await client
-        .send("0x70997970C51812dc3A010C7d01b50e0d17dc79C8", `msg ${i}`)
+        .send(BOB_ID, `msg ${i}`)
         .catch(() => {}); // ignore the send failure
     }
 
     // 101st should be rate-limited even though all previous sends failed
-    await expect(
-      client.send("0x70997970C51812dc3A010C7d01b50e0d17dc79C8", "msg 100"),
-    ).rejects.toThrow("Rate limit exceeded");
+    await expect(client.send(BOB_ID, "msg 100")).rejects.toThrow("Rate limit exceeded");
 
     vi.unstubAllGlobals();
   });
@@ -390,94 +357,45 @@ describe("Social Client", () => {
 // ─── 5. Agent Card Tests ────────────────────────────────────────
 
 describe("Agent Card", () => {
+  const db = {
+    getChildren: () => [],
+    getSkills: () => [],
+  } as any;
+
   it("generateAgentCard does NOT include sandbox ID", async () => {
     const { generateAgentCard } = await import("../registry/agent-card.js");
 
-    const identity = {
-      name: "test-agent",
-      address: "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266" as `0x${string}`,
-      account: {} as any,
-      creatorAddress: "0x70997970C51812dc3A010C7d01b50e0d17dc79C8" as `0x${string}`,
-      sandboxId: "sandbox-123",
-      apiKey: "key-123",
-      createdAt: new Date().toISOString(),
-    };
-
-    const config = {
-      name: "TestBot",
-      conwayApiUrl: "https://api.conway.tech",
-      creatorAddress: "0x70997970C51812dc3A010C7d01b50e0d17dc79C8" as `0x${string}`,
-    } as any;
-
-    const db = {
-      getChildren: () => [],
-      getSkills: () => [],
-    } as any;
+    const identity = createTestIdentity();
+    const config = createTestConfig();
 
     const card = generateAgentCard(identity, config, db);
     const cardStr = JSON.stringify(card);
 
-    expect(cardStr).not.toContain("sandbox-123");
+    expect(cardStr).not.toContain(identity.sandboxId);
   });
 
   it("generateAgentCard does NOT include Conway API URL", async () => {
     const { generateAgentCard } = await import("../registry/agent-card.js");
 
-    const identity = {
-      name: "test-agent",
-      address: "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266" as `0x${string}`,
-      account: {} as any,
-      creatorAddress: "0x70997970C51812dc3A010C7d01b50e0d17dc79C8" as `0x${string}`,
-      sandboxId: "sandbox-123",
-      apiKey: "key-123",
-      createdAt: new Date().toISOString(),
-    };
-
-    const config = {
-      name: "TestBot",
-      conwayApiUrl: "https://api.conway.tech",
-      creatorAddress: "0x70997970C51812dc3A010C7d01b50e0d17dc79C8" as `0x${string}`,
-    } as any;
-
-    const db = {
-      getChildren: () => [],
-      getSkills: () => [],
-    } as any;
+    const identity = createTestIdentity();
+    const config = createTestConfig();
 
     const card = generateAgentCard(identity, config, db);
     const cardStr = JSON.stringify(card);
 
-    expect(cardStr).not.toContain("api.conway.tech");
+    expect(cardStr).not.toContain(config.conwayApiUrl);
   });
 
-  it("generateAgentCard does NOT include creator address", async () => {
+  it("generateAgentCard does NOT include creator account id", async () => {
     const { generateAgentCard } = await import("../registry/agent-card.js");
 
-    const identity = {
-      name: "test-agent",
-      address: "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266" as `0x${string}`,
-      account: {} as any,
-      creatorAddress: "0x70997970C51812dc3A010C7d01b50e0d17dc79C8" as `0x${string}`,
-      sandboxId: "sandbox-123",
-      apiKey: "key-123",
-      createdAt: new Date().toISOString(),
-    };
-
-    const config = {
-      name: "TestBot",
-      conwayApiUrl: "https://api.conway.tech",
-      creatorAddress: "0x70997970C51812dc3A010C7d01b50e0d17dc79C8" as `0x${string}`,
-    } as any;
-
-    const db = {
-      getChildren: () => [],
-      getSkills: () => [],
-    } as any;
+    const identity = createTestIdentity();
+    const config = createTestConfig();
 
     const card = generateAgentCard(identity, config, db);
     const cardStr = JSON.stringify(card);
 
-    expect(cardStr).not.toContain("0x70997970C51812dc3A010C7d01b50e0d17dc79C8");
+    expect(cardStr).not.toContain(identity.creatorAccountId);
   });
 
   it("hostAgentCard writes card as separate JSON file", async () => {
@@ -493,15 +411,15 @@ describe("Agent Card", () => {
     } as any;
 
     const card = {
-      type: "test",
+      type: "https://conway.tech/agent-card#registration-v1",
       name: "TestBot",
       description: "Test",
+      accountId: ALICE_ID,
       services: [],
-      x402Support: true,
       active: true,
     };
 
-    await hostAgentCard(card, mockConway);
+    await hostAgentCard(card as any, mockConway);
 
     // Card should be written as separate JSON file
     expect(writtenFiles["/tmp/agent-card.json"]).toBeTruthy();
@@ -515,50 +433,62 @@ describe("Agent Card", () => {
   });
 });
 
-// ─── 6. ERC-8004 Tests ─────────────────────────────────────────
+// ─── 6. Feedback Tests ─────────────────────────────────────────
 
-describe("ERC-8004", () => {
-  it("leaveFeedback rejects score 0", async () => {
-    const { leaveFeedback } = await import("../registry/erc8004.js");
-    const { privateKeyToAccount } = await import("viem/accounts");
-    const account = privateKeyToAccount(
-      "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80",
-    );
+describe("Feedback", () => {
+  let tools: AutomatonTool[];
+  let ctx: ToolContext;
+  let db: AutomatonDatabase;
 
-    const mockDb = { raw: createTestDb() } as any;
-
-    await expect(
-      leaveFeedback(account, "1", 0, "bad", "testnet", mockDb),
-    ).rejects.toThrow("Invalid score: 0");
+  beforeEach(() => {
+    tools = createBuiltinTools("test-sandbox-id");
+    db = createAutomatonDb();
+    ctx = {
+      identity: createTestIdentity(),
+      config: createTestConfig(),
+      db,
+      conway: new MockConwayClient(),
+      inference: new MockInferenceClient(),
+    };
   });
 
-  it("leaveFeedback rejects score 6", async () => {
-    const { leaveFeedback } = await import("../registry/erc8004.js");
-    const { privateKeyToAccount } = await import("viem/accounts");
-    const account = privateKeyToAccount(
-      "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80",
-    );
-
-    const mockDb = { raw: createTestDb() } as any;
-
-    await expect(
-      leaveFeedback(account, "1", 6, "too high", "testnet", mockDb),
-    ).rejects.toThrow("Invalid score: 6");
+  afterEach(() => {
+    db.close();
   });
 
-  it("leaveFeedback rejects comment over 500 chars", async () => {
-    const { leaveFeedback } = await import("../registry/erc8004.js");
-    const { privateKeyToAccount } = await import("viem/accounts");
-    const account = privateKeyToAccount(
-      "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80",
+  function feedbackTool(): AutomatonTool {
+    const tool = tools.find((t) => t.name === "give_feedback");
+    if (!tool) throw new Error("give_feedback tool not registered");
+    return tool;
+  }
+
+  it("give_feedback rejects score 0", async () => {
+    const result = await feedbackTool().execute(
+      { agent_id: BOB_ID, score: 0, comment: "bad" },
+      ctx,
     );
 
-    const mockDb = { raw: createTestDb() } as any;
+    expect(result).toContain("Invalid score: 0");
+  });
+
+  it("give_feedback rejects score 6", async () => {
+    const result = await feedbackTool().execute(
+      { agent_id: BOB_ID, score: 6, comment: "too high" },
+      ctx,
+    );
+
+    expect(result).toContain("Invalid score: 6");
+  });
+
+  it("give_feedback rejects comment over 500 chars", async () => {
     const longComment = "x".repeat(501);
 
-    await expect(
-      leaveFeedback(account, "1", 3, longComment, "testnet", mockDb),
-    ).rejects.toThrow("Comment too long");
+    const result = await feedbackTool().execute(
+      { agent_id: BOB_ID, score: 3, comment: longComment },
+      ctx,
+    );
+
+    expect(result).toContain("Comment too long");
   });
 });
 
@@ -600,7 +530,7 @@ describe("Discovery", () => {
       name: "TestAgent",
       type: "test",
       description: "A test agent",
-      services: [{ name: "wallet", endpoint: "eip155:8453:0x123" }],
+      services: [{ name: "agent", endpoint: "https://example.com/agent" }],
     });
     expect(result).not.toBeNull();
     expect(result!.name).toBe("TestAgent");
@@ -631,15 +561,15 @@ describe("Schema", () => {
     // Table should exist - try inserting
     const stmt = db.prepare(
       `INSERT INTO discovered_agents_cache
-       (agent_address, agent_card, fetched_from, card_hash, valid_until, fetch_count, last_fetched_at, created_at)
+       (agent_id, agent_card, fetched_from, card_hash, valid_until, fetch_count, last_fetched_at, created_at)
        VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
     );
     expect(() =>
       stmt.run(
-        "0xtest",
+        "agent-test",
         '{"name":"test"}',
         "https://example.com",
-        "0xhash",
+        "hash-1",
         null,
         1,
         new Date().toISOString(),
@@ -649,31 +579,35 @@ describe("Schema", () => {
 
     // Verify we can read it back
     const row = db
-      .prepare("SELECT * FROM discovered_agents_cache WHERE agent_address = ?")
-      .get("0xtest") as any;
+      .prepare("SELECT * FROM discovered_agents_cache WHERE agent_id = ?")
+      .get("agent-test") as any;
     expect(row).toBeTruthy();
     expect(row.agent_card).toBe('{"name":"test"}');
 
     db.close();
   });
 
-  it("MIGRATION_V7 creates onchain_transactions table", () => {
-    const db = createTestDb();
-
-    const stmt = db.prepare(
-      `INSERT INTO onchain_transactions (id, tx_hash, chain, operation, status, gas_used, metadata)
-       VALUES (?, ?, ?, ?, ?, ?, ?)`,
+  it("MIGRATION_V7 drops the legacy transaction table", () => {
+    const db = new Database(":memory:");
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS schema_version (
+        version INTEGER PRIMARY KEY,
+        applied_at TEXT NOT NULL DEFAULT (datetime('now'))
+      );
+    `);
+    // Simulate an older database that still carries the chain transaction log
+    db.exec(
+      `CREATE TABLE onchain_transactions (
+         id TEXT PRIMARY KEY, tx_hash TEXT, chain TEXT, operation TEXT, status TEXT
+       );`,
     );
-    expect(() =>
-      stmt.run("id1", "0xhash", "eip155:8453", "register", "pending", null, "{}"),
-    ).not.toThrow();
+
+    db.exec(MIGRATION_V7);
 
     const row = db
-      .prepare("SELECT * FROM onchain_transactions WHERE tx_hash = ?")
-      .get("0xhash") as any;
-    expect(row).toBeTruthy();
-    expect(row.operation).toBe("register");
-    expect(row.status).toBe("pending");
+      .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'onchain_transactions'")
+      .get();
+    expect(row).toBeUndefined();
 
     db.close();
   });
@@ -692,15 +626,19 @@ describe("Schema", () => {
     db.close();
   });
 
-  it("onchain_transactions status CHECK constraint works", () => {
+  it("pix_payments status CHECK constraint works", () => {
     const db = createTestDb();
 
     const stmt = db.prepare(
-      `INSERT INTO onchain_transactions (id, tx_hash, chain, operation, status)
-       VALUES (?, ?, ?, ?, ?)`,
+      `INSERT INTO pix_payments (id, user_id, provider, external_id, amount_cents, status)
+       VALUES (?, ?, ?, ?, ?, ?)`,
     );
     expect(() =>
-      stmt.run("id2", "0xhash2", "eip155:8453", "register", "invalid_status"),
+      stmt.run("pix-valid", "user-1", "mercadopago", "ext-valid", 1990, "PENDING"),
+    ).not.toThrow();
+
+    expect(() =>
+      stmt.run("pix-invalid", "user-1", "mercadopago", "ext-invalid", 1990, "invalid_status"),
     ).toThrow();
 
     db.close();
@@ -715,17 +653,17 @@ describe("DB Helpers", () => {
     const { agentCacheUpsert, agentCacheGet } = await import("../state/database.js");
 
     agentCacheUpsert(db, {
-      agentAddress: "0xtest",
+      agentId: "agent-test",
       agentCard: '{"name":"TestAgent"}',
       fetchedFrom: "https://example.com/card",
-      cardHash: "0xhash",
+      cardHash: "hash-1",
       validUntil: new Date(Date.now() + 3_600_000).toISOString(),
       fetchCount: 1,
       lastFetchedAt: new Date().toISOString(),
       createdAt: new Date().toISOString(),
     });
 
-    const row = agentCacheGet(db, "0xtest");
+    const row = agentCacheGet(db, "agent-test");
     expect(row).toBeTruthy();
     expect(row!.agentCard).toBe('{"name":"TestAgent"}');
     expect(row!.fetchCount).toBe(1);
@@ -739,10 +677,10 @@ describe("DB Helpers", () => {
 
     // Valid entry
     agentCacheUpsert(db, {
-      agentAddress: "0xvalid",
+      agentId: "agent-valid",
       agentCard: '{"name":"Valid"}',
       fetchedFrom: "https://example.com",
-      cardHash: "0x1",
+      cardHash: "hash-1",
       validUntil: new Date(Date.now() + 3_600_000).toISOString(),
       fetchCount: 1,
       lastFetchedAt: new Date().toISOString(),
@@ -751,10 +689,10 @@ describe("DB Helpers", () => {
 
     // Expired entry
     agentCacheUpsert(db, {
-      agentAddress: "0xexpired",
+      agentId: "agent-expired",
       agentCard: '{"name":"Expired"}',
       fetchedFrom: "https://example.com",
-      cardHash: "0x2",
+      cardHash: "hash-2",
       validUntil: "2020-01-01T00:00:00Z",
       fetchCount: 1,
       lastFetchedAt: new Date().toISOString(),
@@ -763,7 +701,7 @@ describe("DB Helpers", () => {
 
     const valid = agentCacheGetValid(db);
     expect(valid.length).toBe(1);
-    expect(valid[0]!.agentAddress).toBe("0xvalid");
+    expect(valid[0]!.agentId).toBe("agent-valid");
 
     db.close();
   });
@@ -773,10 +711,10 @@ describe("DB Helpers", () => {
     const { agentCacheUpsert, agentCachePrune, agentCacheGet } = await import("../state/database.js");
 
     agentCacheUpsert(db, {
-      agentAddress: "0xexpired",
+      agentId: "agent-expired",
       agentCard: '{"name":"Expired"}',
       fetchedFrom: "https://example.com",
-      cardHash: "0x1",
+      cardHash: "hash-1",
       validUntil: "2020-01-01T00:00:00Z",
       fetchCount: 1,
       lastFetchedAt: new Date().toISOString(),
@@ -785,89 +723,104 @@ describe("DB Helpers", () => {
 
     const pruned = agentCachePrune(db);
     expect(pruned).toBe(1);
-    expect(agentCacheGet(db, "0xexpired")).toBeUndefined();
+    expect(agentCacheGet(db, "agent-expired")).toBeUndefined();
 
     db.close();
   });
 
-  it("onchainTxInsert and onchainTxGetByHash work", async () => {
+  it("insertPixPayment and getPixPaymentById work", async () => {
     const db = createTestDb();
-    const { onchainTxInsert, onchainTxGetByHash } = await import("../state/database.js");
+    const { insertPixPayment, getPixPaymentById, getPixPaymentByExternalId } = await import(
+      "../state/database.js"
+    );
 
-    onchainTxInsert(db, {
-      id: "tx1",
-      txHash: "0xabc",
-      chain: "eip155:8453",
-      operation: "register",
-      status: "pending",
-      gasUsed: null,
-      metadata: "{}",
+    insertPixPayment(db, {
+      id: "pix-1",
+      userId: "user-1",
+      provider: "mercadopago",
+      externalId: "ext-1",
+      amountCents: 1990,
+      currency: "BRL",
+      status: "PENDING",
+      pixCopyPaste: "pix-copy-payload-1",
+      qrCode: null,
+      description: "Credit top-up",
+      expiresAt: new Date(Date.now() + 3_600_000).toISOString(),
+      paidAt: null,
       createdAt: new Date().toISOString(),
     });
 
-    const row = onchainTxGetByHash(db, "0xabc");
+    const row = getPixPaymentById(db, "pix-1");
     expect(row).toBeTruthy();
-    expect(row!.operation).toBe("register");
-    expect(row!.status).toBe("pending");
+    expect(row!.amountCents).toBe(1990);
+    expect(row!.status).toBe("PENDING");
+    expect(row!.currency).toBe("BRL");
+    expect(formatBRL(row!.amountCents)).toContain("19,90");
+
+    const byExternal = getPixPaymentByExternalId(db, "mercadopago", "ext-1");
+    expect(byExternal?.id).toBe("pix-1");
 
     db.close();
   });
 
-  it("onchainTxGetAll with status filter works", async () => {
+  it("listPixPayments filters by user", async () => {
     const db = createTestDb();
-    const { onchainTxInsert, onchainTxGetAll } = await import("../state/database.js");
+    const { insertPixPayment, listPixPayments } = await import("../state/database.js");
 
-    onchainTxInsert(db, {
-      id: "tx1",
-      txHash: "0x1",
-      chain: "eip155:8453",
-      operation: "register",
-      status: "pending",
-      gasUsed: null,
-      metadata: "{}",
-      createdAt: new Date().toISOString(),
-    });
+    const now = new Date().toISOString();
+    const base = {
+      provider: "mercadopago",
+      currency: "BRL" as const,
+      status: "PENDING" as const,
+      pixCopyPaste: null,
+      qrCode: null,
+      description: "Credit top-up",
+      expiresAt: null,
+      paidAt: null,
+      createdAt: now,
+    };
 
-    onchainTxInsert(db, {
-      id: "tx2",
-      txHash: "0x2",
-      chain: "eip155:8453",
-      operation: "feedback",
-      status: "confirmed",
-      gasUsed: 50000,
-      metadata: "{}",
-      createdAt: new Date().toISOString(),
-    });
+    insertPixPayment(db, { ...base, id: "pix-a1", userId: "user-1", externalId: "ext-a1", amountCents: 1000 });
+    insertPixPayment(db, { ...base, id: "pix-a2", userId: "user-1", externalId: "ext-a2", amountCents: 2500 });
+    insertPixPayment(db, { ...base, id: "pix-b1", userId: "user-2", externalId: "ext-b1", amountCents: 5000 });
 
-    const pending = onchainTxGetAll(db, { status: "pending" });
-    expect(pending.length).toBe(1);
-
-    const all = onchainTxGetAll(db);
-    expect(all.length).toBe(2);
+    expect(listPixPayments(db, "user-1").length).toBe(2);
+    expect(listPixPayments(db, "user-2").length).toBe(1);
+    expect(listPixPayments(db, "user-none").length).toBe(0);
 
     db.close();
   });
 
-  it("onchainTxUpdateStatus works", async () => {
+  it("updatePixPaymentStatus works", async () => {
     const db = createTestDb();
-    const { onchainTxInsert, onchainTxUpdateStatus, onchainTxGetByHash } = await import("../state/database.js");
+    const { insertPixPayment, updatePixPaymentStatus, getPixPaymentById } = await import(
+      "../state/database.js"
+    );
 
-    onchainTxInsert(db, {
-      id: "tx1",
-      txHash: "0xupdate",
-      chain: "eip155:8453",
-      operation: "register",
-      status: "pending",
-      gasUsed: null,
-      metadata: "{}",
+    insertPixPayment(db, {
+      id: "pix-update",
+      userId: "user-1",
+      provider: "mercadopago",
+      externalId: "ext-update",
+      amountCents: 1000,
+      currency: "BRL",
+      status: "PENDING",
+      pixCopyPaste: null,
+      qrCode: null,
+      description: "Credit top-up",
+      expiresAt: new Date(Date.now() + 3_600_000).toISOString(),
+      paidAt: null,
       createdAt: new Date().toISOString(),
     });
 
-    onchainTxUpdateStatus(db, "0xupdate", "confirmed", 75000);
+    updatePixPaymentStatus(db, "pix-update", {
+      status: "PAID",
+      paidAt: new Date().toISOString(),
+    });
 
-    const row = onchainTxGetByHash(db, "0xupdate");
-    expect(row!.status).toBe("confirmed");
-    expect(row!.gasUsed).toBe(75000);
+    const row = getPixPaymentById(db, "pix-update");
+    expect(row!.status).toBe("PAID");
+    expect(row!.paidAt).toBeTruthy();
 
     db.close();
   });
@@ -892,68 +845,56 @@ describe("Protocol", () => {
   });
 
   it("verifyMessageSignature validates correct signature", async () => {
-    const { privateKeyToAccount } = await import("viem/accounts");
     const { signSendPayload } = await import("../social/signing.js");
     const { verifyMessageSignature } = await import("../social/protocol.js");
 
-    const account = privateKeyToAccount(
-      "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80",
-    );
+    const signer = createSigner(ALICE_ID);
+    const payload = await signSendPayload(signer, BOB_ID, "Test content");
 
-    const payload = await signSendPayload(
-      account,
-      "0x70997970C51812dc3A010C7d01b50e0d17dc79C8",
-      "Test content",
-    );
-
-    const valid = await verifyMessageSignature(payload, account.address);
+    const valid = await verifyMessageSignature(payload, ALICE_ID, signer.publicKey);
     expect(valid).toBe(true);
   });
 
   it("verifyMessageSignature rejects wrong signer", async () => {
-    const { privateKeyToAccount } = await import("viem/accounts");
     const { signSendPayload } = await import("../social/signing.js");
     const { verifyMessageSignature } = await import("../social/protocol.js");
 
-    const account = privateKeyToAccount(
-      "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80",
-    );
+    const signer = createSigner(ALICE_ID);
+    const payload = await signSendPayload(signer, BOB_ID, "Test content");
 
-    const payload = await signSendPayload(
-      account,
-      "0x70997970C51812dc3A010C7d01b50e0d17dc79C8",
-      "Test content",
-    );
+    // No sender public key: nothing to verify against
+    expect(await verifyMessageSignature(payload, ALICE_ID)).toBe(false);
 
-    // Different address
+    // Published key belongs to a different account
     const valid = await verifyMessageSignature(
       payload,
-      "0x70997970C51812dc3A010C7d01b50e0d17dc79C8",
+      ALICE_ID,
+      createSigner(ALICE_ID).publicKey,
     );
     expect(valid).toBe(false);
   });
 });
 
-// ─── 11. Address Validation Tests ───────────────────────────────
+// ─── 11. Account Id Validation Tests ────────────────────────────
 
-describe("Address Validation", () => {
-  it("isValidAddress accepts valid address", async () => {
-    const { isValidAddress } = await import("../social/validation.js");
-    expect(isValidAddress("0x70997970C51812dc3A010C7d01b50e0d17dc79C8")).toBe(true);
+describe("Account Id Validation", () => {
+  it("isValidAccountId accepts valid account id", async () => {
+    const { isValidAccountId } = await import("../social/validation.js");
+    expect(isValidAccountId("acct_1234567890abcdef1234")).toBe(true);
   });
 
-  it("isValidAddress rejects short address", async () => {
-    const { isValidAddress } = await import("../social/validation.js");
-    expect(isValidAddress("0x7099")).toBe(false);
+  it("isValidAccountId rejects short account id", async () => {
+    const { isValidAccountId } = await import("../social/validation.js");
+    expect(isValidAccountId("acct_abc")).toBe(false);
   });
 
-  it("isValidAddress rejects non-hex", async () => {
-    const { isValidAddress } = await import("../social/validation.js");
-    expect(isValidAddress("0xGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGG")).toBe(false);
+  it("isValidAccountId rejects non-hex characters", async () => {
+    const { isValidAccountId } = await import("../social/validation.js");
+    expect(isValidAccountId("acct_GGGGGGGGGGGGGGGG")).toBe(false);
   });
 
-  it("isValidAddress rejects no prefix", async () => {
-    const { isValidAddress } = await import("../social/validation.js");
-    expect(isValidAddress("70997970C51812dc3A010C7d01b50e0d17dc79C8")).toBe(false);
+  it("isValidAccountId rejects missing prefix", async () => {
+    const { isValidAccountId } = await import("../social/validation.js");
+    expect(isValidAccountId("1234567890abcdef1234")).toBe(false);
   });
 });

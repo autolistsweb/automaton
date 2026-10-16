@@ -1,4 +1,5 @@
 import { createLogger } from "../../observability/logger.js";
+import { formatBRL } from "../../payments/money.js";
 import type { ChatMessage, InferenceToolCall } from "../../types.js";
 import type { TaskNode, TaskResult } from "../../orchestration/task-graph.js";
 import { LoopDetector } from "../loop-detector.js";
@@ -268,7 +269,7 @@ export abstract class BaseHarness implements AgentHarness {
 
     if (budget.costUsedCents >= budget.maxCostCents) {
       throw new Error(
-        `Budget exhausted: cost limit reached ($${(budget.costUsedCents / 100).toFixed(2)} / $${(budget.maxCostCents / 100).toFixed(2)}). ` +
+        `Budget exhausted: cost limit reached (${formatBRL(budget.costUsedCents)} / ${formatBRL(budget.maxCostCents)}). ` +
         `Task "${this.task.title}" exceeded its cost budget.`,
       );
     }

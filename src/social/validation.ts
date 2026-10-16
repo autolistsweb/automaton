@@ -9,9 +9,9 @@
 
 import type { MessageValidationResult } from "../types.js";
 import { MESSAGE_LIMITS } from "./signing.js";
-import { isValidAddress } from "../identity/chain.js";
+import { isValidAccountId } from "../identity/account.js";
 
-export { isValidAddress } from "../identity/chain.js";
+export { isValidAccountId };
 
 /**
  * Validate a social message for size, timestamp, and address constraints.
@@ -51,12 +51,12 @@ export function validateMessage(message: {
     }
   }
 
-  // Address validation
-  if (!isValidAddress(message.from)) {
-    errors.push("Invalid sender address");
+  // Account id validation
+  if (!isValidAccountId(message.from)) {
+    errors.push("Invalid sender account");
   }
-  if (!isValidAddress(message.to)) {
-    errors.push("Invalid recipient address");
+  if (!isValidAccountId(message.to)) {
+    errors.push("Invalid recipient account");
   }
 
   return { valid: errors.length === 0, errors };
@@ -78,4 +78,4 @@ export function validateRelayUrl(url: string): void {
   }
 }
 
-// isValidAddress is re-exported from ../identity/chain.js (supports both EVM and Solana)
+// isValidAccountId is re-exported from ../identity/account.js

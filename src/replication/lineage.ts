@@ -4,7 +4,7 @@
  * Track parent-child relationships between automatons.
  * The parent records children in SQLite.
  * Children record their parent in config.
- * ERC-8004 registration includes parentAgent field.
+ * Agent card registration records the parentAgent field.
  *
  * Phase 3.1: Actual pruning + concurrency-limited refresh.
  */
@@ -49,7 +49,7 @@ export function getLineage(db: AutomatonDatabase): {
  * Check if this automaton has a parent (is itself a child).
  */
 export function hasParent(config: AutomatonConfig): boolean {
-  return !!config.parentAddress;
+  return !!config.parentAccountId;
 }
 
 /**
@@ -63,7 +63,7 @@ export function getLineageSummary(
   const parts: string[] = [];
 
   if (hasParent(config)) {
-    parts.push(`Parent: ${config.parentAddress}`);
+    parts.push(`Parent: ${config.parentAccountId}`);
   }
 
   if (lineage.total > 0) {

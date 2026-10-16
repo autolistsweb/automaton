@@ -1,102 +1,201 @@
 /**
- * Credit Topup via x402
+ * Credit Topup
  *
- * Converts USDC to Conway credits via the x402 payment protocol.
+ * Conway compute credits are bought with the account's BRL balance.
+ * The balance itself is only ever increased by an inbound Pix confirmed
+ * through the payment webhook — there is no coin, chain or external token
+ * involved anywhere in this path.
  *
- * - On startup: bootstraps with the minimum tier ($5) so the agent can run.
- * - At runtime: the agent uses the `topup_credits` tool to choose how much.
- * - Heartbeat: wakes the agent when USDC is available but credits are low.
+ * On startup: `bootstrapTopup` buys the minimum tier when credits are low
+ * and the BRL balance covers it.
+ * At runtime: the agent uses the `topup_credits` tool to choose a tier.
+ * On a 402/insufficient-credit sandbox error: `topupForSandbox` picks the
+ * smallest tier that covers the deficit.
  *
- * Endpoint: GET /pay/{amountUsd}/{walletAddress}
- * Payment: x402 (USDC on Base, signed TransferWithAuthorization)
- *
- * Valid tiers: 5, 25, 100, 500, 1000, 2500 (USD)
+ * All amounts are integer centavos of BRL.
  */
 
-import type { PrivateKeyAccount, Address } from "viem";
-import { x402Fetch, getUsdcBalance } from "./x402.js";
+import type Database from "better-sqlite3";
 import { createLogger } from "../observability/logger.js";
-import type { ChainType } from "../identity/chain.js";
+import { formatBRL, validateAmountCents, BRL_CURRENCY } from "../payments/money.js";
+import {
+  creditBalance,
+  debitBalance,
+  getBalanceCents,
+  hasFinancialTransaction,
+  insertFinancialTransaction,
+} from "../state/database.js";
+import { ulid } from "ulid";
+import type { ConwayClient, FinancialTransactionRow } from "../types.js";
 
 const logger = createLogger("topup");
 
-/** Valid topup tier amounts in USD. */
-export const TOPUP_TIERS = [5, 25, 100, 500, 1000, 2500];
+/** Valid topup tiers in centavos of BRL (R$ 10 … R$ 500). */
+export const TOPUP_TIERS_CENTS = [1000, 2500, 5000, 10000, 25000, 50000];
+
+/** Smallest tier — the default bootstrap amount. */
+export const MIN_TOPUP_CENTS = TOPUP_TIERS_CENTS[0];
+/** Largest tier accepted without an explicit policy override. */
+export const MAX_TOPUP_CENTS = TOPUP_TIERS_CENTS[TOPUP_TIERS_CENTS.length - 1];
 
 export interface TopupResult {
   success: boolean;
-  amountUsd: number;
+  /** BRL centavos taken from the account balance. */
+  amountCents: number;
   creditsCentsAdded?: number;
+  balanceCents?: number;
   error?: string;
 }
 
-/**
- * Execute a credit topup via x402 payment.
- *
- * Calls GET /pay/{amountUsd}/{address} which returns HTTP 402.
- * x402Fetch handles the payment signing and retry automatically.
- */
-export async function topupCredits(
-  apiUrl: string,
-  account: PrivateKeyAccount,
-  amountUsd: number,
-  recipientAddress?: Address,
-): Promise<TopupResult> {
-  const address = recipientAddress || account.address;
-  const url = `${apiUrl}/pay/${amountUsd}/${address}`;
-
-  logger.info(`Attempting credit topup: $${amountUsd} USD for ${address}`);
-
-  const result = await x402Fetch(url, account, "GET");
-
-  if (!result.success) {
-    logger.error(`Credit topup failed: ${result.error}`);
-    return {
-      success: false,
-      amountUsd,
-      error: result.error || `HTTP ${result.status}`,
-    };
-  }
-
-  const creditsCentsAdded = typeof result.response === "object"
-    ? result.response?.credits_cents ?? result.response?.amount_cents ?? amountUsd * 100
-    : amountUsd * 100;
-
-  logger.info(`Credit topup successful: $${amountUsd} USD → ${creditsCentsAdded} credits cents`);
-
-  return {
-    success: true,
-    amountUsd,
-    creditsCentsAdded,
-  };
+function pickTier(deficitCents: number): number {
+  return (
+    TOPUP_TIERS_CENTS.find((tier) => tier >= deficitCents) ??
+    MAX_TOPUP_CENTS
+  );
 }
 
 /**
- * Attempt a credit topup in response to a 402 sandbox creation error.
+ * Buy Conway credits with the account's BRL balance.
  *
- * Parses the error response to determine the deficit, picks the smallest
- * tier that covers it, checks USDC balance, and calls topupCredits().
- * Returns null if the error isn't a 402 or topup can't proceed.
+ * Order of operations (fail-safe):
+ *  1. validate the amount;
+ *  2. debit the BRL balance (refuses to go negative);
+ *  3. call the Conway credits API;
+ *  4. refund the balance and record a FAILED ledger entry if step 3 fails.
+ *
+ * The ledger entry reference is stable per call, so a retried purchase with
+ * the same reference cannot be recorded twice.
+ */
+export async function purchaseCredits(params: {
+  db: Database.Database;
+  userId: string;
+  amountCents: number;
+  conway: ConwayClient;
+  description?: string;
+}): Promise<TopupResult> {
+  const { db, userId, amountCents, conway } = params;
+
+  const amountError = validateAmountCents(amountCents, {
+    min: MIN_TOPUP_CENTS,
+    max: MAX_TOPUP_CENTS,
+  });
+  if (amountError) {
+    return { success: false, amountCents, error: amountError };
+  }
+
+  if (amountCents % 100 !== 0) {
+    return {
+      success: false,
+      amountCents,
+      error: "Credit topup must use a whole-real tier (multiples of R$ 1,00)",
+    };
+  }
+
+  const referenceId = `crd_${ulid().toLowerCase()}`;
+
+  let balanceCents: number;
+  try {
+    balanceCents = debitBalance(db, userId, amountCents);
+  } catch (err: any) {
+    return {
+      success: false,
+      amountCents,
+      error: err?.message === "Insufficient balance"
+        ? `Saldo insuficiente: ${formatBRL(getBalanceCents(db, userId))} disponível`
+        : err?.message,
+    };
+  }
+
+  try {
+    const result = await conway.purchaseCredits(amountCents, referenceId);
+
+    const ledgerRow: FinancialTransactionRow = {
+      id: ulid(),
+      userId,
+      type: "credit_purchase",
+      amountCents: -amountCents,
+      balanceAfterCents: balanceCents,
+      currency: BRL_CURRENCY,
+      paymentMethod: "PIX",
+      status: "COMPLETED",
+      referenceId,
+      description:
+        params.description ??
+        `Compra de créditos — ${formatBRL(amountCents)}`,
+      createdAt: new Date().toISOString(),
+    };
+    if (!hasFinancialTransaction(db, referenceId, "credit_purchase")) {
+      insertFinancialTransaction(db, ledgerRow);
+    }
+
+    logger.info(
+      `Credit topup: -${formatBRL(amountCents)} balance=${formatBRL(balanceCents)} credits=+${result.creditsCentsAdded}`,
+    );
+
+    return {
+      success: true,
+      amountCents,
+      creditsCentsAdded: result.creditsCentsAdded,
+      balanceCents,
+    };
+  } catch (err: any) {
+    // Refund: the money never bought credits.
+    let refundBalance = balanceCents;
+    try {
+      refundBalance = creditBalance(db, userId, amountCents);
+    } catch (refundErr: any) {
+      logger.error(`Credit topup refund failed: ${refundErr?.message}`);
+    }
+
+    if (!hasFinancialTransaction(db, referenceId, "credit_purchase")) {
+      insertFinancialTransaction(db, {
+        id: ulid(),
+        userId,
+        type: "credit_purchase",
+        amountCents: 0,
+        balanceAfterCents: refundBalance,
+        currency: BRL_CURRENCY,
+        paymentMethod: "PIX",
+        status: "FAILED",
+        referenceId,
+        description: `Compra de créditos falhou — ${formatBRL(amountCents)} devolvido`,
+        createdAt: new Date().toISOString(),
+      });
+    }
+
+    logger.warn(
+      `Credit topup failed: ${err?.message} (refunded ${formatBRL(amountCents)})`,
+    );
+
+    return {
+      success: false,
+      amountCents,
+      balanceCents: refundBalance,
+      error: err?.message ?? "credit topup failed",
+    };
+  }
+}
+
+/**
+ * Attempt a credit topup in response to a 402 / INSUFFICIENT_CREDITS
+ * sandbox creation error.
+ *
+ * Parses the error to find the deficit, picks the smallest tier that covers
+ * it and checks the BRL balance before spending. Returns `null` when the
+ * error is unrelated or the balance cannot cover the tier.
  */
 export async function topupForSandbox(params: {
-  apiUrl: string;
-  account: PrivateKeyAccount;
+  db: Database.Database;
+  userId: string;
+  conway: ConwayClient;
   error: Error & { status?: number; responseText?: string };
-  chainType?: ChainType;
 }): Promise<TopupResult | null> {
-  const { apiUrl, account, error, chainType } = params;
+  const { db, userId, conway, error } = params;
 
-  // Solana wallets cannot use x402 for topup (EVM-only payment protocol)
-  if (chainType === "solana") {
-    logger.info(
-      "Sandbox topup skipped: Solana wallets cannot use x402. Fund via Conway credits API or dashboard.",
-    );
+  if (error.status !== 402 && !error.message?.includes("INSUFFICIENT_CREDITS")) {
     return null;
   }
 
-  if (error.status !== 402 && !error.message?.includes("INSUFFICIENT_CREDITS")) return null;
-
-  // Parse the 402 response body for credit details
   let requiredCents: number | undefined;
   let currentCents: number | undefined;
   try {
@@ -104,89 +203,68 @@ export async function topupForSandbox(params: {
     requiredCents = body.details?.required_cents;
     currentCents = body.details?.current_balance_cents;
   } catch {
-    // If we can't parse the body, check for INSUFFICIENT_CREDITS in message
     if (!error.message?.includes("INSUFFICIENT_CREDITS")) return null;
   }
 
-  // Calculate deficit in cents; default to minimum tier if details missing
-  const deficitCents = (requiredCents != null && currentCents != null)
-    ? requiredCents - currentCents
-    : TOPUP_TIERS[0] * 100;
+  const deficitCents =
+    requiredCents != null && currentCents != null
+      ? requiredCents - currentCents
+      : MIN_TOPUP_CENTS;
 
-  // Pick smallest tier that covers the deficit (tier is in USD, deficit in cents)
-  const selectedTier = TOPUP_TIERS.find((tier) => tier * 100 >= deficitCents)
-    ?? TOPUP_TIERS[TOPUP_TIERS.length - 1];
+  const selectedTier = pickTier(deficitCents);
 
-  // Check USDC balance before attempting payment
-  let usdcBalance: number;
-  try {
-    usdcBalance = await getUsdcBalance(account.address);
-  } catch (err: any) {
-    logger.warn(`Failed to check USDC balance for sandbox topup: ${err.message}`);
-    return null;
-  }
-
-  if (usdcBalance < selectedTier) {
+  const balanceCents = getBalanceCents(db, userId);
+  if (balanceCents < selectedTier) {
     logger.info(
-      `Sandbox topup skipped: USDC $${usdcBalance.toFixed(2)} < tier $${selectedTier}`,
-    );
-    return null;
-  }
-
-  logger.info(`Sandbox topup: deficit=${deficitCents}c, buying $${selectedTier} tier`);
-  return topupCredits(apiUrl, account, selectedTier);
-}
-
-/**
- * Bootstrap topup: buy the minimum tier ($5) on startup so the agent
- * can run inference. The agent decides larger topups itself via the
- * `topup_credits` tool.
- *
- * Only triggers when credits are below threshold AND USDC covers the
- * minimum tier.
- */
-export async function bootstrapTopup(params: {
-  apiUrl: string;
-  account: PrivateKeyAccount;
-  creditsCents: number;
-  creditThresholdCents?: number;
-  chainType?: ChainType;
-}): Promise<TopupResult | null> {
-  const { apiUrl, account, creditsCents, creditThresholdCents = 500, chainType } = params;
-
-  // Solana wallets cannot use x402 for topup (EVM-only payment protocol)
-  if (chainType === "solana") {
-    if (creditsCents < creditThresholdCents) {
-      logger.info(
-        "Bootstrap topup skipped: Solana wallets cannot use x402. Fund via Conway credits API or dashboard.",
-      );
-    }
-    return null;
-  }
-
-  if (creditsCents >= creditThresholdCents) {
-    return null;
-  }
-
-  let usdcBalance: number;
-  try {
-    usdcBalance = await getUsdcBalance(account.address);
-  } catch (err: any) {
-    logger.warn(`Failed to check USDC balance for bootstrap topup: ${err.message}`);
-    return null;
-  }
-
-  const minTier = TOPUP_TIERS[0];
-  if (usdcBalance < minTier) {
-    logger.info(
-      `Bootstrap topup skipped: USDC balance $${usdcBalance.toFixed(2)} below minimum tier ($${minTier})`,
+      `Sandbox topup skipped: balance ${formatBRL(balanceCents)} < tier ${formatBRL(selectedTier)}`,
     );
     return null;
   }
 
   logger.info(
-    `Bootstrap topup: credits=$${(creditsCents / 100).toFixed(2)}, USDC=$${usdcBalance.toFixed(2)}, buying $${minTier}`,
+    `Sandbox topup: deficit=${deficitCents}c, buying ${formatBRL(selectedTier)} of credits`,
   );
 
-  return topupCredits(apiUrl, account, minTier);
+  return purchaseCredits({ db, userId, amountCents: selectedTier, conway });
+}
+
+/**
+ * Bootstrap topup: buy the minimum tier on startup so the agent can run
+ * inference. The agent decides larger topups itself via `topup_credits`.
+ *
+ * Only triggers when credits are below the threshold AND the BRL balance
+ * covers the minimum tier.
+ */
+export async function bootstrapTopup(params: {
+  db: Database.Database;
+  userId: string;
+  conway: ConwayClient;
+  creditsCents: number;
+  creditThresholdCents?: number;
+}): Promise<TopupResult | null> {
+  const {
+    db,
+    userId,
+    conway,
+    creditsCents,
+    creditThresholdCents = 500,
+  } = params;
+
+  if (creditsCents >= creditThresholdCents) {
+    return null;
+  }
+
+  const balanceCents = getBalanceCents(db, userId);
+  if (balanceCents < MIN_TOPUP_CENTS) {
+    logger.info(
+      `Bootstrap topup skipped: balance ${formatBRL(balanceCents)} below minimum tier ${formatBRL(MIN_TOPUP_CENTS)}`,
+    );
+    return null;
+  }
+
+  logger.info(
+    `Bootstrap topup: credits=${creditsCents}c, balance=${formatBRL(balanceCents)}, buying ${formatBRL(MIN_TOPUP_CENTS)}`,
+  );
+
+  return purchaseCredits({ db, userId, amountCents: MIN_TOPUP_CENTS, conway });
 }

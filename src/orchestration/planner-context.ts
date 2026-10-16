@@ -11,9 +11,9 @@ export interface PlannerContextOptions {
   db: Database;
   workspace?: Pick<AgentWorkspace, "basePath" | "listOutputs">;
   funding?: Pick<FundingProtocol, "getBalance">;
-  identityAddress?: string;
+  identityId?: string;
   creditsCents?: number;
-  usdcBalance?: number;
+  balanceCents?: number;
   availableRoles?: string[];
   customRoles?: string[];
   marketIntel?: string;
@@ -39,11 +39,11 @@ export const DEFAULT_PLANNER_AVAILABLE_ROLES = [
 export async function buildPlannerContext(options: PlannerContextOptions): Promise<PlannerContext> {
   const cachedBalance = readCachedBalance(options.db);
   const creditsCents = await resolveCreditsCents(options, cachedBalance?.creditsCents);
-  const usdcBalance = resolveUsdcBalance(options, cachedBalance?.usdcBalance);
+  const balanceCents = resolveBrlBalance(options, cachedBalance?.balanceCents);
 
   return {
     creditsCents,
-    usdcBalance,
+    balanceCents,
     survivalTier: toSurvivalTier(creditsCents),
     availableRoles: normalizeStringList(options.availableRoles, [...DEFAULT_PLANNER_AVAILABLE_ROLES]),
     customRoles: normalizeStringList(options.customRoles, []),
@@ -138,7 +138,7 @@ function loadRecentOutcomes(db: Database): Array<{
   }
 }
 
-function readCachedBalance(db: Database): { creditsCents?: number; usdcBalance?: number } | null {
+function readCachedBalance(db: Database): { creditsCents?: number; balanceCents?: number } | null {
   try {
     const row = db.prepare("SELECT value FROM kv WHERE key = ?").get("last_known_balance") as
       | { value: string }
@@ -153,8 +153,8 @@ function readCachedBalance(db: Database): { creditsCents?: number; usdcBalance?:
       creditsCents: typeof parsed.creditsCents === "number" && Number.isFinite(parsed.creditsCents)
         ? Math.max(0, Math.floor(parsed.creditsCents))
         : undefined,
-      usdcBalance: typeof parsed.usdcBalance === "number" && Number.isFinite(parsed.usdcBalance)
-        ? parsed.usdcBalance
+      balanceCents: typeof parsed.balanceCents === "number" && Number.isFinite(parsed.balanceCents)
+        ? parsed.balanceCents
         : undefined,
     };
   } catch {
@@ -170,9 +170,9 @@ async function resolveCreditsCents(
     return Math.max(0, Math.floor(options.creditsCents));
   }
 
-  if (options.funding && options.identityAddress) {
+  if (options.funding && options.identityId) {
     try {
-      const balance = await options.funding.getBalance(options.identityAddress);
+      const balance = await options.funding.getBalance(options.identityId);
       if (Number.isFinite(balance)) {
         return Math.max(0, Math.floor(balance));
       }
@@ -184,13 +184,13 @@ async function resolveCreditsCents(
   return Math.max(0, Math.floor(cachedCreditsCents ?? 0));
 }
 
-function resolveUsdcBalance(options: PlannerContextOptions, cachedUsdcBalance?: number): number {
-  if (typeof options.usdcBalance === "number" && Number.isFinite(options.usdcBalance)) {
-    return options.usdcBalance;
+function resolveBrlBalance(options: PlannerContextOptions, cachedBalanceCents?: number): number {
+  if (typeof options.balanceCents === "number" && Number.isFinite(options.balanceCents)) {
+    return options.balanceCents;
   }
 
-  return typeof cachedUsdcBalance === "number" && Number.isFinite(cachedUsdcBalance)
-    ? cachedUsdcBalance
+  return typeof cachedBalanceCents === "number" && Number.isFinite(cachedBalanceCents)
+    ? cachedBalanceCents
     : 0;
 }
 

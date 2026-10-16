@@ -13,8 +13,8 @@ import type {
   FinancialState,
   SurvivalTier,
 } from "../types.js";
-import { getSurvivalTier, formatCredits } from "../conway/credits.js";
-import { getUsdcBalance } from "../conway/x402.js";
+import { getSurvivalTier } from "../conway/credits.js";
+import { formatBRL } from "../payments/money.js";
 
 export interface ResourceStatus {
   financial: FinancialState;
@@ -38,11 +38,8 @@ export async function checkResources(
     creditsCents = await conway.getCreditsBalance();
   } catch {}
 
-  // Check USDC
-  let usdcBalance = 0;
-  try {
-    usdcBalance = await getUsdcBalance(identity.address);
-  } catch {}
+  // Check BRL balance (only Pix deposits increase it)
+  const balanceCents = db.getBalanceCents(identity.accountId);
 
   // Check sandbox health
   let sandboxHealthy = true;
@@ -55,7 +52,7 @@ export async function checkResources(
 
   const financial: FinancialState = {
     creditsCents,
-    usdcBalance,
+    balanceCents,
     lastChecked: new Date().toISOString(),
   };
 
@@ -85,8 +82,8 @@ export async function checkResources(
 export function formatResourceReport(status: ResourceStatus): string {
   const lines = [
     `=== RESOURCE STATUS ===`,
-    `Credits: ${formatCredits(status.financial.creditsCents)}`,
-    `USDC: ${status.financial.usdcBalance.toFixed(6)}`,
+    `Credits: ${formatBRL(status.financial.creditsCents)}`,
+    `Saldo: ${formatBRL(status.financial.balanceCents)}`,
     `Tier: ${status.tier}${status.tierChanged ? ` (changed from ${status.previousTier})` : ""}`,
     `Sandbox: ${status.sandboxHealthy ? "healthy" : "UNHEALTHY"}`,
     `Checked: ${status.financial.lastChecked}`,

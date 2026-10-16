@@ -7,7 +7,8 @@
  */
 
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
-import { createBuiltinTools, loadInstalledTools, executeTool } from "../agent/tools.js";
+import nodePath from "path";
+import { createBuiltinTools } from "../agent/tools.js";
 import {
   MockInferenceClient,
   MockConwayClient,
@@ -16,14 +17,6 @@ import {
   createTestConfig,
 } from "./mocks.js";
 import type { AutomatonDatabase, ToolContext, AutomatonTool, RiskLevel } from "../types.js";
-
-// Mock erc8004.js to avoid ABI parse error
-vi.mock("../registry/erc8004.js", () => ({
-  queryAgent: vi.fn(),
-  getTotalAgents: vi.fn().mockResolvedValue(0),
-  registerAgent: vi.fn(),
-  leaveFeedback: vi.fn(),
-}));
 
 // ─── Risk Level Classification ──────────────────────────────────
 
@@ -38,7 +31,7 @@ describe("Tool Risk Level Classification", () => {
   const EXPECTED_RISK_LEVELS: Record<string, RiskLevel> = {
     // Safe tools (read-only, no side effects)
     check_credits: "safe",
-    check_usdc_balance: "safe",
+    check_balance: "safe",
     list_sandboxes: "safe",
     read_file: "safe",
     system_synopsis: "safe",
@@ -86,7 +79,7 @@ describe("Tool Risk Level Classification", () => {
     install_skill: "dangerous",
     create_skill: "dangerous",
     remove_skill: "dangerous",
-    register_erc8004: "dangerous",
+    register_agent: "dangerous",
     give_feedback: "dangerous",
     spawn_child: "dangerous",
     fund_child: "dangerous",
@@ -169,7 +162,7 @@ describe("write_file / edit_own_file protection parity", () => {
   });
 
   const PROTECTED_FILES = [
-    "wallet.json",
+    "account.json",
     "config.json",
     "state.db",
     "state.db-wal",
@@ -226,9 +219,9 @@ describe("write_file / edit_own_file protection parity", () => {
       { path: "project/file.txt", content: "safe content" },
       ctx,
     );
-    // Relative paths resolve against /root, so "project/file.txt" -> "/root/project/file.txt"
+    // Relative paths resolve against the sandbox home
     expect(result).toContain("File written");
-    expect(result).toContain("/root/project/file.txt");
+    expect(result).toContain(nodePath.resolve("/root", "project/file.txt"));
   });
 
   it("write_file allows tilde paths within sandbox home", async () => {
@@ -238,7 +231,9 @@ describe("write_file / edit_own_file protection parity", () => {
       ctx,
     );
     expect(result).toContain("File written");
-    expect(result).toContain("/root/.automaton/skills/test/SKILL.md");
+    expect(result).toContain(
+      nodePath.resolve("/root", ".automaton/skills/test/SKILL.md"),
+    );
   });
 });
 
@@ -267,9 +262,9 @@ describe("read_file sensitive file blocking", () => {
     db.close();
   });
 
-  it("blocks reading wallet.json", async () => {
+  it("blocks reading account.json", async () => {
     const readTool = tools.find((t) => t.name === "read_file")!;
-    const result = await readTool.execute({ path: "/home/automaton/.automaton/wallet.json" }, ctx);
+    const result = await readTool.execute({ path: "/home/automaton/.automaton/account.json" }, ctx);
     expect(result).toContain("Blocked");
   });
 
@@ -410,7 +405,7 @@ describe("exec tool forbidden command patterns", () => {
   const FORBIDDEN_COMMANDS = [
     "rm -rf ~/.automaton",
     "rm state.db",
-    "rm wallet.json",
+    "rm account.json",
     "rm automaton.json",
     "rm heartbeat.yml",
     "rm SOUL.md",
@@ -431,7 +426,7 @@ describe("exec tool forbidden command patterns", () => {
     "cat ~/.ssh/id_rsa",
     "cat ~/.gnupg/key",
     "cat .env",
-    "cat wallet.json",
+    "cat account.json",
   ];
 
   for (const cmd of FORBIDDEN_COMMANDS) {
@@ -531,7 +526,7 @@ describe("transfer_credits self-preservation", () => {
   it("blocks transfer of more than half balance", async () => {
     const transferTool = tools.find((t) => t.name === "transfer_credits")!;
     const result = await transferTool.execute(
-      { to_address: "0xrecipient", amount_cents: 6000 },
+      { to_account_id: "0xrecipient", amount_cents: 6000 },
       ctx,
     );
     expect(result).toContain("Blocked");
@@ -541,7 +536,7 @@ describe("transfer_credits self-preservation", () => {
   it("allows transfer of less than half balance", async () => {
     const transferTool = tools.find((t) => t.name === "transfer_credits")!;
     const result = await transferTool.execute(
-      { to_address: "0xrecipient", amount_cents: 4000 },
+      { to_account_id: "0xrecipient", amount_cents: 4000 },
       ctx,
     );
     expect(result).toContain("transfer submitted");
@@ -550,7 +545,7 @@ describe("transfer_credits self-preservation", () => {
   it("blocks negative amount", async () => {
     const transferTool = tools.find((t) => t.name === "transfer_credits")!;
     const result = await transferTool.execute(
-      { to_address: "0xrecipient", amount_cents: -500 },
+      { to_account_id: "0xrecipient", amount_cents: -500 },
       ctx,
     );
     expect(result).toContain("Blocked");
@@ -560,7 +555,7 @@ describe("transfer_credits self-preservation", () => {
   it("blocks zero amount", async () => {
     const transferTool = tools.find((t) => t.name === "transfer_credits")!;
     const result = await transferTool.execute(
-      { to_address: "0xrecipient", amount_cents: 0 },
+      { to_account_id: "0xrecipient", amount_cents: 0 },
       ctx,
     );
     expect(result).toContain("Blocked");

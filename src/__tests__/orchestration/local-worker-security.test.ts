@@ -20,7 +20,7 @@ function createConwayStub(overrides?: Partial<ConwayClient>): ConwayClient {
     listSandboxes: async () => [],
     getCreditsBalance: async () => 0,
     getCreditsPricing: async () => [],
-    transferCredits: async () => ({ id: "", fromAddress: "", toAddress: "", amountCents: 0, status: "completed", timestamp: "" }),
+    transferCredits: async () => ({ transferId: "", status: "completed", toAccountId: "", amountCents: 0, balanceAfterCents: 0 }),
     registerAutomaton: async () => ({ automaton: {} }),
     searchDomains: async () => [],
     registerDomain: async () => ({ domain: "", status: "pending", registrationDate: "", expirationDate: "", nameservers: [] }),
@@ -113,8 +113,8 @@ describe("agent/general-harness security", () => {
     return tool.execute(args);
   }
 
-  it("blocks sensitive file reads (wallet.json)", async () => {
-    const out = await runTool(createConwayStub(), "read_file", { path: "wallet.json" });
+  it("blocks sensitive file reads (.env)", async () => {
+    const out = await runTool(createConwayStub(), "read_file", { path: ".env" });
     expect(out).toContain("Blocked: cannot read sensitive file");
   });
 
@@ -147,9 +147,9 @@ describe("agent/general-harness security", () => {
 
   it("blocks forbidden shell commands", async () => {
     const out = await runTool(createConwayStub(), "exec", {
-      command: "cat ~/.automaton/wallet.json",
+      command: "cat ~/.ssh/id_rsa",
     });
-    expect(out).toContain("Blocked:");
+    expect(out).toContain("Blocked: Read SSH keys");
   });
 
   it("allows normal read_file paths inside the allowed edit root", async () => {

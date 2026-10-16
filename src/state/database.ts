@@ -46,6 +46,9 @@ import {
   MIGRATION_V9_ALTER_CHILDREN_ROLE,
   MIGRATION_V10,
   MIGRATION_V11,
+  MIGRATION_V12,
+  MIGRATION_V12_SPEND_CATEGORY,
+  MIGRATION_V12_RENAME,
 } from "./schema.js";
 import type {
   RiskLevel,
@@ -66,12 +69,15 @@ import type {
   RelationshipMemoryEntry,
   ChildLifecycleEventRow,
   ChildLifecycleState,
-  OnchainTransactionRow,
+  UserBalanceRow,
+  PixPaymentRow,
+  FinancialTransactionRow,
   DiscoveredAgentCacheRow,
   MetricSnapshotRow,
 } from "../types.js";
 import { ulid } from "ulid";
 import { createLogger } from "../observability/logger.js";
+import type { PixChargeStatus } from "../payments/types.js";
 
 const logger = createLogger("database");
 
@@ -395,19 +401,18 @@ export function createDatabase(dbPath: string): AutomatonDatabase {
 
   const insertChild = (child: ChildAutomaton): void => {
     db.prepare(
-      `INSERT INTO children (id, name, address, sandbox_id, genesis_prompt, creator_message, funded_amount_cents, status, created_at, chain_type)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      `INSERT INTO children (id, name, account_id, sandbox_id, genesis_prompt, creator_message, funded_amount_cents, status, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     ).run(
       child.id,
       child.name,
-      child.address,
+      child.accountId,
       child.sandboxId,
       child.genesisPrompt,
       child.creatorMessage ?? null,
       child.fundedAmountCents,
       child.status,
       child.createdAt,
-      child.chainType ?? "evm",
     );
   };
 
@@ -428,14 +433,14 @@ export function createDatabase(dbPath: string): AutomatonDatabase {
 
   const setRegistryEntry = (entry: RegistryEntry): void => {
     db.prepare(
-      `INSERT OR REPLACE INTO registry (agent_id, agent_uri, chain, contract_address, tx_hash, registered_at)
+      `INSERT OR REPLACE INTO registry (agent_id, agent_uri, provider, endpoint, registration_ref, registered_at)
        VALUES (?, ?, ?, ?, ?, ?)`,
     ).run(
       entry.agentId,
       entry.agentURI,
-      entry.chain,
-      entry.contractAddress,
-      entry.txHash,
+      entry.provider,
+      entry.endpoint,
+      entry.registrationRef,
       entry.registeredAt,
     );
   };
@@ -444,7 +449,7 @@ export function createDatabase(dbPath: string): AutomatonDatabase {
 
   const insertReputation = (entry: ReputationEntry): void => {
     db.prepare(
-      `INSERT INTO reputation (id, from_agent, to_agent, score, comment, tx_hash)
+      `INSERT INTO reputation (id, from_agent, to_agent, score, comment, feedback_ref)
        VALUES (?, ?, ?, ?, ?, ?)`,
     ).run(
       entry.id,
@@ -452,15 +457,15 @@ export function createDatabase(dbPath: string): AutomatonDatabase {
       entry.toAgent,
       entry.score,
       entry.comment,
-      entry.txHash ?? null,
+      entry.feedbackRef ?? null,
     );
   };
 
-  const getReputation = (agentAddress?: string): ReputationEntry[] => {
-    const query = agentAddress
+  const getReputation = (agentId?: string): ReputationEntry[] => {
+    const query = agentId
       ? "SELECT * FROM reputation WHERE to_agent = ? ORDER BY created_at DESC"
       : "SELECT * FROM reputation ORDER BY created_at DESC";
-    const params = agentAddress ? [agentAddress] : [];
+    const params = agentId ? [agentId] : [];
     const rows = db.prepare(query).all(...params) as any[];
     return rows.map(deserializeReputation);
   };
@@ -469,7 +474,7 @@ export function createDatabase(dbPath: string): AutomatonDatabase {
 
   const insertInboxMessage = (msg: InboxMessage): void => {
     db.prepare(
-      `INSERT OR IGNORE INTO inbox_messages (id, from_address, content, received_at, reply_to)
+      `INSERT OR IGNORE INTO inbox_messages (id, from_account_id, content, received_at, reply_to)
        VALUES (?, ?, ?, ?, ?)`,
     ).run(
       msg.id,
@@ -532,6 +537,13 @@ export function createDatabase(dbPath: string): AutomatonDatabase {
     updateHeartbeatLastRun,
     insertTransaction,
     getRecentTransactions,
+    getBalanceCents: (userId: string) => getBalanceCents(db, userId),
+    creditBalance: (userId: string, amountCents: number) =>
+      creditBalance(db, userId, amountCents),
+    debitBalance: (userId: string, amountCents: number) =>
+      debitBalance(db, userId, amountCents),
+    listFinancialTransactions: (userId: string, limit?: number) =>
+      listFinancialTransactions(db, userId, limit),
     getInstalledTools,
     installTool,
     removeTool,
@@ -585,7 +597,7 @@ function applyMigrations(db: DatabaseType): void {
       version: 4,
       apply: () => {
         db.exec(MIGRATION_V4);
-        try { db.exec(MIGRATION_V4_ALTER); } catch { logger.debug("V4 ALTER (to_address) skipped — column likely exists"); }
+        try { db.exec(MIGRATION_V4_ALTER); } catch { logger.debug("V4 ALTER (to_account_id) skipped — column likely exists"); }
         try { db.exec(MIGRATION_V4_ALTER2); } catch { logger.debug("V4 ALTER (raw_content) skipped — column likely exists"); }
         try { db.exec(MIGRATION_V4_ALTER_INBOX_STATUS); } catch { logger.debug("V4 ALTER (inbox status) skipped — column likely exists"); }
         try { db.exec(MIGRATION_V4_ALTER_INBOX_RETRY); } catch { logger.debug("V4 ALTER (inbox retry_count) skipped — column likely exists"); }
@@ -625,6 +637,13 @@ function applyMigrations(db: DatabaseType): void {
         try { db.exec(MIGRATION_V11); } catch { /* column may already exist */ }
       },
     },
+    {
+      version: 12,
+      apply: () => {
+        db.exec(MIGRATION_V12);
+        try { db.exec(MIGRATION_V12_SPEND_CATEGORY); } catch { /* legacy table */ }
+      },
+    },
   ];
 
   for (const m of migrations) {
@@ -634,6 +653,17 @@ function applyMigrations(db: DatabaseType): void {
         db.prepare("INSERT INTO schema_version (version) VALUES (?)").run(m.version);
       });
       migrate();
+    }
+  }
+
+  // Legacy column renames run outside of any transaction: each statement is
+  // best-effort because databases created by the current schema already use
+  // the new column names.
+  for (const stmt of MIGRATION_V12_RENAME) {
+    try {
+      db.exec(stmt);
+    } catch {
+      // Column already renamed, or absent on this database.
     }
   }
 }
@@ -723,7 +753,7 @@ export interface TaskGraphRow {
 export interface EventStreamRow {
   id: string;
   type: string;
-  agentAddress: string;
+  agentId: string;
   goalId: string | null;
   taskId: string | null;
   content: string;
@@ -1016,7 +1046,7 @@ export function insertEvent(
   db: DatabaseType,
   row: {
     type: string;
-    agentAddress: string;
+    agentId: string;
     goalId?: string | null;
     taskId?: string | null;
     content: string;
@@ -1027,12 +1057,12 @@ export function insertEvent(
   const id = ulid();
   const now = new Date().toISOString();
   db.prepare(
-    `INSERT INTO event_stream (id, type, agent_address, goal_id, task_id, content, token_count, compacted_to, created_at)
+    `INSERT INTO event_stream (id, type, agent_id, goal_id, task_id, content, token_count, compacted_to, created_at)
      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
   ).run(
     id,
     row.type,
-    row.agentAddress,
+    row.agentId,
     row.goalId ?? null,
     row.taskId ?? null,
     row.content,
@@ -1043,10 +1073,10 @@ export function insertEvent(
   return id;
 }
 
-export function getRecentEvents(db: DatabaseType, agentAddress: string, limit: number = 50): EventStreamRow[] {
+export function getRecentEvents(db: DatabaseType, agentId: string, limit: number = 50): EventStreamRow[] {
   const rows = db
-    .prepare("SELECT * FROM event_stream WHERE agent_address = ? ORDER BY created_at DESC LIMIT ?")
-    .all(agentAddress, limit) as any[];
+    .prepare("SELECT * FROM event_stream WHERE agent_id = ? ORDER BY created_at DESC LIMIT ?")
+    .all(agentId, limit) as any[];
   return rows.map(deserializeEventStreamRow).reverse();
 }
 
@@ -1374,14 +1404,14 @@ export function insertDedupKey(db: DatabaseType, key: string, taskName: string, 
 
 export function pruneExpiredDedupKeys(db: DatabaseType): number {
   const result = db.prepare(
-    "DELETE FROM heartbeat_dedup WHERE expires_at < datetime('now')",
+    "DELETE FROM heartbeat_dedup WHERE datetime(expires_at) < datetime('now')",
   ).run();
   return result.changes;
 }
 
 export function isDeduplicated(db: DatabaseType, key: string): boolean {
   const row = db.prepare(
-    "SELECT 1 FROM heartbeat_dedup WHERE dedup_key = ? AND expires_at >= datetime('now')",
+    "SELECT 1 FROM heartbeat_dedup WHERE dedup_key = ? AND datetime(expires_at) >= datetime('now')",
   ).get(key) as any | undefined;
   return !!row;
 }
@@ -1394,7 +1424,7 @@ export function claimInboxMessages(db: DatabaseType, limit: number): InboxMessag
   // SELECT the same rows before either UPDATE runs.
   const claimTx = db.transaction(() => {
     const rows = db.prepare(
-      `SELECT id, from_address, content, received_at, processed_at, reply_to, to_address, raw_content,
+      `SELECT id, from_account_id, content, received_at, processed_at, reply_to, to_account_id, raw_content,
               status, retry_count, max_retries
        FROM inbox_messages
        WHERE status = 'received' AND retry_count < max_retries
@@ -1415,12 +1445,12 @@ export function claimInboxMessages(db: DatabaseType, limit: number): InboxMessag
     // Return rows with updated retry_count
     return rows.map((row: any) => ({
       id: row.id,
-      fromAddress: row.from_address,
+      fromAddress: row.from_account_id,
       content: row.content,
       receivedAt: row.received_at,
       processedAt: row.processed_at ?? null,
       replyTo: row.reply_to ?? null,
-      toAddress: row.to_address ?? null,
+      toAddress: row.to_account_id ?? null,
       rawContent: row.raw_content ?? null,
       status: 'in_progress' as const,
       retryCount: (row.retry_count ?? 0) + 1,
@@ -1593,7 +1623,7 @@ function deserializeChild(row: any): ChildAutomaton {
   return {
     id: row.id,
     name: row.name,
-    address: row.address,
+    accountId: row.account_id,
     sandboxId: row.sandbox_id,
     genesisPrompt: row.genesis_prompt,
     creatorMessage: row.creator_message ?? undefined,
@@ -1601,7 +1631,6 @@ function deserializeChild(row: any): ChildAutomaton {
     status: row.status,
     createdAt: row.created_at,
     lastChecked: row.last_checked ?? undefined,
-    chainType: row.chain_type ?? undefined,
   };
 }
 
@@ -1609,9 +1638,9 @@ function deserializeRegistry(row: any): RegistryEntry {
   return {
     agentId: row.agent_id,
     agentURI: row.agent_uri,
-    chain: row.chain,
-    contractAddress: row.contract_address,
-    txHash: row.tx_hash,
+    provider: row.provider ?? "conway",
+    endpoint: row.endpoint,
+    registrationRef: row.registration_ref ?? null,
     registeredAt: row.registered_at,
   };
 }
@@ -1619,8 +1648,8 @@ function deserializeRegistry(row: any): RegistryEntry {
 function deserializeInboxMessage(row: any): InboxMessage {
   return {
     id: row.id,
-    from: row.from_address,
-    to: row.to_address ?? "",
+    from: row.from_account_id,
+    to: row.to_account_id ?? "",
     content: row.content,
     signedAt: row.received_at,
     createdAt: row.received_at,
@@ -1635,7 +1664,7 @@ function deserializeReputation(row: any): ReputationEntry {
     toAgent: row.to_agent,
     score: row.score,
     comment: row.comment,
-    txHash: row.tx_hash ?? undefined,
+    feedbackRef: row.feedback_ref ?? undefined,
     timestamp: row.created_at,
   };
 }
@@ -1980,33 +2009,33 @@ export function relationshipUpsert(db: DatabaseType, entry: Omit<RelationshipMem
   const id = ulid();
   try {
     db.prepare(
-      `INSERT INTO relationship_memory (id, entity_address, entity_name, relationship_type, trust_score, notes)
+      `INSERT INTO relationship_memory (id, entity_id, entity_name, relationship_type, trust_score, notes)
        VALUES (?, ?, ?, ?, ?, ?)
-       ON CONFLICT(entity_address) DO UPDATE SET
+       ON CONFLICT(entity_id) DO UPDATE SET
          entity_name = COALESCE(excluded.entity_name, relationship_memory.entity_name),
          relationship_type = excluded.relationship_type, trust_score = excluded.trust_score,
          notes = COALESCE(excluded.notes, relationship_memory.notes), updated_at = datetime('now')`,
-    ).run(id, entry.entityAddress, entry.entityName, entry.relationshipType, entry.trustScore, entry.notes);
+    ).run(id, entry.entityId, entry.entityName, entry.relationshipType, entry.trustScore, entry.notes);
   } catch (error) { logger.error("relationshipUpsert failed", error instanceof Error ? error : undefined); }
   return id;
 }
 
-export function relationshipGet(db: DatabaseType, entityAddress: string): RelationshipMemoryEntry | undefined {
+export function relationshipGet(db: DatabaseType, entityId: string): RelationshipMemoryEntry | undefined {
   try {
-    const row = db.prepare("SELECT * FROM relationship_memory WHERE entity_address = ?").get(entityAddress) as any | undefined;
+    const row = db.prepare("SELECT * FROM relationship_memory WHERE entity_id = ?").get(entityId) as any | undefined;
     return row ? deserializeRelationshipRow(row) : undefined;
   } catch (error) { logger.error("relationshipGet failed", error instanceof Error ? error : undefined); return undefined; }
 }
 
-export function relationshipRecordInteraction(db: DatabaseType, entityAddress: string): void {
+export function relationshipRecordInteraction(db: DatabaseType, entityId: string): void {
   try {
-    db.prepare("UPDATE relationship_memory SET interaction_count = interaction_count + 1, last_interaction_at = datetime('now'), updated_at = datetime('now') WHERE entity_address = ?").run(entityAddress);
+    db.prepare("UPDATE relationship_memory SET interaction_count = interaction_count + 1, last_interaction_at = datetime('now'), updated_at = datetime('now') WHERE entity_id = ?").run(entityId);
   } catch (error) { logger.error("relationshipRecordInteraction failed", error instanceof Error ? error : undefined); }
 }
 
-export function relationshipUpdateTrust(db: DatabaseType, entityAddress: string, trustDelta: number): void {
+export function relationshipUpdateTrust(db: DatabaseType, entityId: string, trustDelta: number): void {
   try {
-    db.prepare("UPDATE relationship_memory SET trust_score = MAX(0.0, MIN(1.0, trust_score + ?)), updated_at = datetime('now') WHERE entity_address = ?").run(trustDelta, entityAddress);
+    db.prepare("UPDATE relationship_memory SET trust_score = MAX(0.0, MIN(1.0, trust_score + ?)), updated_at = datetime('now') WHERE entity_id = ?").run(trustDelta, entityId);
   } catch (error) { logger.error("relationshipUpdateTrust failed", error instanceof Error ? error : undefined); }
 }
 
@@ -2017,8 +2046,8 @@ export function relationshipGetTrusted(db: DatabaseType, minTrust: number = 0.5)
   } catch (error) { logger.error("relationshipGetTrusted failed", error instanceof Error ? error : undefined); return []; }
 }
 
-export function relationshipDelete(db: DatabaseType, entityAddress: string): void {
-  try { db.prepare("DELETE FROM relationship_memory WHERE entity_address = ?").run(entityAddress); }
+export function relationshipDelete(db: DatabaseType, entityId: string): void {
+  try { db.prepare("DELETE FROM relationship_memory WHERE entity_id = ?").run(entityId); }
   catch (error) { logger.error("relationshipDelete failed", error instanceof Error ? error : undefined); }
 }
 
@@ -2061,7 +2090,7 @@ function deserializeProceduralRow(row: any): ProceduralMemoryEntry {
 }
 
 function deserializeRelationshipRow(row: any): RelationshipMemoryEntry {
-  return { id: row.id, entityAddress: row.entity_address, entityName: row.entity_name ?? null,
+  return { id: row.id, entityId: row.entity_id, entityName: row.entity_name ?? null,
     relationshipType: row.relationship_type, trustScore: row.trust_score,
     interactionCount: row.interaction_count, lastInteractionAt: row.last_interaction_at ?? null,
     notes: row.notes ?? null, createdAt: row.created_at, updatedAt: row.updated_at };
@@ -2288,7 +2317,7 @@ function deserializeEventStreamRow(row: any): EventStreamRow {
   return {
     id: row.id,
     type: row.type,
-    agentAddress: row.agent_address,
+    agentId: row.agent_id,
     goalId: row.goal_id ?? null,
     taskId: row.task_id ?? null,
     content: row.content,
@@ -2379,9 +2408,9 @@ function deserializeLifecycleEventRow(row: any): ChildLifecycleEventRow {
 export function agentCacheUpsert(db: DatabaseType, row: DiscoveredAgentCacheRow): void {
   db.prepare(
     `INSERT INTO discovered_agents_cache
-     (agent_address, agent_card, fetched_from, card_hash, valid_until, fetch_count, last_fetched_at, created_at)
+     (agent_id, agent_card, fetched_from, card_hash, valid_until, fetch_count, last_fetched_at, created_at)
      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-     ON CONFLICT(agent_address) DO UPDATE SET
+     ON CONFLICT(agent_id) DO UPDATE SET
        agent_card = excluded.agent_card,
        fetched_from = excluded.fetched_from,
        card_hash = excluded.card_hash,
@@ -2389,7 +2418,7 @@ export function agentCacheUpsert(db: DatabaseType, row: DiscoveredAgentCacheRow)
        fetch_count = fetch_count + 1,
        last_fetched_at = excluded.last_fetched_at`,
   ).run(
-    row.agentAddress,
+    row.agentId,
     row.agentCard,
     row.fetchedFrom,
     row.cardHash,
@@ -2400,10 +2429,10 @@ export function agentCacheUpsert(db: DatabaseType, row: DiscoveredAgentCacheRow)
   );
 }
 
-export function agentCacheGet(db: DatabaseType, agentAddress: string): DiscoveredAgentCacheRow | undefined {
+export function agentCacheGet(db: DatabaseType, agentId: string): DiscoveredAgentCacheRow | undefined {
   const row = db
-    .prepare("SELECT * FROM discovered_agents_cache WHERE agent_address = ?")
-    .get(agentAddress) as any | undefined;
+    .prepare("SELECT * FROM discovered_agents_cache WHERE agent_id = ?")
+    .get(agentId) as any | undefined;
   return row ? deserializeAgentCacheRow(row) : undefined;
 }
 
@@ -2423,7 +2452,7 @@ export function agentCachePrune(db: DatabaseType): number {
 
 function deserializeAgentCacheRow(row: any): DiscoveredAgentCacheRow {
   return {
-    agentAddress: row.agent_address,
+    agentId: row.agent_id,
     agentCard: row.agent_card,
     fetchedFrom: row.fetched_from,
     cardHash: row.card_hash,
@@ -2434,61 +2463,284 @@ function deserializeAgentCacheRow(row: any): DiscoveredAgentCacheRow {
   };
 }
 
-// ─── Phase 3.2: Onchain Transaction DB Helpers ──────────────────
+// ─── BRL Balance, Pix Charges and Financial Ledger ──────────────
 
-export function onchainTxInsert(db: DatabaseType, row: OnchainTransactionRow): void {
+/**
+ * Current balance in centavos. Accounts start at R$ 0,00.
+ */
+export function getBalanceCents(db: DatabaseType, userId: string): number {
+  const row = db
+    .prepare("SELECT balance_cents FROM user_balances WHERE user_id = ?")
+    .get(userId) as { balance_cents: number } | undefined;
+  return row?.balance_cents ?? 0;
+}
+
+export function getBalance(db: DatabaseType, userId: string): UserBalanceRow {
+  const row = db
+    .prepare("SELECT * FROM user_balances WHERE user_id = ?")
+    .get(userId) as any;
+  if (!row) {
+    return {
+      userId,
+      balanceCents: 0,
+      currency: "BRL",
+      updatedAt: new Date().toISOString(),
+    };
+  }
+  return {
+    userId: row.user_id,
+    balanceCents: row.balance_cents,
+    currency: row.currency,
+    updatedAt: row.updated_at,
+  };
+}
+
+/**
+ * Atomically credit a balance. Never returns a negative value.
+ */
+export function creditBalance(db: DatabaseType, userId: string, amountCents: number): number {
+  if (!Number.isInteger(amountCents) || amountCents <= 0) {
+    throw new Error(`creditBalance requires a positive integer amount (got ${amountCents})`);
+  }
+  const run = db.transaction(() => {
+    db.prepare(
+      `INSERT INTO user_balances (user_id, balance_cents, currency, updated_at)
+       VALUES (?, ?, 'BRL', datetime('now'))
+       ON CONFLICT(user_id) DO UPDATE SET
+         balance_cents = balance_cents + excluded.balance_cents,
+         currency = 'BRL',
+         updated_at = datetime('now')`,
+    ).run(userId, amountCents);
+    return getBalanceCents(db, userId);
+  });
+  return run();
+}
+
+/**
+ * Atomically debit a balance. Fails when funds are insufficient, so the
+ * balance can never go negative through this path.
+ */
+export function debitBalance(db: DatabaseType, userId: string, amountCents: number): number {
+  if (!Number.isInteger(amountCents) || amountCents <= 0) {
+    throw new Error(`debitBalance requires a positive integer amount (got ${amountCents})`);
+  }
+  const run = db.transaction(() => {
+    const result = db
+      .prepare(
+        `UPDATE user_balances
+         SET balance_cents = balance_cents - ?, updated_at = datetime('now')
+         WHERE user_id = ? AND balance_cents >= ?`,
+      )
+      .run(amountCents, userId, amountCents);
+    if (result.changes === 0) {
+      throw new Error("Insufficient balance");
+    }
+    return getBalanceCents(db, userId);
+  });
+  return run();
+}
+
+// ─── Pix Charges ─────────────────────────────────────────────────
+
+export function insertPixPayment(db: DatabaseType, row: PixPaymentRow): void {
   db.prepare(
-    `INSERT INTO onchain_transactions (id, tx_hash, chain, operation, status, gas_used, metadata, created_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+    `INSERT INTO pix_payments
+       (id, user_id, provider, external_id, amount_cents, currency, status,
+        pix_copy_paste, qr_code, description, expires_at, paid_at, created_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
   ).run(
     row.id,
-    row.txHash,
-    row.chain,
-    row.operation,
+    row.userId,
+    row.provider,
+    row.externalId,
+    row.amountCents,
+    row.currency,
     row.status,
-    row.gasUsed,
-    row.metadata,
+    row.pixCopyPaste,
+    row.qrCode,
+    row.description,
+    row.expiresAt,
+    row.paidAt,
     row.createdAt,
   );
 }
 
-export function onchainTxGetByHash(db: DatabaseType, txHash: string): OnchainTransactionRow | undefined {
+export function getPixPaymentById(db: DatabaseType, id: string): PixPaymentRow | undefined {
+  const row = db.prepare("SELECT * FROM pix_payments WHERE id = ?").get(id) as any;
+  return row ? deserializePixPaymentRow(row) : undefined;
+}
+
+export function getPixPaymentByExternalId(
+  db: DatabaseType,
+  provider: string,
+  externalId: string,
+): PixPaymentRow | undefined {
   const row = db
-    .prepare("SELECT * FROM onchain_transactions WHERE tx_hash = ?")
-    .get(txHash) as any | undefined;
-  return row ? deserializeOnchainTxRow(row) : undefined;
+    .prepare("SELECT * FROM pix_payments WHERE provider = ? AND external_id = ?")
+    .get(provider, externalId) as any;
+  return row ? deserializePixPaymentRow(row) : undefined;
 }
 
-export function onchainTxGetAll(db: DatabaseType, filter?: { status?: string }): OnchainTransactionRow[] {
-  if (filter?.status) {
-    const rows = db
-      .prepare("SELECT * FROM onchain_transactions WHERE status = ? ORDER BY created_at DESC")
-      .all(filter.status) as any[];
-    return rows.map(deserializeOnchainTxRow);
-  }
+export function updatePixPaymentStatus(
+  db: DatabaseType,
+  id: string,
+  updates: {
+    status: PixChargeStatus;
+    paidAt?: string | null;
+    expiresAt?: string | null;
+    pixCopyPaste?: string | null;
+    qrCode?: string | null;
+  },
+): void {
+  const sets: string[] = ["status = ?"];
+  const params: unknown[] = [updates.status];
+  if (updates.paidAt !== undefined) { sets.push("paid_at = ?"); params.push(updates.paidAt); }
+  if (updates.expiresAt !== undefined) { sets.push("expires_at = ?"); params.push(updates.expiresAt); }
+  if (updates.pixCopyPaste !== undefined) { sets.push("pix_copy_paste = ?"); params.push(updates.pixCopyPaste); }
+  if (updates.qrCode !== undefined) { sets.push("qr_code = ?"); params.push(updates.qrCode); }
+  params.push(id);
+  db.prepare(`UPDATE pix_payments SET ${sets.join(", ")} WHERE id = ?`).run(...(params as any[]));
+}
+
+export function listPixPayments(db: DatabaseType, userId: string, limit = 20): PixPaymentRow[] {
   const rows = db
-    .prepare("SELECT * FROM onchain_transactions ORDER BY created_at DESC")
-    .all() as any[];
-  return rows.map(deserializeOnchainTxRow);
+    .prepare(
+      "SELECT * FROM pix_payments WHERE user_id = ? ORDER BY created_at DESC LIMIT ?",
+    )
+    .all(userId, limit) as any[];
+  return rows.map(deserializePixPaymentRow);
 }
 
-export function onchainTxUpdateStatus(db: DatabaseType, txHash: string, status: string, gasUsed?: number): void {
-  db.prepare(
-    "UPDATE onchain_transactions SET status = ?, gas_used = COALESCE(?, gas_used) WHERE tx_hash = ?",
-  ).run(status, gasUsed ?? null, txHash);
+export function expireStalePixPayments(db: DatabaseType): number {
+  const result = db
+    .prepare(
+      `UPDATE pix_payments
+       SET status = 'EXPIRED'
+        WHERE status = 'PENDING' AND expires_at IS NOT NULL AND datetime(expires_at) < datetime('now')`,
+    )
+    .run();
+  return result.changes;
 }
 
-function deserializeOnchainTxRow(row: any): OnchainTransactionRow {
+function deserializePixPaymentRow(row: any): PixPaymentRow {
   return {
     id: row.id,
-    txHash: row.tx_hash,
-    chain: row.chain,
-    operation: row.operation,
+    userId: row.user_id,
+    provider: row.provider,
+    externalId: row.external_id,
+    amountCents: row.amount_cents,
+    currency: row.currency,
     status: row.status,
-    gasUsed: row.gas_used ?? null,
-    metadata: row.metadata ?? "{}",
+    pixCopyPaste: row.pix_copy_paste ?? null,
+    qrCode: row.qr_code ?? null,
+    description: row.description ?? "",
+    expiresAt: row.expires_at ?? null,
+    paidAt: row.paid_at ?? null,
     createdAt: row.created_at,
   };
+}
+
+// ─── Financial Ledger ────────────────────────────────────────────
+
+/**
+ * Append a row to the financial ledger.
+ *
+ * Returns false when a completed transaction with the same
+ * (reference_id, type) already exists — this is the idempotency guard that
+ * prevents a replayed webhook from crediting the balance twice.
+ */
+export function insertFinancialTransaction(db: DatabaseType, row: FinancialTransactionRow): boolean {
+  try {
+    db.prepare(
+      `INSERT INTO transactions
+         (id, type, amount_cents, balance_after_cents, description,
+          user_id, currency, payment_method, status, reference_id, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    ).run(
+      row.id,
+      row.type,
+      row.amountCents,
+      row.balanceAfterCents ?? null,
+      row.description,
+      row.userId,
+      row.currency,
+      row.paymentMethod,
+      row.status,
+      row.referenceId,
+      row.createdAt,
+    );
+    return true;
+  } catch (err: any) {
+    if (String(err?.message ?? "").includes("UNIQUE")) {
+      return false;
+    }
+    throw err;
+  }
+}
+
+export function hasFinancialTransaction(
+  db: DatabaseType,
+  referenceId: string,
+  type: string,
+): boolean {
+  const row = db
+    .prepare("SELECT 1 as found FROM transactions WHERE reference_id = ? AND type = ? LIMIT 1")
+    .get(referenceId, type) as { found: number } | undefined;
+  return row !== undefined;
+}
+
+export function listFinancialTransactions(
+  db: DatabaseType,
+  userId: string,
+  limit = 50,
+): FinancialTransactionRow[] {
+  const rows = db
+    .prepare(
+      `SELECT * FROM transactions
+       WHERE user_id = ? AND reference_id IS NOT NULL
+       ORDER BY created_at DESC LIMIT ?`,
+    )
+    .all(userId, limit) as any[];
+  return rows.map(deserializeFinancialTransactionRow);
+}
+
+export function deserializeFinancialTransactionRow(row: any): FinancialTransactionRow {
+  return {
+    id: row.id,
+    userId: row.user_id ?? "",
+    type: row.type,
+    amountCents: row.amount_cents ?? 0,
+    balanceAfterCents: row.balance_after_cents ?? undefined,
+    currency: row.currency ?? "BRL",
+    paymentMethod: row.payment_method ?? "PIX",
+    status: row.status ?? "COMPLETED",
+    referenceId: row.reference_id ?? null,
+    description: row.description ?? "",
+    createdAt: row.created_at,
+  };
+}
+
+/**
+ * Record a webhook delivery. Returns false when the event was already
+ * processed (replay protection at the storage layer).
+ */
+export function recordPixWebhookEvent(
+  db: DatabaseType,
+  eventId: string,
+  provider: string,
+  externalId: string,
+): boolean {
+  try {
+    db.prepare(
+      "INSERT INTO pix_webhook_events (event_id, provider, external_id) VALUES (?, ?, ?)",
+    ).run(eventId, provider, externalId);
+    return true;
+  } catch (err: any) {
+    if (String(err?.message ?? "").includes("UNIQUE")) {
+      return false;
+    }
+    throw err;
+  }
 }
 
 // ─── Phase 4.1: Metrics Snapshot DB Helpers ─────────────────────

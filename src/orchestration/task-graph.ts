@@ -236,10 +236,10 @@ export function getReadyTasks(db: Database): TaskNode[] {
   return getReadyTaskRows(db).map(taskRowToTaskNode);
 }
 
-export function assignTask(db: Database, taskId: string, agentAddress: string): void {
-  const normalizedAddress = agentAddress.trim();
+export function assignTask(db: Database, taskId: string, agentId: string): void {
+  const normalizedAddress = agentId.trim();
   if (!normalizedAddress) {
-    throw new Error("agentAddress cannot be empty");
+    throw new Error("agentId cannot be empty");
   }
 
   withTransaction(db, () => {
