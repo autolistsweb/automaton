@@ -102,6 +102,33 @@ describe("truncateToolResult", () => {
 // ─── Token Budget & summarizeTurns wiring ──────────────────────
 
 describe("buildContextMessages token budget", () => {
+  it("preserves tool-only assistant calls and their results for the next inference", () => {
+    const turn = makeTurn({
+      input: undefined,
+      thinking: "",
+      toolCalls: [{
+        id: "inspect-assets",
+        name: "exec",
+        arguments: { command: "ls projects" },
+        result: "ExhibitKit\nFuelEU",
+        durationMs: 1,
+      }],
+    });
+
+    const messages = buildContextMessages("Inspect the assets", [turn]);
+    const assistant = messages.find((message) => message.role === "assistant");
+    expect(assistant?.tool_calls).toEqual([{
+      id: "inspect-assets",
+      type: "function",
+      function: { name: "exec", arguments: '{"command":"ls projects"}' },
+    }]);
+    expect(messages.find((message) => message.role === "tool")).toEqual({
+      role: "tool",
+      content: "ExhibitKit\nFuelEU",
+      tool_call_id: "inspect-assets",
+    });
+  });
+
   it("passes all turns through when under budget", () => {
     const turns = [makeTurn(), makeTurn(), makeTurn()];
     const messages = buildContextMessages("System prompt", turns);

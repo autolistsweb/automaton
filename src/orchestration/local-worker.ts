@@ -46,7 +46,10 @@ interface LocalWorkerConfig {
 }
 
 export class LocalWorkerPool {
-  private activeWorkers = new Map<string, { promise: Promise<void>; abortController: AbortController }>();
+  private static readonly activeWorkers = new Map<string, {
+    promise: Promise<void>;
+    abortController: AbortController;
+  }>();
 
   constructor(private readonly config: LocalWorkerConfig) {}
 
@@ -74,28 +77,33 @@ export class LocalWorkerPool {
         }
       })
       .finally(() => {
-        this.activeWorkers.delete(workerId);
+        LocalWorkerPool.activeWorkers.delete(workerId);
+        this.config.db.prepare(
+          `UPDATE children
+           SET status = 'dead', last_checked = datetime('now')
+           WHERE address = ? OR sandbox_id = ?`,
+        ).run(address, workerId);
       });
 
-    this.activeWorkers.set(workerId, { promise: workerPromise, abortController });
+    LocalWorkerPool.activeWorkers.set(workerId, { promise: workerPromise, abortController });
     return { address, name: workerName, sandboxId: workerId };
   }
 
   getActiveCount(): number {
-    return this.activeWorkers.size;
+    return LocalWorkerPool.activeWorkers.size;
   }
 
   hasWorker(addressOrId: string): boolean {
     const id = addressOrId.replace("local://", "");
-    return this.activeWorkers.has(id);
+    return LocalWorkerPool.activeWorkers.has(id);
   }
 
   async shutdown(): Promise<void> {
-    for (const [, worker] of this.activeWorkers) {
+    for (const [, worker] of LocalWorkerPool.activeWorkers) {
       worker.abortController.abort();
     }
-    await Promise.allSettled([...this.activeWorkers.values()].map((worker) => worker.promise));
-    this.activeWorkers.clear();
+    await Promise.allSettled([...LocalWorkerPool.activeWorkers.values()].map((worker) => worker.promise));
+    LocalWorkerPool.activeWorkers.clear();
   }
 
   private async runWorker(workerId: string, task: TaskNode, signal: AbortSignal): Promise<void> {

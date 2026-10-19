@@ -4,6 +4,12 @@ export default defineConfig({
   test: {
     testTimeout: 30_000,
     teardownTimeout: 5_000,
+    pool: "forks",
+    poolOptions: {
+      forks: {
+        singleFork: true,
+      },
+    },
     include: ["src/__tests__/**/*.test.ts"],
     coverage: {
       provider: "v8",

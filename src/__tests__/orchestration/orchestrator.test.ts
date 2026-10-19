@@ -78,6 +78,7 @@ function makeOrchestrator(
     inference?: ReturnType<typeof makeInference>;
     config?: any;
     messaging?: ColonyMessaging;
+    isWorkerAlive?: (address: string) => boolean;
   } = {},
 ): Orchestrator {
   const { messaging } = makeMessaging(db);
@@ -88,6 +89,7 @@ function makeOrchestrator(
     messaging: overrides.messaging ?? messaging,
     inference: overrides.inference ?? (makeInference() as any),
     identity: IDENTITY,
+    isWorkerAlive: overrides.isWorkerAlive,
     config: overrides.config ?? {},
   });
 }
@@ -309,6 +311,92 @@ describe("orchestration/Orchestrator", () => {
       // handleFailedPhase marks the goal as failed and resets to idle
       // so the orchestrator can pick up other active goals.
       expect(result.phase).toBe("idle");
+    });
+
+    it("does not reassign work that belongs to a failed goal", async () => {
+      const failedGoalId = insertGoal(db, { status: "failed" });
+      const activeGoalId = insertGoal(db, { status: "active" });
+      const staleTaskId = insertTask(db, {
+        goalId: failedGoalId,
+        status: "assigned",
+        assignedTo: "local://dead-worker",
+      });
+      setOrchestratorState(db, {
+        phase: "executing",
+        goalId: failedGoalId,
+        replanCount: 0,
+        failedTaskId: null,
+        failedError: null,
+      });
+
+      const spawnAgent = vi.fn();
+      const orc = makeOrchestrator(db, {
+        isWorkerAlive: () => false,
+        config: { spawnAgent },
+      });
+
+      const result = await orc.tick();
+      const state = getOrchestratorState(db);
+      const task = db.prepare(
+        "SELECT status, assigned_to AS assignedTo FROM task_graph WHERE id = ?",
+      ).get(staleTaskId) as { status: string; assignedTo: string | null };
+
+      expect(result.phase).toBe("classifying");
+      expect(state?.goalId).toBe(activeGoalId);
+      expect(task).toEqual({ status: "assigned", assignedTo: "local://dead-worker" });
+      expect(spawnAgent).not.toHaveBeenCalled();
+    });
+
+    it("retires a dead local worker before assigning its task to a replacement", async () => {
+      const goalId = insertGoal(db, { status: "active" });
+      const taskId = insertTask(db, {
+        goalId,
+        status: "assigned",
+        assignedTo: "local://dead-worker",
+      });
+      db.prepare(
+        `INSERT INTO children
+         (id, name, address, sandbox_id, genesis_prompt, status, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?)`,
+      ).run(
+        "dead-child-id",
+        "dead-worker",
+        "local://dead-worker",
+        "dead-worker",
+        "Role: generalist",
+        "running",
+        "2026-01-01T00:00:00.000Z",
+      );
+      setOrchestratorState(db, {
+        phase: "executing",
+        goalId,
+        replanCount: 0,
+        failedTaskId: null,
+        failedError: null,
+      });
+
+      const spawnAgent = vi.fn().mockResolvedValue({
+        address: "local://replacement-worker",
+        name: "replacement-worker",
+        sandboxId: "replacement-worker",
+      });
+      const orc = makeOrchestrator(db, {
+        isWorkerAlive: (address) => address === "local://replacement-worker",
+        config: { spawnAgent },
+      });
+
+      const result = await orc.tick();
+      const task = db.prepare(
+        "SELECT status, assigned_to AS assignedTo FROM task_graph WHERE id = ?",
+      ).get(taskId) as { status: string; assignedTo: string | null };
+      const deadChild = db.prepare(
+        "SELECT status FROM children WHERE address = ?",
+      ).get("local://dead-worker") as { status: string };
+
+      expect(result.tasksAssigned).toBe(1);
+      expect(task).toEqual({ status: "assigned", assignedTo: "local://replacement-worker" });
+      expect(deadChild.status).toBe("dead");
+      expect(spawnAgent).toHaveBeenCalledTimes(1);
     });
   });
 
