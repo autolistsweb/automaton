@@ -528,6 +528,14 @@ export class Orchestrator {
       };
     }
 
+    if (goal.status !== "active") {
+      logger.warn("Orchestrator state points to a non-active goal; selecting active work", {
+        goalId: goal.id,
+        goalStatus: goal.status,
+      });
+      return this.handleIdlePhase({ ...DEFAULT_STATE });
+    }
+
     // Recover stale tasks: workers that died (process restart, sandbox crash)
     // leave tasks stuck in 'assigned' forever. Detect and reset them.
     if (this.params.isWorkerAlive) {
@@ -540,6 +548,11 @@ export class Orchestrator {
             taskId: task.id,
             worker: task.assignedTo,
           });
+          this.params.db.prepare(
+            `UPDATE children
+             SET status = 'dead', last_checked = datetime('now')
+             WHERE address = ? OR sandbox_id = ?`,
+          ).run(task.assignedTo, task.assignedTo?.replace(/^local:\/\//, ""));
           this.params.db.prepare(
             "UPDATE task_graph SET status = 'pending', assigned_to = NULL, started_at = NULL WHERE id = ?",
           ).run(task.id);

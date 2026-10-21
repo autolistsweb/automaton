@@ -221,6 +221,64 @@ describe("orchestration/LocalWorkerPool harness integration", () => {
     expect(pool.getActiveCount()).toBe(0);
   });
 
+  it("recognizes an active worker started by a previous pool instance", async () => {
+    registry.register("custom-slow", SlowHarness);
+    const originalPool = createPool();
+    const task = insertTask(db, {
+      id: "task-cross-pool-liveness",
+      goalId: "goal-1",
+      agentRole: "custom-slow",
+      status: "assigned",
+      assignedTo: null,
+      maxRetries: 0,
+    });
+
+    const spawned = originalPool.spawn(task);
+    const restartedPool = createPool();
+    expect(restartedPool.hasWorker(spawned.address)).toBe(true);
+
+    await waitFor(async () => SlowHarness.release !== null);
+    SlowHarness.release?.();
+    await waitFor(async () => !restartedPool.hasWorker(spawned.address));
+  });
+
+  it("marks the child dead when its in-process worker exits", async () => {
+    registry.register("custom-slow", SlowHarness);
+    const pool = createPool();
+    const task = insertTask(db, {
+      id: "task-worker-lifecycle",
+      goalId: "goal-1",
+      agentRole: "custom-slow",
+      status: "assigned",
+      assignedTo: null,
+      maxRetries: 0,
+    });
+
+    const spawned = pool.spawn(task);
+    db.prepare(
+      `INSERT INTO children
+       (id, name, address, sandbox_id, genesis_prompt, status, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?)`,
+    ).run(
+      "lifecycle-child",
+      spawned.name,
+      spawned.address,
+      spawned.sandboxId,
+      "Role: generalist",
+      "running",
+      "2026-01-01T00:00:00.000Z",
+    );
+
+    await waitFor(async () => SlowHarness.release !== null);
+    SlowHarness.release?.();
+    await waitFor(async () => pool.getActiveCount() === 0);
+
+    const child = db.prepare("SELECT status FROM children WHERE id = ?").get("lifecycle-child") as {
+      status: string;
+    };
+    expect(child.status).toBe("dead");
+  });
+
   it("gives orchestrator-role harnesses a 50-turn default budget", async () => {
     registry.register("custom-planner", OrchestratorBudgetHarness);
     const pool = createPool();
